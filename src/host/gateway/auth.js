@@ -63,6 +63,12 @@
  * `Host: localhost` (some HTTP clients rewrite it) must not be exempted either,
  * which is what the socket half of the check prevents.
  *
+ * The predicate itself is defined in `../loopback.js` (domain half) and
+ * re-exported below, unchanged. Stage 4's admin API needs the same test but may
+ * not import `gateway/*` (`quality-guidelines.md` §7 — one-way dependency), so
+ * the single DEFINITION moved down a layer while the single DECISION stayed
+ * here. Behaviour is byte-for-byte identical: same rules, same export shape.
+ *
  * ## What this module does NOT do
  *
  * It does not touch `lastSeenAt`. Recording activity costs an fsync per call
@@ -71,105 +77,22 @@
  * this function pure enough to reason about in isolation.
  */
 import { hashToken, sameTokenHash } from '../tokens.js'
+import {
+  headerValue,
+  isLoopback,
+  isLoopbackHostname,
+  isLoopbackSocket,
+  peerAddress,
+} from '../loopback.js'
 import { checkOrigin, checkUpgradeOrigin, isWriteMethod } from './origin.js'
 
-/**
- * Whether a hostname names loopback.
- *
- * Reimplemented rather than imported: the official predicate is package-internal
- * (`dsh-client-connection` does not export `isLoopbackHostname`), and the rules
- * are fixed and small. Identical semantics so the two agree: `localhost`, IPv6
- * `::1`, and any address in `127/8`.
- *
- * @param {string} hostname Already-normalized WHATWG hostname (IPv6 keeps its brackets).
- * @returns {boolean}
- */
-export function isLoopbackHostname(hostname) {
-  if (typeof hostname !== 'string') return false
-  if (hostname === 'localhost' || hostname === '[::1]' || hostname === '::1') return true
-  /* An IPv6 zone index (`fe80::1%eth0`) is not loopback, and `::1%x` must not be
-     accepted by the prefix test below. */
-  if (hostname.includes(':')) return false
-  const parts = hostname.split('.')
-  return parts.length === 4
-    && parts[0] === '127'
-    && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255)
-}
-
-/**
- * The peer address of a request, normalized, or `undefined` when unknowable.
- *
- * `remoteAddress` may be an IPv4-mapped IPv6 literal (`::ffff:127.0.0.1`) on a
- * dual-stack listener, which is exactly what `0.0.0.0` produces on Windows. Left
- * unmapped, that literal would fail {@link isLoopbackHostname} and a genuinely
- * local request would be asked for a cookie.
- *
- * @param {import('node:net').Socket | null | undefined} socket
- * @returns {string | undefined}
- */
-export function peerAddress(socket) {
-  const address = socket !== null && typeof socket === 'object' ? socket.remoteAddress : undefined
-  if (typeof address !== 'string' || address === '') return undefined
-  /* Unwrap IPv4-mapped IPv6 so one address has one spelling. */
-  if (address.startsWith('::ffff:') && address.includes('.')) return address.slice('::ffff:'.length)
-  return address
-}
-
-/**
- * Whether the SOCKET end of this request came from loopback.
- *
- * Only half of the loopback test — see {@link isLoopback}. Exported because the
- * admin API (stage 4) will need the socket half on its own.
- *
- * @param {import('node:http').IncomingMessage} req
- * @returns {boolean}
- */
-export function isLoopbackSocket(req) {
-  return isLoopbackHostname(peerAddress(req?.socket))
-}
-
-/**
- * Whether this request is a local, non-browser-originated access.
- *
- * BOTH halves are required (`design.md` §3.2 note):
- *
- *   - the socket peer is loopback — proves the bytes came from this machine;
- *   - the `Host` header names a loopback authority — proves the request was
- *     addressed to this machine rather than delivered here by DNS rebinding.
- *
- * @param {import('node:http').IncomingMessage} req
- * @returns {boolean}
- */
-export function isLoopback(req) {
-  if (!isLoopbackSocket(req)) return false
-  const host = readHeader(req, 'host')
-  if (typeof host !== 'string' || host === '') return false
-  try {
-    return isLoopbackHostname(new URL(`http://${host}`).hostname)
-  } catch {
-    return false
-  }
-}
-
-/**
- * Read one request header as a string.
- *
- * Kept local so this module has no dependency on `origin.js`'s internals beyond
- * the single exported decision; repeated headers collapse to their first value.
- *
- * @param {import('node:http').IncomingMessage} req
- * @param {string} name
- * @returns {string | undefined}
- */
-function readHeader(req, name) {
-  if (req === null || typeof req !== 'object') return undefined
-  const headers = req.headers
-  if (headers === null || typeof headers !== 'object') return undefined
-  const value = headers[name]
-  if (typeof value === 'string') return value
-  if (Array.isArray(value) && typeof value[0] === 'string') return value[0]
-  return undefined
-}
+/* The loopback predicate is DEFINED in `../loopback.js` and RE-EXPORTED here, so
+   the gateway keeps exporting what it always did (`isLoopback`, `isLoopbackSocket`,
+   `isLoopbackHostname`, `peerAddress`) and every existing caller — including the
+   tests that assert the DNS-rebinding arms — keeps working unchanged. What moved
+   is only where the code lives; the decision about when it applies is still in
+   `authorize()` below and nowhere else. */
+export { isLoopback, isLoopbackHostname, isLoopbackSocket, peerAddress }
 
 /**
  * Pull a named cookie out of a `Cookie` header.
@@ -270,7 +193,7 @@ export function authorize({ req, store, cookieName, upgrade = false }) {
   }
 
   /* 2. The device credential. */
-  const presented = readCookie(readHeader(req, 'cookie'), cookieName)
+  const presented = readCookie(headerValue(req, 'cookie'), cookieName)
   if (presented === undefined) {
     return { decision: DECISION.UNAUTHENTICATED, device: null, loopback: false, reason: 'no-cookie' }
   }

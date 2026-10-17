@@ -157,3 +157,47 @@ export const UPGRADE_HEAD_TIMEOUT_MS = 10_000
  * Real clients send at most one or two short tokens.
  */
 export const UPGRADE_MAX_SUBPROTOCOL_LENGTH = 512
+
+/* ------------------------------------------------------------------ *
+ * Audit trail (`design.md` §6, `prd.md` R5)
+ * ------------------------------------------------------------------ */
+
+/**
+ * File-name prefix of one day's audit file.
+ *
+ * The full name is `audit-<YYYY-MM-DD>.jsonl`; `audit.js`'s retention sweep
+ * matches that pattern EXACTLY and deletes nothing else, so this prefix is also
+ * the fence between "our data" and "whatever else is in the directory".
+ */
+export const AUDIT_FILE_PREFIX = 'audit-'
+
+/** POSIX mode for a day file — the audit names devices and their addresses. A no-op on Windows. */
+export const AUDIT_FILE_MODE = 0o600
+
+/** Days of audit history kept (`prd.md` R5 / `design.md` §6: 30). */
+export const AUDIT_RETENTION_DAYS = 30
+
+/**
+ * How often the daily retention sweep runs while the process stays up.
+ *
+ * The sweep also runs once at startup, which handles the normal case (a desktop
+ * host is restarted far more often than it runs for a day). This interval covers
+ * the long-lived process. Six hours rather than 24 so a machine that stays up for
+ * days still prunes within half a day of a file expiring, and so the timer is
+ * cheap either way: the sweep lists one directory and stats a handful of files.
+ */
+export const AUDIT_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000
+
+/**
+ * Route prefix the admin API claims on the OFFICIAL `dsh web` server.
+ *
+ * Deliberately not under `/api`: `/api` is the connection plugin's prefix
+ * (`dsh-client-connection` mounts it with its own Host/Origin fence and browser
+ * cookie, `research/official-connection-fence.md` §2), and a route under it
+ * would either be shadowed by that registration or inherit a credential check
+ * this API must not require. A dedicated prefix is served on the same official
+ * port, on the desktop browser's normal origin, and is matched by
+ * `webserver.register({ kind: 'prefix', … })` before any fallback.
+ */
+export const ADMIN_API_PREFIX = '/remote-control/api'
+

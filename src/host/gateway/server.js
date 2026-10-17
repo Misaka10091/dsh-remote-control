@@ -46,10 +46,38 @@
  * runs (`checkUpgradeOrigin`, strictly; see `origin.js` for why an upgrade cannot
  * use the read arms). No second decision path exists, which is the property
  * `quality-guidelines.md` §8 demands.
+ *
+ * ## The admin API is refused here, and that refusal is load-bearing
+ *
+ * `prd.md` R4: pairing grants session access, not administration. The admin API
+ * is registered on the OFFICIAL loopback server (`api.js`), so it is not
+ * reachable from the LAN at all — but this hop must still refuse the prefix
+ * explicitly, and the reason is subtle enough to spell out:
+ *
+ *   the gateway forwards from loopback with `Host` rewritten to
+ *   `127.0.0.1:<officialPort>` (`design.md` §4.4 item A). So if a remote request
+ *   for `/remote-control/api/...` were proxied, the official server would see it
+ *   arrive over a loopback socket with a loopback `Host` — i.e. it would satisfy
+ *   `isLoopback()` and its own admin guard would ADMIT it. The "loopback only"
+ *   rule would then be verified by the attacker's own proxy hop.
+ *
+ * Refusing here is therefore the layer that makes the rule true, not a
+ * defence-in-depth extra. `ADMIN_API_PREFIX` is a constant shared with `api.js`,
+ * so the two cannot disagree about what is being refused.
+ *
+ * ## Audit (`prd.md` R5)
+ *
+ * Every admitted request is classified by `classify.js` (path prefix + method —
+ * this hop does not understand DSH semantics) and recorded through the injected
+ * `audit` writer. Only the ACTION and its identifiers are recorded: never a
+ * message body, a tool argument, a file's contents, a token or a cookie. The
+ * upgrade path records `connect`, and the socket's close records `disconnect`,
+ * once.
  */
 import { createServer } from 'node:http'
 
-import { ACTIVITY_PERSIST_INTERVAL_MS, GATEWAY_BIND_HOST } from '../constants.js'
+import { ACTIVITY_PERSIST_INTERVAL_MS, ADMIN_API_PREFIX, GATEWAY_BIND_HOST } from '../constants.js'
+import { classify, classifyUpgrade } from '../classify.js'
 import { createActivityTracker } from './activity.js'
 import {
   DECISION,
@@ -97,6 +125,7 @@ export function upstreamFor(officialPort) {
  * @param {number} [options.innerAuthTimeoutMs] Bound on one inner-credential exchange.
  * @param {number} [options.upgradeHeadTimeoutMs] Bound on the wait for an upstream `101`.
  * @param {number} [options.upgradeLingerMs] Grace for a clean upstream WebSocket close.
+ * @param {object} [options.audit] Audit writer (`audit.js`). Omitted = nothing is recorded.
  * @param {object} [options.logger]
  * @returns {Promise<{
  *   server: import('node:http').Server,
@@ -119,6 +148,29 @@ export async function startGateway(options) {
   const now = typeof options.now === 'function' ? options.now : Date.now
   const logger = options.logger
   const upstream = upstreamFor(options.officialPort)
+  /* Optional: a host that never mounted an audit writer still gets a gateway.
+     `recordSafely` below keeps the call site unconditional, so a future event
+     cannot be forgotten just because the writer might be absent. */
+  const audit = options.audit !== null && typeof options.audit === 'object' ? options.audit : null
+
+  /**
+   * Record one audit event, or nothing at all.
+   *
+   * A failing audit write must never fail the request that triggered it — the
+   * request was already authorized and is about to be served. `audit.record`
+   * itself never throws and reports its failures through its own sink; this
+   * wrapper additionally survives an `audit` object that is present but broken.
+   *
+   * @param {{ event: string, deviceId?: string | null, ip?: string | null, meta?: object }} entry
+   */
+  function recordSafely(entry) {
+    if (audit === null || typeof audit.record !== 'function') return
+    try {
+      audit.record(entry)
+    } catch {
+      /* see above: auditing is observability, not authorization */
+    }
+  }
 
   const activity = createActivityTracker({
     touch: (id) => store.touchDevice(id),
@@ -215,6 +267,29 @@ export async function startGateway(options) {
       activity.record(verdict.device.id)
     }
 
+    /* An admitted handshake is the one moment a remote device genuinely "connects"
+       (`design.md` §6). Recorded BEFORE the proxy call so a stream that fails to
+       establish is still visible as an attempted connection, and only for a device
+       — the loopback exemption has no device to attribute it to.
+       `classifyUpgrade` returns `connect` for the multiplexed channel and
+       `unknown` for a channel this hop does not recognize: an unrecognized channel
+       is still an event, and dropping it would be a silent hole in the trail. */
+    const deviceId = verdict.device?.id ?? null
+    recordSafely({ event: classifyUpgrade(req?.url), deviceId, ip: peer })
+
+    /* `disconnect` is emitted from the socket's own close, once. `wsproxy` already
+       registers the socket in its revocation registry and tears it down from
+       `error`/`close`/`end` (§19); binding here as well would be a second listener
+       that could fire twice for one socket, so the pairing is done with a flag. */
+    if (deviceId !== null) {
+      let counted = false
+      socket.once('close', () => {
+        if (counted) return
+        counted = true
+        recordSafely({ event: 'disconnect', deviceId, ip: peer })
+      })
+    }
+
     upgradeProxy.handle({ req, socket, head, verdict, peer })
   }
 
@@ -233,6 +308,21 @@ export async function startGateway(options) {
    */
   function handle(req, res) {
     const peer = peerAddress(req?.socket)
+
+    /* The admin API lives on the OFFICIAL loopback server (`api.js`), and this hop
+       must refuse it explicitly: the gateway rewrites `Host` to the loopback
+       upstream authority before forwarding, so a proxied admin request would
+       arrive at the official server over a loopback socket with a loopback Host —
+       satisfying that API's `isLoopback()` guard. Refusing here is what makes
+       `prd.md` R4's boundary real rather than assumed. Answered before
+       authorization so a paired device learns the same thing an unpaired one does:
+       this path does not exist on this port. */
+    if (isAdminPath(req?.url) === true) {
+      sendError(res, 403, 'gateway/admin-not-here', 'Device management is only available from this machine.')
+      emit(logger, 'debug', '[remote-control] refused an admin API request on the gateway port')
+      return
+    }
+
     let verdict
     try {
       verdict = authorize({ req, store, cookieName })
@@ -260,6 +350,25 @@ export async function startGateway(options) {
        `record` is throttled (7.06 ms per unthrottled write — see `activity.js`). */
     if (verdict.device !== null && verdict.device !== undefined) {
       activity.record(verdict.device.id)
+    }
+
+    /* The audit line (`prd.md` R5, `design.md` §6). `classify` answers with the
+       ACTION and nothing else — path prefix + method, because this hop does not
+       understand DSH semantics — and returns `null` for a read, which is not an
+       action. An unrecognized write is `unknown`: recorded, never guessed.
+       The request body is never read here, which is the structural half of
+       "audit records actions, never content". */
+    const event = classify(req?.method, req?.url)
+    if (event !== null) {
+      recordSafely({
+        event,
+        deviceId: verdict.device?.id ?? null,
+        ip: peer,
+        /* Identifiers only. `path` is the request target WITHOUT its query string:
+           a query can carry a prompt fragment or a file path, and the trail has no
+           business holding either. */
+        meta: { method: String(req?.method ?? ''), path: pathnameOf(req?.url) },
+      })
     }
 
     proxy
@@ -460,6 +569,39 @@ export async function startGateway(options) {
     upgradeProxy,
     revokeDevice,
     close,
+  }
+}
+
+/**
+ * Whether a request target names the admin API prefix.
+ *
+ * Shared with `api.js` through `ADMIN_API_PREFIX`, so the route the official
+ * server serves and the route this port refuses can never diverge.
+ *
+ * @param {string | undefined} target
+ * @returns {boolean}
+ */
+export function isAdminPath(target) {
+  const pathname = pathnameOf(target)
+  return pathname === ADMIN_API_PREFIX || pathname.startsWith(`${ADMIN_API_PREFIX}/`)
+}
+
+/**
+ * The pathname of a request target, or '' when it cannot be parsed.
+ *
+ * Used so an audit `meta.path` never carries a query string: a query can contain
+ * a prompt fragment or a file path, and the trail must hold neither
+ * (`logging-guidelines.md`).
+ *
+ * @param {string | undefined} target
+ * @returns {string}
+ */
+function pathnameOf(target) {
+  if (typeof target !== 'string' || target === '') return ''
+  try {
+    return new URL(target, 'http://localhost').pathname
+  } catch {
+    return ''
   }
 }
 

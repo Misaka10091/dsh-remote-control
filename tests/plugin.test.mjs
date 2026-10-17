@@ -12,7 +12,7 @@
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import path from 'node:path'
 
@@ -89,12 +89,37 @@ test('createRuntime keeps two runtimes independent', () => {
 })
 
 test('apply logs exactly one line through ctx.logger.info', async () => {
+  /* Stage 0's acceptance, and it still holds: the LOAD path prints one info line.
+     Since stage 4 there can additionally be one `warn` when the host provides no
+     `webServer.register` (the panel's backend is then absent, and silence would
+     be the wrong answer — `quality-guidelines.md` §5). No `webServer` is passed
+     here, so that warning is expected and is asserted rather than tolerated. */
   await withTempHome(() => {
     const { calls, logger } = recordingLogger()
     entry.apply({ logger })
 
-    assert.equal(calls.length, 1, 'stage 0 acceptance is exactly one line')
-    assert.equal(calls[0].level, 'info')
+    const infos = calls.filter((call) => call.level === 'info')
+    assert.equal(infos.length, 1, 'stage 0 acceptance is exactly one info line')
+    assert.equal(infos[0].level, 'info')
+    assert.match(infos[0].message, /^\[remote-control\] loaded/)
+
+    /* Exactly one warning, and only for the documented reason. Two would mean the
+       degradation is reported twice; none would mean it is silent. */
+    const warns = calls.filter((call) => call.level === 'warn')
+    assert.equal(warns.length, 1, 'the missing admin route is reported exactly once')
+    assert.match(warns[0].message, /register is unavailable/)
+  })
+})
+
+test('with a web server available, apply logs the load line and nothing else', async () => {
+  /* The stage-0 shape, restored: once the host CAN serve the panel's backend
+     there is no degradation to report, so the load path is exactly one line. */
+  await withTempHome(() => {
+    const { calls, logger } = recordingLogger()
+    const ctx = { logger, webServer: { port: 1, register: () => () => {} }, effect: (run) => run() }
+    entry.apply(ctx)
+
+    assert.equal(calls.length, 1, 'one line, and it is the load line')
     assert.match(calls[0].message, /^\[remote-control\] loaded/)
   })
 })
@@ -177,13 +202,20 @@ test('apply fails loudly on a corrupt device table instead of pretending remote 
  */
 function gatewayContext({ officialPort, logger }) {
   const effects = []
+  const effectLabels = []
   return {
     effects,
+    effectLabels,
     logger,
-    webServer: { port: officialPort },
+    webServer: { port: officialPort, register: () => () => {} },
     get: () => undefined,
-    effect: (execute) => {
-      effects.push(execute())
+    /* Cordis hands `ctx.effect` an acquire function and keeps what it RETURNS as
+       the disposer, so the stub does the same — that is what makes "the route's
+       disposer is the registration's return value" testable here. */
+    effect: (acquire, label) => {
+      const release = typeof acquire === 'function' ? acquire() : undefined
+      effects.push(typeof release === 'function' ? release : () => {})
+      effectLabels.push(label)
       return () => {}
     },
   }
@@ -204,16 +236,30 @@ async function stubOfficialPort() {
 
 test('apply starts no listener while remote access is off', async () => {
   /* PRD D1 / acceptance 1: with the switch off, behaviour is identical to a host
-     without the plugin. The strongest form of that is "no socket, no effect". */
+     without the plugin. The strongest form of that is "no socket".
+
+     Since stage 4 two effects ARE registered while the switch is off — the audit
+     retention timer and the admin API route — and neither opens a listening port:
+     the admin API is served by the host's own loopback web server, and the timer
+     touches one directory. So the assertion moved from "no effect at all" to
+     "no LISTENER", which is what the requirement is actually about. */
   await withTempHome(() => {
     const { calls, logger } = recordingLogger()
     const ctx = gatewayContext({ officialPort: 1, logger })
 
     const result = entry.apply(ctx)
     assert.equal(result, undefined, 'nothing is binding, so nothing is returned')
-    assert.equal(calls.length, 1, 'still exactly one load line')
     assert.match(calls[0].message, /remote access off/)
-    assert.deepEqual(ctx.effects, [], 'no effect was registered')
+
+    /* Every registered effect must be one of the two stage-4 effects, and neither
+       may be a socket. Asserting the LABELS is what makes this a real test: a
+       future `server.listen()` registered here would fail it. */
+    assert.deepEqual(
+      ctx.effectLabels,
+      ['remote-control: audit retention', 'remote-control: admin API'],
+      'only the retention timer and the admin route, no gateway listener',
+    )
+    for (const dispose of ctx.effects) dispose()
   })
 })
 
@@ -243,8 +289,20 @@ test('apply binds a gateway and logs one listening line when remote access is on
       /* Never a token or a cookie value. */
       assert.ok(!/[A-Za-z0-9_-]{43,}/.test(listening), 'the listening line carries no secret')
 
-      assert.equal(ctx.effects.length, 1, 'the listener registered exactly one disposer')
-      await ctx.effects[0]()
+      /* Three effects now: the retention timer, the admin route and the listener.
+         The LISTENER is the last one, and it is the one that must be released or
+         the port stays held for the rest of the run. Disposing all three is what
+         the old single-disposer version was doing implicitly. */
+      assert.deepEqual(
+        ctx.effectLabels,
+        [
+          'remote-control: audit retention',
+          'remote-control: admin API',
+          'remote-control: gateway listener',
+        ],
+        'the listener is the third effect, and it is registered last',
+      )
+      for (const dispose of ctx.effects) await dispose()
     })
   } finally {
     await official.close()
@@ -268,6 +326,8 @@ test('apply logs the load line before the listening line, so a bind failure is a
         (error) => error.code === 'EADDRINUSE',
         'a port in use must fail the row, not be warned about',
       )
+      /* The load line was printed; the listening line was not. No warn either,
+         because this context CAN register the admin route. */
       assert.equal(calls.length, 1, 'the load line was printed, the listening line was not')
       assert.match(calls[0].message, /loaded/)
     })
@@ -291,5 +351,79 @@ test('apply refuses to start when the official server reports no port', async ()
       (error) => error.code === 'gateway/invalid-upstream',
     )
     assert.equal(calls.filter((call) => /gateway listening/.test(call.message)).length, 0)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * Stage 4: the audit retention sweep is gated on nothing
+ * ------------------------------------------------------------------ */
+
+test('apply prunes expired audit day files at startup, even with remote access off', async () => {
+  /* `prd.md` R5's retention is about the FILES, not about the feature being on. A
+     user who turns remote access off for a month must not come back to a
+     directory full of files older than the documented window. */
+  await withTempHome((home) => {
+    const baseDir = path.join(home, '.dsh', 'remote-control')
+    const runtime = entry.createRuntime({ baseDir })
+    const today = Date.now()
+    /* One file well outside the window, one inside it. Dates are derived from the
+       real clock because `apply` resolves its own clock — the point here is that
+       the sweep runs on the LOAD path, not that it can be time-travelled. */
+    const expired = new Date(today - 40 * 86_400_000).toISOString().slice(0, 10)
+    const fresh = new Date(today - 2 * 86_400_000).toISOString().slice(0, 10)
+    mkdirSync(baseDir, { recursive: true })
+    writeFileSync(path.join(baseDir, `audit-${expired}.jsonl`), '')
+    writeFileSync(path.join(baseDir, `audit-${fresh}.jsonl`), '')
+    /* And a file that is NOT ours: the sweep must not touch it. */
+    writeFileSync(path.join(baseDir, 'notes.txt'), 'keep me')
+
+    const { calls, logger } = recordingLogger()
+    const ctx = gatewayContext({ officialPort: 1, logger })
+    entry.apply(ctx)
+
+    assert.equal(existsSync(path.join(baseDir, `audit-${expired}.jsonl`)), false, 'the expired file is gone')
+    assert.equal(existsSync(path.join(baseDir, `audit-${fresh}.jsonl`)), true, 'the fresh one is kept')
+    assert.equal(existsSync(path.join(baseDir, 'notes.txt')), true, 'a foreign file is never deleted')
+    assert.ok(
+      calls.some((call) => call.level === 'warn' && /audit retention removed 1 expired/.test(call.message)),
+      'the deletion is reported once, as a warning',
+    )
+    for (const dispose of ctx.effects) dispose()
+  })
+})
+
+test('an audit failure is a warning, never a fatal load or a thrown request', async () => {
+  /* `quality-guidelines.md` §5 / the module note in `audit.js`: an unwritable
+     audit trail must be VISIBLE but not FATAL. The requests it would have
+     recorded were already authorized, so failing the plugin over it would take
+     remote access down for a reason that has nothing to do with access. */
+  await withTempHome((home) => {
+    /* A FILE where the audit DIRECTORY should be: every listing and every append
+       against it fails with ENOTDIR. (A missing directory is deliberately not a
+       failure — it is the first run.) */
+    const blocked = path.join(home, 'blocked')
+    writeFileSync(blocked, 'not a directory')
+
+    const { calls, logger } = recordingLogger()
+    const audit = entry.createRuntime({
+      baseDir: blocked,
+      onAuditError: (error) => logger.warn(`[remote-control] audit: ${error.code}`),
+    }).audit
+
+    assert.deepEqual(audit.prune().deleted, [], 'prune survives a directory it cannot read')
+    assert.ok(
+      calls.some((call) => /audit: audit\/unreadable/.test(call.message)),
+      'the sweep failure is reported as a warning',
+    )
+
+    /* And a failed append is reported, not thrown: this is the path a request
+       would take. */
+    const line = audit.record({ event: 'connect', deviceId: 'dev_1' })
+    assert.equal(line, null, 'nothing was written')
+    assert.ok(audit.stats.failures > 0, 'the failure was counted')
+    assert.ok(
+      calls.some((call) => /audit: audit\/write-failed/.test(call.message)),
+      'the append failure is reported too',
+    )
   })
 })

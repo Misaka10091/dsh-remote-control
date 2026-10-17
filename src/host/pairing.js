@@ -143,6 +143,11 @@ function pairingError(code, message) {
  * @param {number} [options.maxAttempts] Wrong codes one pair tolerates; defaults to `PAIRING_MAX_ATTEMPTS`.
  * @param {number} [options.ipMaxFailures] Wrong codes one source address tolerates per window; defaults to `PAIRING_IP_MAX_FAILURES`.
  * @param {number} [options.ipWindowMs] Length of that window; defaults to `PAIRING_IP_WINDOW_MS`.
+ * @param {(failure: { pairId: string | null, source: string | null, code: string }) => void} [options.onFailure]
+ *   Called once per failed redemption. This module stays free of the audit writer
+ *   (it touches no filesystem, `directory-structure.md`), so the wiring is a
+ *   callback: `index.js` points it at `audit.record({ event: 'pair_failed', … })`.
+ *   A throwing callback is swallowed — observability must never break pairing.
  * @returns {{
  *   create: (options?: { label?: string }) => { pairId: string, code: string, createdAt: number, expiresAt: number, label: string | null },
  *   redeem: (pairId: unknown, code: unknown, options?: { source?: string }) => { pairId: string, label: string | null, createdAt: number, expiresAt: number },
@@ -165,6 +170,12 @@ export function createPairingStore(options = {}) {
   const ipWindowMs = Number.isFinite(options.ipWindowMs) && options.ipWindowMs > 0
     ? options.ipWindowMs
     : PAIRING_IP_WINDOW_MS
+  /* The failed-redemption callback (`pair_failed` auditing, `prd.md` D5 /
+     `research/official-connection-fence.md` §7.1: "爆破不可见" — the user cannot
+     notice someone guessing unless a failed attempt leaves a trace). Optional so
+     the module keeps working with no observer at all, and never allowed to throw
+     into `redeem`: an audit sink is observability, not part of the decision. */
+  const onFailure = typeof options.onFailure === 'function' ? options.onFailure : () => {}
 
   /**
    * @type {Map<string, {
@@ -309,6 +320,35 @@ export function createPairingStore(options = {}) {
   }
 
   /**
+   * Report one failed redemption to the injected observer, never throwing.
+   *
+   * Called at the SINGLE point where a guess is spent (`registerFailure`), so
+   * every path that debits a budget also reports exactly one failure — the two
+   * cannot drift apart. A source-lockout rejection is reported too: by the time
+   * an address has spent its budget it has produced one line per attempt, and
+   * the last attempt was itself a guess.
+   *
+   * `pairId` is passed through for correlation, NOT for content: it is an
+   * opaque `pair_*` id, never the code. The code is never in scope here at all,
+   * which is the structural reason a pairing code cannot reach the audit trail.
+   *
+   * @param {string | null} pairId Id the guess named, or null when none was found.
+   * @param {string | undefined} source Caller address.
+   * @param {string} code Stable reason code.
+   */
+  function reportFailure(pairId, source, code) {
+    try {
+      onFailure({
+        pairId: typeof pairId === 'string' && pairId !== '' ? pairId : null,
+        source: typeof source === 'string' && source !== '' ? source : null,
+        code,
+      })
+    } catch {
+      /* A broken observer must not turn a failed pairing into a thrown one. */
+    }
+  }
+
+  /**
    * Consume a pair.
    *
    * The order of the checks is deliberate and must not be reshuffled:
@@ -343,24 +383,31 @@ export function createPairingStore(options = {}) {
     const source = typeof redeemOptions.source === 'string' ? redeemOptions.source : undefined
 
     if (isSourceLockedOut(source, at)) {
+      /* Reported as well: this request was a guess, and its rejection is exactly
+         the moment an operator needs to see. Without it the trail would end at
+         the last attempt that still counted, and every later attempt from a
+         blocked address would be invisible — the loudest part of an attack. */
+      reportFailure(pairId, source, 'pairing/source-locked')
       throw pairingError('pairing/source-locked', 'too many failed pairing attempts from this address')
     }
 
     const entry = typeof pairId === 'string' ? entries.get(pairId) : undefined
     if (entry === undefined) {
-      throw pairingError(
-        registerFailure(source, at, undefined, 'pairing/unknown'),
-        'pairing code not found',
-      )
+      const code = registerFailure(source, at, undefined, 'pairing/unknown')
+      reportFailure(pairId, source, code)
+      throw pairingError(code, 'pairing code not found')
     }
     if (isPairLockedOut(entry)) {
-      throw pairingError(
-        registerFailure(source, at, undefined, 'pairing/locked'),
-        'too many failed attempts for this pairing code',
-      )
+      const code = registerFailure(source, at, undefined, 'pairing/locked')
+      reportFailure(pairId, source, code)
+      throw pairingError(code, 'too many failed attempts for this pairing code')
     }
     if (at >= entry.expiresAt) {
       entries.delete(entry.pairId)
+      /* NOT a guess: the caller presented no code, or the right one — the pair
+         simply aged out. `design.md` §3.1's TTL is normal operation, and an
+         `expired` line would be noise a user learns to ignore, which is how a
+         real `pair_failed` gets overlooked. */
       throw pairingError('pairing/expired', 'pairing code expired')
     }
     if (entry.usedAt !== null) throw pairingError('pairing/used', 'pairing code already redeemed')
@@ -371,8 +418,10 @@ export function createPairingStore(options = {}) {
          caller to discover it on the next request would mean the response to their
          own guess never mentions what it did. */
       const exhausted = entry.failures + 1 >= maxAttempts
+      const failureCode = registerFailure(source, at, entry, exhausted ? 'pairing/locked' : 'pairing/invalid-code')
+      reportFailure(entry.pairId, source, failureCode)
       throw pairingError(
-        registerFailure(source, at, entry, exhausted ? 'pairing/locked' : 'pairing/invalid-code'),
+        failureCode,
         exhausted ? 'too many failed attempts for this pairing code' : 'pairing code mismatch',
       )
     }
