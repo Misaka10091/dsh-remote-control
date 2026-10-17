@@ -11,7 +11,7 @@
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -24,6 +24,30 @@ function readJson(relativePath) {
 
 const pkg = readJson('package.json')
 const manifest = readJson('dsh.plugin.json')
+
+/**
+ * Every host-side source file the package ships.
+ *
+ * Enumerated from disk rather than hand-listed: the point of the assertions that
+ * use it is to cover files a future edit adds, and a hard-coded list would silently
+ * stop covering the new ones.
+ *
+ * @returns {string[]} Repo-relative POSIX paths.
+ */
+function hostSources() {
+  const sources = ['src/index.js']
+  const hostDir = path.join(repoRoot, 'src', 'host')
+  for (const entry of readdirSync(hostDir, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.endsWith('.js')) sources.push(`src/host/${entry.name}`)
+  }
+  const gatewayDir = path.join(hostDir, 'gateway')
+  if (existsSync(gatewayDir)) {
+    for (const entry of readdirSync(gatewayDir, { withFileTypes: true })) {
+      if (entry.isFile() && entry.name.endsWith('.js')) sources.push(`src/host/gateway/${entry.name}`)
+    }
+  }
+  return sources
+}
 
 test('package.json carries the documented identity', () => {
   assert.equal(pkg.name, '@misaka10091/dsh-remote-control')
@@ -103,7 +127,7 @@ test('the locale files are valid JSON and share one key set', () => {
 test('the host half never shells out', () => {
   /* No external process is needed anywhere in this package; `shell: true` or an
      `exec` would be a supply-chain surface for no benefit. */
-  const sources = ['src/index.js', 'src/host/store.js', 'src/host/pairing.js', 'src/host/tokens.js']
+  const sources = hostSources()
   for (const relative of sources) {
     const source = readFileSync(path.join(repoRoot, relative), 'utf8')
     assert.ok(!/shell\s*:\s*true/.test(source), `${relative} must not use shell: true`)
@@ -113,10 +137,97 @@ test('the host half never shells out', () => {
 })
 
 test('the host half logs through ctx.logger, never console', () => {
-  for (const relative of ['src/index.js']) {
+  for (const relative of hostSources()) {
     const source = readFileSync(path.join(repoRoot, relative), 'utf8')
-    assert.ok(!/console\.(log|info|warn|error|debug)\(/.test(source), `${relative} must not log to the console`)
+    /* `console.` in a comment is fine; a call is not. */
+    assert.ok(
+      !/console\.(log|info|warn|error|debug)\s*\(/.test(source),
+      `${relative} must not log to the console`,
+    )
   }
+})
+
+test('the host half imports only node: built-ins and its own modules', () => {
+  /* Zero runtime dependencies is locked by the test above, but an import of a bare
+     package would escape it: the module resolution would simply fail at load time
+     on a host that does not happen to have it. */
+  const allowedBare = new Set()
+  for (const relative of hostSources()) {
+    const source = readFileSync(path.join(repoRoot, relative), 'utf8')
+    for (const match of source.matchAll(/^\s*import\s[^'"]*['"]([^'"]+)['"]/gm)) {
+      const specifier = match[1]
+      const ok = specifier.startsWith('node:')
+        || specifier.startsWith('./')
+        || specifier.startsWith('../')
+        || allowedBare.has(specifier)
+      assert.ok(ok, `${relative} imports ${specifier}, which is outside the allowed set`)
+    }
+  }
+})
+
+test('the WebSocket proxy does not exist yet and nothing imports ws', () => {
+  /* Stage 3 owns the upgrade passthrough. Measured ground truth
+     (`research/official-connection-fence.md` §6.1) is that it needs no `ws` — bare
+     `node:net` byte passthrough — so the zero-dependency claim survives it. This
+     assertion guards the claim from being quietly abandoned in stage 3. */
+  for (const relative of hostSources()) {
+    const source = readFileSync(path.join(repoRoot, relative), 'utf8')
+    assert.ok(!/from\s+['"]ws['"]/.test(source), `${relative} must not import ws`)
+    assert.ok(!/require\(\s*['"]ws['"]\s*\)/.test(source), `${relative} must not require ws`)
+  }
+})
+
+test('the gateway modules exist and are all packaged', () => {
+  /* `files` is the publish boundary; a gateway module missing from it ships a
+     package that cannot start. */
+  const gatewayModules = [
+    'src/host/gateway/server.js',
+    'src/host/gateway/auth.js',
+    'src/host/gateway/origin.js',
+    'src/host/gateway/inner-auth.js',
+    'src/host/gateway/proxy.js',
+    'src/host/gateway/activity.js',
+  ]
+  for (const relative of gatewayModules) {
+    assert.ok(existsSync(path.join(repoRoot, relative)), `missing gateway module: ${relative}`)
+    assert.ok(pkg.files.includes(relative), `${relative} must be listed in files`)
+  }
+})
+
+test('every host source is syntax-checked by check:syntax', () => {
+  /* A module added without being wired into the script is a module whose syntax
+     error is only discovered at load time. The script enumerates files explicitly
+     (not a glob), so this is the assertion that keeps the list honest. */
+  for (const relative of hostSources()) {
+    assert.ok(
+      pkg.scripts['check:syntax'].includes(relative),
+      `${relative} is missing from check:syntax`,
+    )
+  }
+})
+
+test('the gateway never logs or transmits inner credential material', () => {
+  /* The security red line (`design.md` §4.4): the `dsh-auth-*` cookie is
+     equivalent to full access to the instance. It may exist only on the
+     gateway → upstream hop. A log call or a response header carrying it would hand
+     it to anyone who can read the host log or the client. */
+  for (const relative of hostSources()) {
+    const source = readFileSync(path.join(repoRoot, relative), 'utf8')
+    /* Any log line interpolating a value named like the inner credential. */
+    assert.ok(
+      !/(emit|logger\.\w+)\([^)]*\$\{[^}]*(innerCookie|cookieValue|inner)\b/i.test(source),
+      `${relative} appears to interpolate credential material into a log line`,
+    )
+  }
+
+  /* `proxy.js` must filter the upstream `set-cookie`, and `inner-auth.js` must
+     filter the client's outbound one. Both directions, or the credential leaks at
+     one hop or the other. */
+  const proxy = readFileSync(path.join(repoRoot, 'src/host/gateway/proxy.js'), 'utf8')
+  assert.match(proxy, /carriesInnerCookie/, 'the proxy must filter upstream set-cookie')
+
+  const innerAuth = readFileSync(path.join(repoRoot, 'src/host/gateway/inner-auth.js'), 'utf8')
+  assert.match(innerAuth, /startsWith\(COOKIE_PREFIX\)/, 'outbound client cookies must be filtered')
 })
 
 test('the host half stores no plaintext token field', () => {

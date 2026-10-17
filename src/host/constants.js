@@ -54,3 +54,73 @@ export const DEFAULT_GATEWAY_PORT = 3090
 
 /** Leading string of every device id, so an id can never be mistaken for a token hash. */
 export const DEVICE_ID_PREFIX = 'dev_'
+
+/**
+ * The device-facing cookie name (`design.md` §3.1 step 5, §3.2).
+ *
+ * Deliberately NOT under the official `dsh-auth-` prefix: that prefix names the
+ * inner browser-session credential, which binds to the upstream authority
+ * (`research/official-connection-fence.md` §2.2). A device cookie sharing that
+ * prefix would be indistinguishable from inner credential material at exactly
+ * the hop where the two must never be confused.
+ */
+export const DEVICE_COOKIE_NAME = 'dsh-rc-device'
+
+/** Lifetime of the device cookie: 30 days, matching the official browser session. */
+export const DEVICE_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+
+/**
+ * Failed redemptions a single pairing id tolerates before it is destroyed
+ * (`research/official-connection-fence.md` §7.1 — there is no limit at all
+ * otherwise, and a leaked `pairId` turns an 8-character code into a guessable
+ * target).
+ */
+export const PAIRING_MAX_ATTEMPTS = 5
+
+/**
+ * Failed redemptions a single source address tolerates per window.
+ *
+ * Independent of the per-pair counter on purpose: `pairId` is attacker-chosen
+ * on a request, so rotating it must not reset the budget. 20 is far above human
+ * mistyping (which the per-pair lock already caps at 5) and far below anything
+ * that helps an attacker, whose search space is 32^8.
+ */
+export const PAIRING_IP_MAX_FAILURES = 20
+
+/** Sliding window of the per-source failure budget. */
+export const PAIRING_IP_WINDOW_MS = 60_000
+
+/**
+ * Bind address of the gateway listener.
+ *
+ * All interfaces: the whole point is that a phone on the LAN can reach it
+ * (`design.md` §2 — `0.0.0.0:<remotePort>`). The official port stays on
+ * `127.0.0.1`, so this listener is the only way in and every request through it
+ * is authenticated.
+ */
+export const GATEWAY_BIND_HOST = '0.0.0.0'
+
+/**
+ * Prefix of the inner browser-session cookie minted by
+ * `@deepseek-ai/dsh-client-connection` (`research/official-connection-fence.md` §2.2).
+ *
+ * Every cookie with this prefix that a CLIENT sends is dropped before forwarding:
+ * the value is bound to the upstream authority, so a client can never hold a
+ * usable one, and letting one cross the hop would put client-controlled bytes in
+ * the position of instance-wide credential material.
+ */
+export const INNER_COOKIE_PREFIX = 'dsh-auth-'
+
+/**
+ * Minimum spacing between persisted `lastSeenAt` writes per device
+ * (`research/official-connection-fence.md` §7.2 — an unthrottled write costs
+ * 7.06 ms of fsync, capping throughput near 140 req/s).
+ */
+export const ACTIVITY_PERSIST_INTERVAL_MS = 30_000
+
+/**
+ * How long a failed inner-credential redemption is remembered before another
+ * attempt is made. Prevents a per-request redemption storm while DSH is down,
+ * without pinning the gateway into permanent degradation.
+ */
+export const INNER_AUTH_RETRY_INTERVAL_MS = 1_000

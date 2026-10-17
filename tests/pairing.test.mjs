@@ -11,6 +11,9 @@ import { test } from 'node:test'
 import {
   PAIRING_CODE_ALPHABET,
   PAIRING_CODE_LENGTH,
+  PAIRING_IP_MAX_FAILURES,
+  PAIRING_IP_WINDOW_MS,
+  PAIRING_MAX_ATTEMPTS,
   PAIRING_TTL_MS,
 } from '../src/host/constants.js'
 import { createPairingStore, normalizePairingCode } from '../src/host/pairing.js'
@@ -125,13 +128,17 @@ test('an unknown pairId fails', () => {
 })
 
 test('non-string pairIds and codes fail without throwing a TypeError', () => {
-  const { pairing } = makePairing()
-  const pair = pairing.create()
-
-  for (const pairId of [undefined, null, 0, {}, [], pair]) {
+  /* A fresh store per case: from stage 2 on, a failed redemption spends the
+     per-source budget, so one store across six failures would start reporting
+     `pairing/source-locked` partway through and stop testing what it means to. */
+  for (const pairId of [undefined, null, 0, {}, [], 'pair']) {
+    const { pairing } = makePairing()
+    const pair = pairing.create()
     assertCode(() => pairing.redeem(pairId, pair.code), 'pairing/unknown')
   }
   for (const code of [undefined, null, 0, {}, []]) {
+    const { pairing } = makePairing()
+    const pair = pairing.create()
     assertCode(() => pairing.redeem(pair.pairId, code), 'pairing/invalid-code')
   }
 })
@@ -206,4 +213,188 @@ test('pending counts redeemable pairs, not consumed ones', () => {
      `pairing/used`, but it is no longer redeemable — the panel must not offer it. */
   assert.equal(pairing.pending(), 0)
   assertCode(() => pairing.redeem(pair.pairId, pair.code), 'pairing/used')
+})
+
+/* ------------------------------------------------------------------ *
+ * Gap A: guessing must be bounded (research §7.1)
+ *
+ * Measured before this was fixed: five wrong codes against one pairId all
+ * returned `pairing/invalid-code` with no counting or lockout, and the correct
+ * code still redeemed afterwards. These tests exist to keep that closed.
+ * ------------------------------------------------------------------ */
+
+/** A wrong code guaranteed to differ from `code`, in the canonical alphabet. */
+function wrongCodeFor(code) {
+  return code === 'AAAAAAAA' ? 'AAAAAAAB' : 'AAAAAAAA'
+}
+
+test('five wrong codes destroy the pair and it reports pairing/locked', () => {
+  const { pairing } = makePairing()
+  const pair = pairing.create()
+  const wrong = wrongCodeFor(pair.code)
+
+  /* Failures 1-4 are ordinary mismatches. */
+  for (let attempt = 1; attempt < PAIRING_MAX_ATTEMPTS; attempt += 1) {
+    assertCode(() => pairing.redeem(pair.pairId, wrong), 'pairing/invalid-code')
+  }
+
+  /* The fifth is the one that reaches the limit, and it reports the lockout. */
+  assertCode(() => pairing.redeem(pair.pairId, wrong), 'pairing/locked')
+
+  /* The pair is gone from the panel's point of view. */
+  assert.equal(pairing.pending(), 0, 'a locked pair is not offered for redemption')
+
+  /* And the correct code no longer works — this is the whole point. */
+  assertCode(() => pairing.redeem(pair.pairId, pair.code), 'pairing/locked')
+})
+
+test('a locked pair keeps reporting pairing/locked, not pairing/unknown', () => {
+  /* Deleting the entry outright would make the sixth attempt report
+     `pairing/unknown`, silently changing what the error means once the limit is
+     hit. The tombstone is bounded by the pair's own TTL. */
+  const { pairing } = makePairing()
+  const pair = pairing.create()
+  const wrong = wrongCodeFor(pair.code)
+
+  for (let attempt = 0; attempt < PAIRING_MAX_ATTEMPTS; attempt += 1) {
+    try {
+      pairing.redeem(pair.pairId, wrong)
+    } catch {
+      /* counted below */
+    }
+  }
+  assertCode(() => pairing.redeem(pair.pairId, wrong), 'pairing/locked')
+  assertCode(() => pairing.redeem(pair.pairId, pair.code), 'pairing/locked')
+})
+
+test('the per-pair limit is independent of the per-source limit', () => {
+  /* A user with a fresh pair, from an address with no history, gets the full
+     PAIRING_MAX_ATTEMPTS budget on that pair even though another address has
+     already burned its own. */
+  const { pairing } = makePairing()
+  const victim = pairing.create()
+
+  /* Spend another address's entire budget against other pairs. */
+  for (let index = 0; index < PAIRING_IP_MAX_FAILURES; index += 1) {
+    try {
+      pairing.redeem('pair_nope', 'AAAAAAAA', { source: '203.0.113.9' })
+    } catch {
+      /* expected */
+    }
+  }
+
+  const wrong = wrongCodeFor(victim.code)
+  assertCode(
+    () => pairing.redeem(victim.pairId, wrong, { source: '198.51.100.4' }),
+    'pairing/invalid-code',
+  )
+  assert.ok(
+    pairing.redeem(victim.pairId, victim.code, { source: '198.51.100.4' }),
+    'a clean address still redeems after one bad attempt',
+  )
+})
+
+test('rotating pairId does not bypass the per-source failure budget', () => {
+  /* `pairId` is attacker-chosen on every request, so a per-pair counter alone is
+     bypassed by simply varying it. This is the test that proves the second,
+     independent limit is doing the work. */
+  const { pairing } = makePairing()
+  const pairs = []
+  for (let index = 0; index < PAIRING_IP_MAX_FAILURES; index += 1) {
+    pairs.push(pairing.create())
+  }
+  pairing.sweep()
+
+  const source = '192.0.2.55'
+  let lockedAt = -1
+  for (let index = 0; index < PAIRING_IP_MAX_FAILURES; index += 1) {
+    /* A different pairId each time — the bypass attempt. */
+    try {
+      pairing.redeem('pair_' + String(index), 'AAAAAAAA', { source })
+    } catch (error) {
+      if (error.code === 'pairing/source-locked') {
+        lockedAt = index
+        break
+      }
+    }
+  }
+
+  /* The attempt that spends the last unit of budget reports the lockout itself,
+     so the address is locked on index MAX-1 — the caller learns immediately
+     rather than discovering it on the next request. */
+  assert.equal(lockedAt, PAIRING_IP_MAX_FAILURES - 1, 'the address is locked on the attempt that spends its budget')
+
+  /* Even a REAL pair and its REAL code is refused now: the address is locked out
+     before any pair is even looked at. */
+  const real = pairs[0]
+  assertCode(() => pairing.redeem(real.pairId, real.code, { source }), 'pairing/source-locked')
+})
+
+test('the per-source budget slides with the window instead of staying locked forever', () => {
+  const { pairing, clock } = makePairing()
+  const source = '192.0.2.77'
+
+  for (let index = 0; index < PAIRING_IP_MAX_FAILURES; index += 1) {
+    try {
+      pairing.redeem('pair_nope', 'AAAAAAAA', { source })
+    } catch {
+      /* expected */
+    }
+  }
+  assertCode(() => pairing.redeem('pair_nope', 'AAAAAAAA', { source }), 'pairing/source-locked')
+
+  /* Once the window has passed, the budget is restored. */
+  clock.now += PAIRING_IP_WINDOW_MS
+  assertCode(() => pairing.redeem('pair_nope', 'AAAAAAAA', { source }), 'pairing/unknown')
+})
+
+test('a successful redemption does not spend the failure budget', () => {
+  const { pairing } = makePairing()
+  const source = '192.0.2.88'
+
+  for (let index = 0; index < PAIRING_IP_MAX_FAILURES * 2; index += 1) {
+    const pair = pairing.create()
+    assert.ok(pairing.redeem(pair.pairId, pair.code, { source }), 'successful redemptions never accumulate')
+    pairing.sweep()
+  }
+})
+
+test('resetSource clears one address budget without touching the others', () => {
+  const { pairing } = makePairing()
+  const blocked = '192.0.2.99'
+
+  for (let index = 0; index < PAIRING_IP_MAX_FAILURES; index += 1) {
+    try {
+      pairing.redeem('pair_nope', 'AAAAAAAA', { source: blocked })
+    } catch {
+      /* expected */
+    }
+  }
+  assertCode(() => pairing.redeem('pair_nope', 'AAAAAAAA', { source: blocked }), 'pairing/source-locked')
+
+  assert.equal(pairing.resetSource(blocked), true, 'the panel can unblock a mistyping user')
+  assert.equal(pairing.resetSource(blocked), false, 'the second reset has nothing to clear')
+  assertCode(() => pairing.redeem('pair_nope', 'AAAAAAAA', { source: blocked }), 'pairing/unknown')
+
+  /* A non-string source is not a source. */
+  assert.equal(pairing.resetSource(undefined), false)
+  assert.equal(pairing.resetSource(''), false)
+})
+
+test('the lockout limits are configurable so a test need not run 20 rounds', () => {
+  const pairing = createPairingStore({ now: () => 0, maxAttempts: 2, ipMaxFailures: 3 })
+  const pair = pairing.create()
+
+  assertCode(() => pairing.redeem(pair.pairId, 'AAAAAAAA'), 'pairing/invalid-code')
+  assertCode(() => pairing.redeem(pair.pairId, 'AAAAAAAA'), 'pairing/locked')
+
+  /* A separate address and a separate pair, so the per-pair limit above does not
+     interfere with the per-source one under test. */
+  const second = pairing.create()
+  const source = '198.51.100.1'
+  assertCode(() => pairing.redeem('pair_nope', 'AAAAAAAA', { source }), 'pairing/unknown')
+  assertCode(() => pairing.redeem('pair_nope', 'AAAAAAAA', { source }), 'pairing/unknown')
+  /* Third failure spends the budget of 3 and reports the lockout. */
+  assertCode(() => pairing.redeem('pair_nope', 'AAAAAAAA', { source }), 'pairing/source-locked')
+  assertCode(() => pairing.redeem(second.pairId, second.code, { source }), 'pairing/source-locked')
 })

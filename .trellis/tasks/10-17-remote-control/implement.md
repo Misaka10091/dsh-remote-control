@@ -20,14 +20,20 @@
 
 ## 阶段 2：网关 HTTP 侧
 
-- [ ] `src/host/gateway/server.js`：自建 `http.Server`，可配置端口，`ctx.effect()` 清理
-- [ ] `src/host/gateway/auth.js`：Cookie 解析、令牌校验、loopback 判定
-- [ ] `src/host/gateway/origin.js`：Origin / Sec-Fetch-Site 校验，无 Origin 写请求拒绝
-- [ ] `src/host/gateway/inner-auth.js`：兑换/缓存/失效重兑内层 `dsh-auth-*` Cookie（见 `research/official-connection-fence.md`）
-- [ ] `src/host/gateway/proxy.js`：上游转发，Host 改写、Origin 剥离、内层 Cookie 注入，SSE/chunked 透传
+- [x] `src/host/gateway/server.js`：自建 `http.Server`，可配置端口，`ctx.effect()` 清理
+- [x] `src/host/gateway/auth.js`：Cookie 解析、令牌校验、loopback 判定
+- [x] `src/host/gateway/origin.js`：Origin / Sec-Fetch-Site 校验，无 Origin 写请求拒绝
+- [x] `src/host/gateway/inner-auth.js`：兑换/缓存/失效重兑内层 `dsh-auth-*` Cookie（见 `research/official-connection-fence.md`）
+- [x] `src/host/gateway/proxy.js`：上游转发，Host 改写、Origin 剥离、内层 Cookie 注入，SSE/chunked 透传
 - **验收**：curl 验证——无 Cookie 401、伪 Origin 403、带 Cookie 200 且内容与直连一致
 
 > **注意**：跳过 `inner-auth` 时，带正确设备 Cookie 的请求仍会在官方层被 401（无回环豁免）。这是阶段 2 最容易被误判为"代理写错"的坑。
+
+> **实施记录（阶段 2 完成）**：
+> - 除上述五个模块外，另加两个：`activity.js`（`lastSeenAt` 节流，见下方补充）与 `wire.js`（响应写出、Cookie 序列化的统一出口，保证"绝不二次 `writeHead`"）。
+> - **Origin 判定取舍**：`design.md` §3.2 的"无 Origin 写请求一律 403"如果按字面无条件执行，会把同源 POST 与 `curl` 一起打死。实际实现为四条分支：`Sec-Fetch-Site: cross-site` 无条件 403；有 Origin 时校验 `origin.host === Host`；无 Origin 但声明 `same-origin`/`same-site` 放行；无 Origin 且无 `Sec-Fetch-Site` 403。理由写在 `origin.js` 顶部注释里。
+> - **端口覆盖**：`apply(ctx, config)` 支持 `config.port` / `config.host` 覆盖存储里的端口，测试用 `port: 0` 绑定 OS 分配端口，绝不占真实端口。
+> - 测试 82 → 232。
 
 ## 阶段 3：网关 WebSocket 侧
 
@@ -38,17 +44,23 @@
 
 ## 阶段 2 补充：配对码防爆破（阶段 1 复盘遗留）
 
-- [ ] `pairing.js`：每个 `pairId` 记录失败次数，超过 5 次直接作废该 pair，返回 `pairing/locked`
-- [ ] 来源 IP 级失败速率限制（与 pairId 级独立，防止换 pairId 绕过）
+- [x] `pairing.js`：每个 `pairId` 记录失败次数，超过 5 次直接作废该 pair，返回 `pairing/locked`
+- [x] 来源 IP 级失败速率限制（与 pairId 级独立，防止换 pairId 绕过）
 - [ ] 失败兑换尝试进审计（见阶段 4 的 `pair_failed` 事件）
 - **依据**：`research/official-connection-fence.md` §7.1（实测无任何限制，可无限尝试）
 
+> **实施记录**：两条限制都在 `pairing.js` 内，仍然纯内存、`now`/`random` 可注入。新增错误码 `pairing/locked`（pair 级）与 `pairing/source-locked`（IP 级）。源级限制用滑动窗口（默认 60s / 20 次，`PAIRING_IP_MAX_FAILURES`、`PAIRING_IP_WINDOW_MS`），不是永久封禁。`resetSource(source)` 供阶段 4 面板解封误伤。审计事件留到阶段 4。
+> 审计那条未勾是**故意**的：`pair_failed` 属于阶段 4 的 `audit.js`，本阶段没有审计写入器。
+
 ## 阶段 2 补充：`lastSeenAt` 写入节流（阶段 1 复盘遗留）
 
-- [ ] 网关不得逐请求调用 `store.touchDevice()`（实测 7.06 ms/次全量 fsync 写盘，吞吐会被锁死在约 140 req/s）
-- [ ] 改为进程内节流：`deviceId → 上次落盘时间`，不足 30s 只更新内存
-- [ ] 进程退出 / 吊销 / 面板读取时强制 flush
+- [x] 网关不得逐请求调用 `store.touchDevice()`（实测 7.06 ms/次全量 fsync 写盘，吞吐会被锁死在约 140 req/s）
+- [x] 改为进程内节流：`deviceId → 上次落盘时间`，不足 30s 只更新内存
+- [x] 进程退出 / 吊销 / 面板读取时强制 flush
 - **依据**：`research/official-connection-fence.md` §7.2
+
+> **实施记录**：落在 `src/host/gateway/activity.js`，`createActivityTracker({ touch, now, intervalMs })`。网关只调 `record(id)`；`dispose()` 已挂进 `ctx.effect()` 的 disposer（进程退出/热重载都会 flush）。`flush(deviceId)` 与 `flush()` 供阶段 4 的吊销与面板读取使用。单测断言 100 次请求只产生 1 次写盘。
+
 
 ## 阶段 4：管理 API 与审计
 

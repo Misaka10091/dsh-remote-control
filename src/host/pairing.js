@@ -17,15 +17,27 @@
  *   - Bounded memory: pending pairs live in a Map that is swept on every create,
  *     so an abandoned code cannot accumulate.
  *   - The code is compared in constant time, and the comparison never throws.
+ *   - GUESSING IS BOUNDED (`research/official-connection-fence.md` §7.1). Before
+ *     this module had any limit, five wrong codes against one `pairId` left the
+ *     pair intact and the right code still redeemable. Two independent limits
+ *     now apply, and they must stay independent:
+ *       · per-pair: `PAIRING_MAX_ATTEMPTS` wrong codes destroy the pair;
+ *       · per-source-address: `PAIRING_IP_MAX_FAILURES` wrong codes per
+ *         `PAIRING_IP_WINDOW_MS`. `pairId` is attacker-supplied, so a per-pair
+ *         limit alone is bypassed by simply varying it.
  *
- * Everything observable is injectable (`now`, `random`) so tests can expire a
- * code without waiting two minutes and mint a deterministic code.
+ * Everything observable is injectable (`now`, `random`, and the three limits) so
+ * tests can expire a code without waiting two minutes, mint a deterministic code,
+ * and exhaust a budget without 20 round trips.
  */
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto'
 
 import {
   PAIRING_CODE_ALPHABET,
   PAIRING_CODE_LENGTH,
+  PAIRING_IP_MAX_FAILURES,
+  PAIRING_IP_WINDOW_MS,
+  PAIRING_MAX_ATTEMPTS,
   PAIRING_TTL_MS,
 } from './constants.js'
 
@@ -128,20 +140,53 @@ function pairingError(code, message) {
  * @param {() => number} [options.now] Clock in epoch milliseconds. Injectable so a test can expire a code.
  * @param {(size: number) => Buffer} [options.random] Random-byte source. Injectable so a test can pin the id and the code.
  * @param {number} [options.ttlMs] Lifetime of a code; defaults to `PAIRING_TTL_MS`.
+ * @param {number} [options.maxAttempts] Wrong codes one pair tolerates; defaults to `PAIRING_MAX_ATTEMPTS`.
+ * @param {number} [options.ipMaxFailures] Wrong codes one source address tolerates per window; defaults to `PAIRING_IP_MAX_FAILURES`.
+ * @param {number} [options.ipWindowMs] Length of that window; defaults to `PAIRING_IP_WINDOW_MS`.
  * @returns {{
  *   create: (options?: { label?: string }) => { pairId: string, code: string, createdAt: number, expiresAt: number, label: string | null },
- *   redeem: (pairId: unknown, code: unknown) => { pairId: string, label: string | null, createdAt: number, expiresAt: number },
+ *   redeem: (pairId: unknown, code: unknown, options?: { source?: string }) => { pairId: string, label: string | null, createdAt: number, expiresAt: number },
  *   sweep: () => number,
  *   pending: () => number,
+ *   resetSource: (source: unknown) => boolean,
  * }}
  */
 export function createPairingStore(options = {}) {
   const now = typeof options.now === 'function' ? options.now : Date.now
   const random = typeof options.random === 'function' ? options.random : randomBytes
   const ttlMs = Number.isFinite(options.ttlMs) && options.ttlMs > 0 ? options.ttlMs : PAIRING_TTL_MS
+  const maxAttempts = Number.isInteger(options.maxAttempts) && options.maxAttempts > 0
+    ? options.maxAttempts
+    : PAIRING_MAX_ATTEMPTS
+  const ipMaxFailures = Number.isInteger(options.ipMaxFailures) && options.ipMaxFailures > 0
+    ? options.ipMaxFailures
+    : PAIRING_IP_MAX_FAILURES
+  const ipWindowMs = Number.isFinite(options.ipWindowMs) && options.ipWindowMs > 0
+    ? options.ipWindowMs
+    : PAIRING_IP_WINDOW_MS
 
-  /** @type {Map<string, { pairId: string, code: string, label: string | null, createdAt: number, expiresAt: number, usedAt: number | null }>} */
+  /**
+   * @type {Map<string, {
+   *   pairId: string,
+   *   code: string,
+   *   label: string | null,
+   *   createdAt: number,
+   *   expiresAt: number,
+   *   usedAt: number | null,
+   *   failures: number,
+   * }>}
+   */
   const entries = new Map()
+
+  /**
+   * Per-source failure budget: address → failure timestamps inside the window.
+   *
+   * Timestamps, not a count, so the window can slide: a burst of failures does
+   * not lock an address out for a full window after the burst has aged out.
+   *
+   * @type {Map<string, number[]>}
+   */
+  const sourceFailures = new Map()
 
   /** Drop expired entries. A consumed entry dies with its TTL, so duplicates can still report `pairing/used`. */
   function sweep() {
@@ -154,6 +199,34 @@ export function createPairingStore(options = {}) {
       }
     }
     return removed
+  }
+
+  /** Drop failure timestamps that have aged out of the window. */
+  function pruneSource(source, at) {
+    const recorded = sourceFailures.get(source)
+    if (recorded === undefined) return []
+    const fresh = recorded.filter((stamp) => at - stamp < ipWindowMs)
+    if (fresh.length === 0) sourceFailures.delete(source)
+    else sourceFailures.set(source, fresh)
+    return fresh
+  }
+
+  /**
+   * Record one failed redemption against its source.
+   *
+   * @param {string | undefined} source Caller-supplied address, or `undefined` when unknowable.
+   */
+  function recordSourceFailure(source, at) {
+    if (source === undefined || source === '') return
+    const recorded = pruneSource(source, at)
+    recorded.push(at)
+    sourceFailures.set(source, recorded)
+  }
+
+  /** Whether this source has already spent its failure budget. */
+  function isSourceLockedOut(source, at) {
+    if (source === undefined || source === '') return false
+    return pruneSource(source, at).length >= ipMaxFailures
   }
 
   /**
@@ -173,32 +246,116 @@ export function createPairingStore(options = {}) {
       createdAt,
       expiresAt,
       usedAt: null,
+      failures: 0,
     }
     entries.set(pairId, entry)
     return { pairId, code, createdAt, expiresAt, label: entry.label }
   }
 
   /**
+   * Consult the per-pair lockout without touching it.
+   *
+   * @param {object | undefined} entry
+   * @returns {boolean}
+   */
+  function isPairLockedOut(entry) {
+    return entry !== undefined && entry.failures >= maxAttempts
+  }
+
+  /**
+   * Spend both failure budgets for one wrong guess, and report the headline.
+   *
+   * Both limits are debited in the SAME call, so they cannot drift apart: every
+   * path that counts a guess counts it exactly once against each budget. The
+   * default headline is `fallback` — the pair's own state, which is what the
+   * caller asked about — but a guess that exhausts the per-source budget
+   * overrides it with `pairing/source-locked`: that state outlives the pair,
+   * applies to the next request regardless of which pair it names, and telling
+   * the user about a burned code while their address is also blocked would send
+   * them chasing the narrower problem.
+   *
+   * @param {string | undefined} source
+   * @param {number} at
+   * @param {object | undefined} entry Pair to debit; undefined when no pair was found.
+   * @param {string} fallback Error code describing the pair's own state.
+   * @returns {string}
+   */
+  function registerFailure(source, at, entry, fallback) {
+    if (entry !== undefined) entry.failures += 1
+    recordSourceFailure(source, at)
+    if (isSourceLockedOut(source, at)) return 'pairing/source-locked'
+    return fallback
+  }
+
+  /**
    * Consume a pair.
+   *
+   * The order of the checks is deliberate and must not be reshuffled:
+   *
+   *   1. source lockout — true regardless of the pair named, so an address that
+   *      has spent its budget learns nothing more about any pair;
+   *   2. per-pair lockout — the pair is already destroyed; say so rather than
+   *      pretending it never existed, which would send the user hunting for a
+   *      typo in a code that was burned on purpose;
+   *   3. unknown / expired / used — the pair's own state;
+   *   4. the code itself — the only constant-time comparison in the sequence.
+   *
+   * Every GUESS spends budget (unknown pairId included — it is a free one-bit
+   * oracle otherwise). An expired or already-redeemed pair is not a guess and
+   * does not: the caller presented the right code, or no code at all.
+   *
+   * A locked pair is KEPT in the map until its TTL expires and reports
+   * `pairing/locked` on every later attempt. Deleting it outright would make the
+   * next attempt report `pairing/unknown`, i.e. the error would silently change
+   * meaning the moment the limit was hit. Its TTL is at most two minutes, so
+   * keeping the tombstone is bounded memory, not a leak.
    *
    * @param {unknown} pairId
    * @param {unknown} code
+   * @param {{ source?: string }} [redeemOptions] Caller address, for the per-source budget.
    * @returns {{ pairId: string, label: string | null, createdAt: number, expiresAt: number }}
-   * @throws {Error} `pairing/unknown` | `pairing/expired` | `pairing/used` | `pairing/invalid-code`
+   * @throws {Error} `pairing/source-locked` | `pairing/locked` | `pairing/unknown` |
+   *   `pairing/expired` | `pairing/used` | `pairing/invalid-code`
    */
-  function redeem(pairId, code) {
+  function redeem(pairId, code, redeemOptions = {}) {
+    const at = now()
+    const source = typeof redeemOptions.source === 'string' ? redeemOptions.source : undefined
+
+    if (isSourceLockedOut(source, at)) {
+      throw pairingError('pairing/source-locked', 'too many failed pairing attempts from this address')
+    }
+
     const entry = typeof pairId === 'string' ? entries.get(pairId) : undefined
-    if (entry === undefined) throw pairingError('pairing/unknown', 'pairing code not found')
-    if (now() >= entry.expiresAt) {
+    if (entry === undefined) {
+      throw pairingError(
+        registerFailure(source, at, undefined, 'pairing/unknown'),
+        'pairing code not found',
+      )
+    }
+    if (isPairLockedOut(entry)) {
+      throw pairingError(
+        registerFailure(source, at, undefined, 'pairing/locked'),
+        'too many failed attempts for this pairing code',
+      )
+    }
+    if (at >= entry.expiresAt) {
       entries.delete(entry.pairId)
       throw pairingError('pairing/expired', 'pairing code expired')
     }
     if (entry.usedAt !== null) throw pairingError('pairing/used', 'pairing code already redeemed')
     const presented = normalizePairingCode(code)
     if (presented === '' || !sameCode(presented, entry.code)) {
-      throw pairingError('pairing/invalid-code', 'pairing code mismatch')
+      /* The attempt that reaches the per-pair limit reports the lockout itself,
+         not `invalid-code`: at that instant the pair is destroyed, and leaving the
+         caller to discover it on the next request would mean the response to their
+         own guess never mentions what it did. */
+      const exhausted = entry.failures + 1 >= maxAttempts
+      throw pairingError(
+        registerFailure(source, at, entry, exhausted ? 'pairing/locked' : 'pairing/invalid-code'),
+        exhausted ? 'too many failed attempts for this pairing code' : 'pairing code mismatch',
+      )
     }
-    entry.usedAt = now()
+    entry.usedAt = at
     return { pairId: entry.pairId, label: entry.label, createdAt: entry.createdAt, expiresAt: entry.expiresAt }
   }
 
@@ -210,15 +367,33 @@ export function createPairingStore(options = {}) {
    * which is why this counts live-and-unused rather than `entries.size`. A
    * consumed pair reported as "pending" would have the panel show a code that
    * can no longer be redeemed.
+   *
+   * A locked pair is excluded for the same reason: it can never be redeemed, so
+   * offering it in the panel would be a lie.
    */
   function pending() {
     sweep()
     let redeemable = 0
     for (const entry of entries.values()) {
-      if (entry.usedAt === null) redeemable += 1
+      if (entry.usedAt === null && entry.failures < maxAttempts) redeemable += 1
     }
     return redeemable
   }
 
-  return { create, redeem, sweep, pending }
+  /**
+   * Forget an address's failure history.
+   *
+   * Exists so a legitimate user who mistyped a few codes on a shared LAN address
+   * can be unblocked — from the desktop panel, which is loopback-only, without
+   * restarting the process. Returns whether anything was actually cleared.
+   *
+   * @param {unknown} source
+   * @returns {boolean}
+   */
+  function resetSource(source) {
+    if (typeof source !== 'string' || source === '') return false
+    return sourceFailures.delete(source)
+  }
+
+  return { create, redeem, sweep, pending, resetSource }
 }

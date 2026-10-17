@@ -1,30 +1,47 @@
 /**
  * dsh-remote-control — host half (plain JavaScript, no build step).
  *
- * A Cordis plugin that will own one pairing-gated channel into the official
+ * A Cordis plugin owning one pairing-gated channel into the official
  * `dsh web` instance (`design.md` §1): a self-hosted listener that authenticates
  * every remote request, then reverse-proxies it to the loopback official port.
  * The official port stays on `127.0.0.1`, so an unpaired request is stopped
  * before it can reach DSH at all.
  *
- * Stage 0/1 scope — what exists here today:
+ * Stage 2 scope — what exists here today:
  *
  *   - the package/manifest skeleton, so the bundle patch installs and the row
  *     loads (this file is the only thing the Node half needs at load time);
  *   - the domain modules under `src/host/` — device store, pairing codes, device
- *     tokens — each pure and independently testable.
+ *     tokens — each pure and independently testable;
+ *   - the HTTP gateway under `src/host/gateway/`: the listener, the single
+ *     authorization decision, the origin fence, the inner-credential provider and
+ *     the reverse proxy.
  *
- * The gateway (`src/host/gateway/*`), the loopback-only admin API and the audit
- * writer land in later stages. Until then `apply` wires the domain runtime and
- * prints exactly ONE line, which is stage 0's acceptance criterion.
+ * The WebSocket upgrade proxy (stage 3), the loopback-only admin API and audit
+ * writer (stage 4) and the client UI (stage 5) land later. Until then a started
+ * gateway forwards HTTP only; `design.md` §4.2's `/api/remote.mux` upgrade is not
+ * yet handled, so a browser that connects can load and read but its live stream
+ * will not establish.
+ *
+ * ## Default off (`prd.md` D1, acceptance 1)
+ *
+ * `apply` starts a listener ONLY when `settings.enabled` is true. A disabled
+ * plugin prints its one line and binds nothing, so `dsh web`'s observable
+ * behaviour is identical to a host without the plugin installed.
  *
  * `inject` declares `webServer` because that is where the upstream port comes
  * from (`ctx.webServer.port`, `design.md` §2). It is declared from the start so
  * the dependency is visible in the plugin graph rather than appearing silently
  * in a later version.
+ *
+ * `ctx.connection` is deliberately NOT injected: it is optional (see
+ * `gateway/inner-auth.js`), read through `ctx.get('connection')`, and its absence
+ * degrades one credential exchange instead of parking the whole plugin.
  */
+import { DEVICE_COOKIE_NAME } from './host/constants.js'
 import { createPairingStore } from './host/pairing.js'
 import { createStore } from './host/store.js'
+import { startGateway } from './host/gateway/server.js'
 
 export const name = 'dsh-remote-control'
 
@@ -89,17 +106,35 @@ export function createRuntime(options = {}) {
 /**
  * Mount the plugin.
  *
- * Stage 0/1: resolve the device table and report state in one line. Nothing is
- * listening yet, so nothing needs a disposer — every listener added from stage 2
- * on must be registered through `ctx.effect()`.
+ * With remote access off, this resolves the device table and prints exactly one
+ * line — stage 0's acceptance criterion, and the "no observable change" guarantee
+ * of `prd.md` D1. With it on, it additionally starts the gateway listener and logs
+ * a second line naming what it bound.
  *
  * A corrupt `devices.json` throws out of `createStore`/`getSettings` on purpose
  * (`.trellis/spec/backend/error-handling.md`): the row goes FAILED and the user
  * sees it, instead of remote access quietly running on an empty device table.
  *
+ * A port that cannot be bound rejects the promise returned by `apply`, which
+ * likewise fails the fiber — the user must not be told remote access is up when
+ * nothing is listening.
+ *
+ * `apply` is a plain function that MAY return a promise, not an `async` function.
+ * The distinction matters: an `async` function converts every synchronous throw
+ * into a rejection, and a corrupt device table (`store/corrupt`) must surface at
+ * the moment of the call so the row fails immediately and visibly. Cordis awaits
+ * a returned promise, so the asynchronous bind still gates activation.
+ *
  * @param {object} ctx Cordis context.
+ * @param {object} [config] Cordis plugin config (the profile row's `config` block).
+ * @param {number} [config.port] Bind port overrides `settings.port`.
+ *   `0` asks the OS for one. Exists for two callers: a profile that wants to pin
+ *   the port without editing `devices.json`, and a test that must not bind a real
+ *   port (`implement.md` — tests bind port 0, never a fixed one).
+ * @param {string} [config.host] Bind address overrides the all-interfaces default.
+ * @returns {Promise<void> | undefined} A promise only while the listener is binding.
  */
-export function apply(ctx) {
+export function apply(ctx, config = {}) {
   const runtime = createRuntime()
   const settings = runtime.store.getSettings()
   const devices = runtime.store.listDevices()
@@ -109,12 +144,71 @@ export function apply(ctx) {
      that sends an operator looking in the wrong place. */
   const activeCount = devices.filter((device) => device.revokedAt === null).length
 
-  /* Exactly one line. The gateway's own "listening on <host>:<port>" line is a
-     stage 2 concern; claiming a listener before it exists would be a lie. */
+  /* Exactly one load line. The gateway's own "listening on <host>:<port>" line is
+     printed only after the bind succeeds, so it can never claim a listener that
+     does not exist. */
   logLine(
     ctx,
     'info',
     `[remote-control] loaded — ${activeCount} paired device(s), configured port ${settings.port}, `
-      + `remote access ${settings.enabled ? 'enabled in settings' : 'off'} (gateway not started in this build)`,
+      + `remote access ${settings.enabled ? 'enabled' : 'off'}`,
   )
+
+  if (!settings.enabled) return
+
+  /* The upstream port comes from the official web server. Reading it lazily (here
+     rather than at module scope) is what makes `inject: ['webServer']` meaningful:
+     when the service is absent Cordis parks the fiber in PENDING and this code
+     never runs, so the cast below cannot see `undefined` in practice. The guard
+     exists for the test harness, where a fake context may provide the service with
+     a port of 0. */
+  const officialPort = ctx.webServer.port
+  if (!Number.isInteger(officialPort) || officialPort <= 0) {
+    throw gatewayFailure('gateway/invalid-upstream', 'the official web server did not report a listening port')
+  }
+
+  /* A row-level override, then the stored setting. `Number.isInteger` and not
+     truthiness: 0 is a legitimate override (OS-assigned) and the common one in
+     tests, which must never bind a real port. */
+  const bindPort = Number.isInteger(config?.port) ? config.port : settings.port
+  const bindHost = typeof config?.host === 'string' && config.host !== '' ? config.host : undefined
+
+  const gateway = startGateway({
+    ctx,
+    store: runtime.store,
+    officialPort,
+    port: bindPort,
+    host: bindHost,
+    cookieName: DEVICE_COOKIE_NAME,
+    logger: ctx.logger,
+  })
+
+  /* Return the pending promise rather than awaiting it: the caller (Cordis) holds
+     activation until the socket is actually bound, and a listen failure rejects
+     into the fiber as a startup error. The listening line is therefore printed from
+     a callback, never optimistically before the bind. */
+  return gateway.then((started) => {
+    logLine(
+      ctx,
+      'info',
+      `[remote-control] gateway listening on ${started.host}:${String(started.port)} `
+        + `(upstream ${started.upstream.host})`,
+    )
+  })
+}
+
+/**
+ * Build the Error used for a startup precondition failure.
+ *
+ * A plain Error with a stable `code`, never a subclass
+ * (`.trellis/spec/backend/error-handling.md`).
+ *
+ * @param {string} code
+ * @param {string} message
+ * @returns {Error}
+ */
+function gatewayFailure(code, message) {
+  const error = new Error(message)
+  error.code = code
+  return error
 }

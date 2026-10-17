@@ -3,10 +3,15 @@
 Pairing-gated remote access for `dsh web`: open the **same** session from a phone
 or another computer on your LAN, with a device panel and a local audit trail.
 
-> **Status: stage 0 + 1 of 6.** The package skeleton, the device store, pairing
-> codes and device tokens are implemented and tested. The gateway, the management
-> API, the audit writer and the panel are not written yet — see
-> [Roadmap](#roadmap). Nothing listens on a port in this build.
+> **Status: stages 0–2 of 6.** The package skeleton, the device store, pairing codes,
+> device tokens and the **HTTP gateway** (listener, auth, Origin fence, inner
+> credential, reverse proxy) are implemented and tested. The WebSocket upgrade proxy,
+> the management API, the audit writer and the panel are not written yet — see
+> [Roadmap](#roadmap).
+>
+> A started gateway forwards **HTTP only** in this build. The live stream rides
+> `/api/remote.mux`, a WebSocket upgrade that stage 3 adds, so a browser that
+> connects today can load and read but its streaming channel will not establish.
 
 ## Why this exists
 
@@ -68,6 +73,48 @@ hidden because they decide whether the plugin is appropriate for you.
    loopback requests). That cookie is equivalent to full access to the whole DSH
    instance, so it exists only on the gateway → upstream hop and is never sent to
    a client, logged, or placed in an audit record.
+7. **Local traffic is not authenticated at the gateway.** A request that both
+   arrives over a loopback socket *and* names a loopback `Host` is exempt from
+   pairing, which is what keeps the desktop browser and CLI tools working. Both
+   halves are required: a loopback socket alone is what DNS rebinding produces.
+8. **Guessing is rate-limited, not impossible.** Five wrong codes destroy a pairing
+   code; 20 wrong codes per minute block a source address, independently, so
+   rotating the pairing id does not reset the budget. Neither limit makes a
+   leaked-then-guessed code impossible — it makes a futile search loud and slow.
+
+## Request pipeline
+
+Every request to the gateway port passes these in order, in exactly one place
+(`src/host/gateway/auth.js`):
+
+```
+1. loopback socket AND loopback Host?  -> allow (no cookie needed)
+2. valid device cookie?                -> continue;  else 401
+3. Origin fence:
+     Sec-Fetch-Site: cross-site        -> 403 (always)
+     write with Origin, mismatch Host  -> 403
+     write, no Origin, same-origin/same-site declared -> allow
+     write, no Origin, no Sec-Fetch-Site -> 403
+4. device not revoked?                 -> allow;  else 401 + clear the cookie
+```
+
+Writes are everything except `GET` / `HEAD` / `OPTIONS`. The fourth arm is the
+CSRF rule `design.md` §3.2 asks for; the third exists because not every
+same-origin browser write carries `Origin`, and rejecting those would break
+normal use. `Sec-Fetch-Site` is checked first because a page cannot forge it.
+
+An admitted request is then rewritten before it reaches DSH — all three, or the
+official port answers 401/403:
+
+| # | Action | Why |
+|---|---|---|
+| A | `Host` → `127.0.0.1:<official port>` | the official fence accepts a loopback authority |
+| B | strip `Origin` / `Sec-Fetch-*` | it compares `origin.host` to `Host`, so a rewritten `Host` with a surviving `Origin` is a guaranteed 403 |
+| C | attach the inner `dsh-auth-*` cookie | the official port has no loopback exemption |
+
+A and B are applied in one function (`upstreamHeaders`), because doing one
+without the other is precisely the configuration that produces an unexplainable
+403.
 
 ## What runs where
 
@@ -78,11 +125,34 @@ src/
 └── host/
     ├── constants.js      # on-disk layout, data-model version, TTLs, file mode
     ├── store.js          # devices.json read/write, atomic write, 0600
-    ├── pairing.js        # 8-char base32 codes, 120s TTL, one-time redemption
-    └── tokens.js         # 32-byte token, sha256 at rest, constant-time compare
+    ├── pairing.js        # 8-char base32 codes, 120s TTL, one-time redemption, lockout
+    ├── tokens.js         # 32-byte token, sha256 at rest, constant-time compare
+    └── gateway/
+        ├── server.js     # own http.Server, ctx.effect cleanup, status mapping
+        ├── auth.js       # the single authorization decision (loopback/cookie/origin/revoke)
+        ├── origin.js     # Origin / Sec-Fetch-Site fence, four arms
+        ├── inner-auth.js # redeem + cache the upstream dsh-auth-* cookie
+        ├── proxy.js      # HTTP reverse proxy: A/B/C rewrites, SSE passthrough
+        ├── activity.js   # throttled lastSeenAt persistence
+        └── wire.js       # response writers, cookie serialization
 locale/                   # zh / en dictionaries
 tests/                    # node --test
 ```
+
+Domain modules (`store`, `pairing`, `tokens`) never import `gateway/*`: they must
+stay usable from the loopback-only management API and testable without HTTP.
+
+## Notes from measurement
+
+Two costs were measured rather than guessed, and both shaped the design:
+
+- `store.touchDevice()` costs **7.06 ms** per call (a full atomic write with
+  `fsync`). Calling it per request would cap the gateway near 140 req/s, so
+  `lastSeenAt` is updated in memory per request and persisted at most once per
+  device per 30 s — with a forced flush on revoke, on panel read and on shutdown.
+- The official port enforces a **Host/Origin fence plus an authority-bound
+  `dsh-auth-*` cookie with no loopback exemption**, so a naive reverse proxy gets
+  401/403 no matter how the listener is configured. Hence the A/B/C rewrites.
 
 ## Data
 
@@ -154,7 +224,8 @@ by advancing a number rather than sleeping.
 
 - [x] **0** Package skeleton, manifest, bundle patch, one-line load
 - [x] **1** Device store, pairing codes, device tokens
-- [ ] **2** Gateway HTTP: listener, auth, Origin check, inner credential, proxy
+- [x] **2** Gateway HTTP: listener, auth, Origin check, inner credential, proxy
+  (+ pairing-code lockout, + `lastSeenAt` throttling)
 - [ ] **3** Gateway WebSocket: upgrade auth, `/api/remote.mux` passthrough
 - [ ] **4** Management API (`/remote-control/api/*`, loopback only) and audit
 - [ ] **5** Client panel: enable switch, port, QR pairing, device list, revoke
