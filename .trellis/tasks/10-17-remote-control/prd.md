@@ -55,6 +55,7 @@
 - `@deepseek-ai/dsh-host-webserver` 的 `WebServer.Config.host` 取值为 `127.0.0.1` 或 `0.0.0.0`，`port` 可为 `0`（由 OS 分配）。
 - 该服务提供 `register({ kind, path, handler })`（`exact` / 前缀）、`registerUpgrade({ path, handler })`、`registerFallback(handler)`。
 - 现有路由注册后请求**直接进入 handler**，WebServer 本身没有请求拦截钩子——鉴权必须自己实现。
+- **官方端口自带鉴权**（实测）：`@deepseek-ai/dsh-client-connection` 在 WebServer 之上叠了 Host/Origin 围栏与 authority 绑定的签名 Cookie（`dsh-auth-*`），覆盖 `/api`、`/api/remote.mux` 升级、index 三处，且**没有回环豁免**。因此反向代理必须注入内层凭证，否则一律 401/403。取证见 `research/official-connection-fence.md`，设计见 `design.md` §4.4。
 - `ctx.authorization` 是为"与用户对话获取凭证"设计的，**不适用于请求鉴权**，因此网关层自行实现。
 - 插件通过 `dsh.bundle.patch` 安装，客户端通过 `dsh.client` 注入注册 UI，形态与 `dsh-git-panel` 一致。
 

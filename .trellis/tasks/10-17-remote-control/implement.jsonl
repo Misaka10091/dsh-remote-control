@@ -1,4 +1,5 @@
 {"file": ".trellis/tasks/10-17-remote-control/design.md", "reason": "Architecture, proxy/auth flow, data model, and security boundary this implementation must follow"}
+{"file": ".trellis/tasks/10-17-remote-control/research/official-connection-fence.md", "reason": "Measured proof that the official port enforces a Host/Origin fence plus an authority-bound dsh-auth cookie, which the gateway proxy must satisfy (design.md §4.4)"}
 {"file": ".trellis/tasks/10-17-remote-control/implement.md", "reason": "Stage-by-stage execution plan, acceptance points, and rollback criteria"}
 {"file": ".trellis/spec/backend/error-handling.md", "reason": "Error type and handling conventions for host-side modules"}
 {"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Code standards and forbidden patterns for backend modules"}

@@ -1,5 +1,6 @@
 {"file": ".trellis/tasks/10-17-remote-control/prd.md", "reason": "Acceptance criteria and explicit non-goals to check the implementation against"}
 {"file": ".trellis/tasks/10-17-remote-control/design.md", "reason": "Security boundary and auth flow that the review must verify"}
+{"file": ".trellis/tasks/10-17-remote-control/research/official-connection-fence.md", "reason": "Official-port auth facts the proxy must satisfy; verify inner-auth injection, Origin stripping, and that the inner cookie never reaches a client"}
 {"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "Quality gate for backend changes"}
 {"file": ".trellis/spec/backend/error-handling.md", "reason": "Error handling conventions to verify against"}
 {"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "Cross-layer checks between host gateway and client UI"}

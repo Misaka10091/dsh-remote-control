@@ -36,6 +36,7 @@
 | `gateway/origin` | 校验 `Origin` / `Sec-Fetch-Site` | 缺失 `Origin` 的写请求一律拒绝 |
 | `gateway/proxy` | HTTP 反向代理 | 流式响应必须边读边写，不能缓冲 |
 | `gateway/wsproxy` | WebSocket 升级透传 | 必须处理 `/api/remote.mux` 多路复用连接 |
+| `gateway/inner-auth` | 兑换并缓存官方端口的浏览器会话 Cookie | 见 §4.4；令牌等价整个实例，绝不下发给客户端 |
 | `pairing` | 配对码生成、兑换、过期 | 一次性；兑换成功即作废 |
 | `devices` | 设备存储与吊销 | 原子写；权限 0600 |
 | `audit` | JSONL 记账与轮转 | 只记动作与时间，不记正文 |
@@ -99,6 +100,39 @@ WebSocket 升级无法携带自定义头，且浏览器会自动带上 Cookie，
 - 请求体直接管道转发，不缓冲。
 - 响应：`text/event-stream`、`chunked` 必须透传，禁止启用压缩缓冲。注意官方已支持 gzip，代理要正确处理 `Content-Encoding`，避免二次解压。
 
+### 4.4 内层凭证（官方端口自带鉴权）
+
+**这一节是实测得出的硬约束，实现时不可省。** 详细取证见 `research/official-connection-fence.md`。
+
+官方端口并不裸奔：`@deepseek-ai/dsh-client-connection` 在 `webServer` 之上叠了两道判定，覆盖 `/api`、`/api/remote.mux` 升级、以及 index 响应。远程请求若原样转发，会在这里被拒：
+
+| 判定 | 失败结果 | 触发条件 |
+|---|---|---|
+| `isTrustedApiRequest` | 403 | Host 非回环且不在 `trustedHosts`；或 `Origin.host ≠ Host` |
+| `BrowserAuth.isAuthenticated` | 401 | 缺少 authority 绑定的 `dsh-auth-*` 签名 Cookie（**无回环豁免**） |
+
+所以网关在转发前必须做三件事：
+
+| # | 动作 | 说明 |
+|---|---|---|
+| A | 把上游 `Host` 改写为 `127.0.0.1:<官方端口>` | 满足回环 Host |
+| B | 剥离客户端 `Origin` / `Sec-Fetch-Site` | 否则跨源判定必然失败 |
+| C | 注入内层 Cookie `dsh-auth-*` | 由 `ctx.connection.authenticatedUrl()` 兑换 |
+
+**兑换流程**（`gateway/inner-auth`）：
+
+```
+url    = ctx.connection.authenticatedUrl(`http://127.0.0.1:${officialPort}/`)
+resp   = await fetch(url, { redirect: 'manual' })      // 必须 manual，否则 Set-Cookie 丢失
+cookie = resp.headers['set-cookie'] 中以 'dsh-auth-' 开头的 name=value
+```
+
+- 兑换出的 Cookie 绑定 `127.0.0.1:<port>`，正好是转发 authority，**可长期缓存复用**。
+- 上游返回 401 时失效缓存并重兑**一次**（有界重试，防止死循环）。
+- `ctx.connection` 不可用（旧版本）时：不注入 Cookie，401 如实透传给客户端，并在日志里记一次降级告警。
+
+> **安全红线**：内层 Cookie 等价于整个 DSH 实例的完全访问权。它只存在于「网关进程 → 上游」这一跳，**必须**在转发前覆盖掉客户端自带的任何 `Cookie` 中同名项，且不得出现在审计、日志、错误响应中。
+
 ### 4.2 WebSocket
 
 - 官方通道：`/api/remote.mux`（`WebSocketServer({ noServer: true })`，由 `registerUpgrade` 独占）。
@@ -109,6 +143,7 @@ WebSocket 升级无法携带自定义头，且浏览器会自动带上 Cookie，
 
 - **连接数**：官方单 WebSocket 多路复用，代理每条远程连接对应一条上游连接，数量线性增长，可接受。
 - **事件回放**：断线重连依赖官方机制，代理不实现缓冲；重连后由客户端重新拉取。这是 MVP 的明确限制。
+- **内层凭证失效**：DSH 重启后启动令牌变化，缓存的内层 Cookie 失效。表现为上游返回 401；`inner-auth` 失效缓存并重兑一次即可恢复，无需重启网关。
 
 ## 5. 数据模型
 
@@ -181,6 +216,7 @@ WebSocket 升级无法携带自定义头，且浏览器会自动带上 Cookie，
 | `webServer.register` | **不使用**（官方端口不对外） |
 | `webServer.registerUpgrade` | **不使用**（同上） |
 | `webServer.port` | 读取，作为上游目标 |
+| `ctx.connection.authenticatedUrl` | 用于兑换内层浏览器会话 Cookie（§4.4） |
 | `ctx.authorization` | **不使用**（面向凭证获取对话，非请求鉴权） |
 | `dsh.bundle.patch` | 用于安装 |
 | `dsh.client.inject` | 用于注册 UI |
