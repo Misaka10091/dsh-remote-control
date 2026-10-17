@@ -1,0 +1,26 @@
+# @misaka10091/dsh-remote-control bundle patch.
+#
+# Installed through the official CLI —
+#
+#   dsh plugin --profile <name> add @misaka10091/dsh-remote-control
+#
+# — the command reconciles dsh.profile.bundles against installed packages and,
+# seeing this declaration, merges THIS patch exactly like the manual mount line
+# below. No profile file edits needed.
+#
+# Manual mount equivalent (profile cordis.patch.yml):
+#
+#   - insert:
+#       - id: remote-control
+#         name: '@misaka10091/dsh-remote-control'
+#
+# Only the Node half loads through this row: it owns the device store, the
+# pairing codes, the audit trail and the self-hosted gateway listener. The web
+# client half is served through exports["./client"] and mounted by the browser
+# boot graph, where it registers the sidebar device panel.
+#
+# The row id ('remote-control') is also the key the host persists row Config
+# under, so it must stay stable across versions.
+- insert:
+    - id: remote-control
+      name: '@misaka10091/dsh-remote-control'

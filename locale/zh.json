@@ -1,0 +1,10 @@
+{
+  "panel.title": "远程控制",
+  "panel.subtitle": "配对设备后可在此接入同一会话",
+  "panel.enable": "启用远程接入",
+  "panel.port": "端口",
+  "panel.addDevice": "添加设备",
+  "panel.devices": "已授权设备",
+  "panel.revoke": "吊销",
+  "panel.empty": "还没有配对设备"
+}

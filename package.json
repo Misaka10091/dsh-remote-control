@@ -1,0 +1,73 @@
+{
+  "name": "@misaka10091/dsh-remote-control",
+  "version": "0.1.0",
+  "description": "Pairing-gated remote access for the dsh web GUI: a self-hosted reverse-proxy gateway, a device panel and a local audit trail, with no relay and no third-party service. | DeepSeek Harness 远程控制插件：配对鉴权网关、设备管理面板与本地审计，官方 dsh web 端口保持仅回环。",
+  "type": "module",
+  "author": {
+    "name": "Misaka10091",
+    "url": "https://github.com/Misaka10091"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Misaka10091/dsh-remote-control.git"
+  },
+  "homepage": "https://github.com/Misaka10091/dsh-remote-control#readme",
+  "bugs": {
+    "url": "https://github.com/Misaka10091/dsh-remote-control/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./client": "./src/client.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "engines": {
+    "node": ">=18",
+    "dsh": ">=0.2.0-rc.2"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-client-ui-slots",
+        "@deepseek-ai/dsh-client-modules"
+      ],
+      "platform": "web"
+    }
+  },
+  "files": [
+    "icon.svg",
+    "locale",
+    "src/index.js",
+    "src/client.js",
+    "src/host/constants.js",
+    "src/host/store.js",
+    "src/host/pairing.js",
+    "src/host/tokens.js",
+    "cordis.patch.yml",
+    "dsh.plugin.json",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test \"tests/*.test.mjs\"",
+    "check:syntax": "node --check src/index.js && node --check src/client.js && node --check src/host/constants.js && node --check src/host/store.js && node --check src/host/pairing.js && node --check src/host/tokens.js"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "dsh-plugin",
+    "remote-control",
+    "remote-access",
+    "pairing",
+    "gateway"
+  ],
+  "license": "MIT"
+}

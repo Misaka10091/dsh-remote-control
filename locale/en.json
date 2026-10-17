@@ -1,0 +1,10 @@
+{
+  "panel.title": "Remote Control",
+  "panel.subtitle": "Pair a device to reach this session from another machine",
+  "panel.enable": "Enable remote access",
+  "panel.port": "Port",
+  "panel.addDevice": "Add device",
+  "panel.devices": "Paired devices",
+  "panel.revoke": "Revoke",
+  "panel.empty": "No paired devices yet"
+}

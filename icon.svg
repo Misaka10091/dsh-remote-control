@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 36 36" fill="none">
+  <!-- Desktop (loopback viewer) -->
+  <rect x="2.5" y="6" width="16.5" height="12" rx="2.4" stroke="#4493f8" stroke-width="1.7"/>
+  <path d="M10.75 18v3.4M7.4 21.4h6.7" stroke="#4493f8" stroke-width="1.7" stroke-linecap="round"/>
+  <!-- Link between the two halves: the pairing code the remote device redeems -->
+  <path d="M21.6 8.6v13.2" stroke="#4493f8" stroke-width="1.7" stroke-linecap="round" stroke-dasharray="2.2 2.6"/>
+  <!-- Paired remote device -->
+  <rect x="24.2" y="9" width="9.4" height="16.6" rx="2.4" stroke="#f0883e" stroke-width="1.7"/>
+  <path d="M27.4 22.6h3" stroke="#f0883e" stroke-width="1.7" stroke-linecap="round"/>
+</svg>
