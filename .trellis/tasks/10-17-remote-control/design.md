@@ -73,12 +73,26 @@
 1. 来源是本机回环？        → 放行（不要求 Cookie）
 2. Cookie 携带有效令牌？    → 进入 3
    否则                    → 401（HTML 导航则重定向到 /remote-control/pair-required 提示页）
-3. Origin 校验：
-   写请求必须有 Origin 且在同源白名单内
-   无 Origin 的写请求一律拒绝（防 CSRF）
+3. Origin 校验（分层，见 §3.2.1）
 4. 令牌对应设备未被吊销？   → 放行，记审计
    已吊销                  → 401 + 清除 Cookie
 ```
+
+#### 3.2.1 Origin 校验的四个分支（已定稿）
+
+初版设计写的是「无 Origin 的写请求一律拒绝」，但这会**误伤 DSH 自己同源下发的写请求**——部分 fetch 实现与非浏览器客户端不带 `Origin`。实测四类情形后改为分层判定：
+
+| # | 条件 | 结果 | 理由 |
+|---|---|---|---|
+| 1 | `Sec-Fetch-Site: cross-site` | **403**（无条件） | 浏览器不能伪造该头，是最强的一条 |
+| 2 | 写请求 + 有 `Origin` | 校验 `origin.host === 请求 host`，不符 **403** | 拦跨站写 |
+| 3 | 写请求 + 无 `Origin` + `Sec-Fetch-Site` 为 `same-origin` / `same-site` | **放行** | 浏览器已声明同源，不误伤 |
+| 4 | 写请求 + 无 `Origin` + 无 `Sec-Fetch-Site` | **403** | 无法证明来源，按原设计拒绝 |
+
+真正的跨站写攻击一定会被 1 或 2 拦住，所以放宽第 3 条不降低安全性，只避免误伤。
+
+> 实测的四类请求：顶层导航 GET（放行）、同源 GET（放行）、同源 POST 无 Origin（旧规则下 403，新规则下第 3 条放行）、跨源 POST（403）。
+> 这四个分支都必须有测试覆盖。
 
 **Cookie 属性**：`HttpOnly; SameSite=Lax; Path=/; Max-Age=<长有效期>`。
 不加 `Secure`——局域网是 HTTP，加了 Cookie 根本不会被发送。这一点必须在 README 里明确写出安全边界。
