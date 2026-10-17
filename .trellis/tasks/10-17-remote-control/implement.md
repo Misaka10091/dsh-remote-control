@@ -180,18 +180,94 @@
 
 ## 阶段 5：客户端 UI
 
-- [ ] `src/client.js`：`window.__ModuleLoader__.load` 包装，注册侧边栏底部图标
-- [ ] 设备面板：开关、端口、二维码、设备列表、吊销、审计导出
-- [ ] 中英文案（`locale/`）
+- [x] `src/client.js`：`window.__ModuleLoader__.load` 包装，注册侧边栏底部图标
+- [x] 设备面板：开关、端口、二维码、设备列表、吊销、审计导出
+- [x] 中英文案（`locale/`）
 - **验收**：面板可完成一次完整配对；吊销后列表即时更新
 
-## 阶段 6：验证与文档
+> **阶段 5 收尾：配对流程的另一半（`gateway/pairing-route.js`）**
+>
+> 阶段 5 的面板能生成码、能画二维码，但**兑换那一半根本不存在**：
+> `api.js#createPairing` 返回 `pairPath: '/remote-control/pair'`，而没有任何东西
+> 服务这个路径；`pairing.redeem()` 除了单测没有任何调用点；`wire.deviceCookie()`
+> 只经 `clearDeviceCookie`（吊销路径）被触达，从没有谁**下发**过
+> `Set-Cookie: dsh-rc-device`。结果是「能生成码，永远用不掉」——手机扫码后被当作
+> 无 cookie 请求 401。这是产品最后一个功能空洞。
+>
+> 补在新模块 `gateway/pairing-route.js` 里，**挂在网关端口**而不是管理 API 上
+> （配对是设备在拥有任何凭证**之前**做的动作，管理 API 仅回环）。
+>
+> **`GET /remote-control/pair`**：自包含 HTML（无外部资源），从 `location.hash`
+> 读 `<pairId>:<code>` 并 POST 回去（fragment 不进服务端，`design.md` §3.1 step 3）。
+> 无 fragment 时显示手输表单（D2 的「纯文本码手输」）。页面回显任何参数，
+> 也从不读 query string。
+>
+> **`POST /remote-control/pair`**：`{ pairId, code }` → `pairing.redeem(pairId, code, source)`；
+> 成功后 `tokens.createDeviceToken()` → `store.addDevice`（只存哈希）→
+> `Set-Cookie: dsh-rc-device=…; Max-Age=2592000; Path=/; HttpOnly; SameSite=Lax`
+> （**无 `Secure`**）→ 审计 `pair` → `303` 到 `/`。
+>
+> **为什么这道「跳过 authorize()」的豁免不是第二个阶段 2 漏洞**：阶段 2 与阶段 3
+> 的洞都是同一个形状——豁免让请求进了 `proxy.js`，而那一跳会注入实例级的
+> `dsh-auth-*` 并剥掉 `Origin`，于是攻击者缺的证明由网关自己补上
+> （`quality-guidelines.md` §8 的判据）。配对路径**从不经过 proxy**：没有
+> `forward()`、没有 `innerAuth.header()`、没有 Header 改写，全部从进程内存应答。
+> 所以豁免只免掉了它自己点名的凭证，Origin 围栏照跑（POST 是写），
+> `settings.enabled` **逐请求重读**（面板关掉开关时监听还在，见 `api.js` 的
+> `requiresReload: true`）。
+>
+> 未认证调用者在这里能做的事，逐条枚举在模块注释里：GET 一个常量文档（**故意不限流**
+> —— 给它上预算等于让共享 NAT 后面的攻击者把合法用户锁在配对页外，而页面无状态、
+> 无按输入分配、除「这里有网关」外不泄露任何东西，而每个其他路径的 401 已经说了这件事）；
+> POST 一次猜测（花的是 `pairing.js` 已有的预算：5/pair、20/source/60s，**没有第二套限流**）；
+> 畸形 body 400（不花预算——畸形请求猜不出码，客户端 bug 不该烧掉用户的地址）；
+> 其他 405/404。它不能触达 DSH、不能在配对成功前创建设备、不能读设备表。
+>
+> **`pair_failed` 只在路由里审计一次，且不在这里写**：`pairing.js` 的 `onFailure`
+> 已经在「预算被扣」的唯一那一点上报了一次，且**只对真正的猜测**上报
+> ——`pairing/expired` / `pairing/used` 是正常操作，不记。路由若再记一次，每次猜测
+> 会有两行，「一次尝试一行」就不成立了。
+>
+> 错误码 → 状态：`pairing/unknown` 404、`invalid-code` 403、`expired` 410、
+> `used` 409、`locked`/`source-locked` 429、body 越界 413、非 JSON 415、
+> `settings.enabled === false` 503（两条路由都拒）。
+>
+> **body 边界有个真坑**：`PAIRING_MAX_BODY_BYTES` 是 4 KB，跨过那一刻**继续 drain
+> 但不继续缓存**。若在跨过时立刻应答 413，会和客户端仍在写的那一段抢跑，
+> 客户端拿到的是 reset 而不是 413——输的是客户端。drain 不是 buffer：超出部分随到随丢，
+> 内存恒定在边界上。
+>
+> **`GET` 与 `POST` 的围栏是刻意不对称的**（本模块唯一的判断题）。真实配对链接通常是
+> 在聊天/邮件里**点开**的，浏览器把这种顶层导航报成 `Sec-Fetch-Site: cross-site`；
+> 若对读也跑围栏，最常见的打开路径会被自己拒掉，而且换不到任何东西：
+> 页面是一个**常量**（无状态、不回显输入），跨站读者拿到的就是仓库里那份文档，
+> 而点开页面后那个 POST 是同源发出的、且**照跑完整围栏**；再加上
+> `X-Frame-Options: DENY` + CSP `frame-ancestors 'none'`，点击劫持这条也关死了。
+> 所以：读宽松、写严格，两半各一条断言、同一个 `cross-site` 头
+> （`tests/gateway-pairing.test.mjs`）——只测一半，将来「顺手收紧读」会打断真实使用，
+> 「顺手放松写」就是 CSRF。
+>
+> **测试能失败的抽查**：写了 13 个变异逐个破坏实现确认变红后还原——
+> 路线里再审计一次失败 / 把 expired·used 也记成失败 / 不查 `settings.enabled` /
+> 接受任意 content-type / 去掉 body 大小边界 / 把配对路径当**前缀**匹配 /
+> 在成功审计里记 code / 成功后不下发 cookie / 用 302 而不是 303 /
+> 网关不再分发配对路径 / 在配对响应头里注入内层凭证 / 把 query 里的 pairId 回显进页面 /
+> 把行内脚本改坏。**12 个变红；1 个（往 addDevice 记录里多塞一个明文字段）存活，
+> 但那是真 no-op**——`store.normalizeDevice` 结构化重建记录，未知字段进不了盘
+> （已单独复验：故意塞 `clearToken` 后 `devices.json` 里没有它）。
+>
+> 另加一条：**页面里的行内脚本必须能被解析**。`node --check` 看不见模板字符串里的
+> JS，`npm test` 与 `check:syntax` 都覆盖不到它——脚本写坏了唯一症状是手机上永远停在
+> 「Reading the pairing link…」。测试把 `<script>` 抠出来过一遍 `new Function` 编译。
+>
+> 测试 396 → 422（+26）。
 
-- [ ] `tests/` 单测通过（`node --test`）
+## 阶段 6：验证与文档
 - [ ] 真机验证：手机扫码 → 打开会话 → 发消息 → 收流式 → 停止
-- [ ] README（中英）：安装、使用、**安全边界**（局域网无 TLS、令牌等价完整控制权）
+- [x] `npm test` / `npm run check:syntax` / `npm pack --dry-run` 三条全绿（421 tests）
+- [ ] README（中英）补 `pairing-route.js` 与配对流程的中文对照
 - [ ] CHANGELOG 首条记录
-- [ ] `npm pack --dry-run` 产物完整
+- [x] `npm pack --dry-run` 产物完整（`src/host/gateway/pairing-route.js` 已列入 `files`）
 
 ## 验证命令
 
