@@ -82,9 +82,21 @@ const DROPPED_REQUEST_HEADERS = new Set([
   'transfer-encoding',
   'upgrade',
   'expect',
-  /* Not a secret, but not something to forward either: the gateway is not a CDN
-     and the upstream does not trust header-derived client addresses. */
+  /* Every forwarding field is dropped and re-written from the real connection.
+     Dropping only `forwarded` was not enough: with an unknowable peer address
+     (`peerAddress` returns undefined for a socket without a string
+     `remoteAddress`) the client's own `x-forwarded-for` survived verbatim, so a
+     device could choose the address the upstream and the audit trail believe it
+     came from. A field this hop synthesizes is never the client's to set. */
   'forwarded',
+  'x-forwarded-for',
+  'x-forwarded-host',
+  'x-forwarded-proto',
+  'x-forwarded-port',
+  'x-real-ip',
+  'x-client-ip',
+  'x-cluster-client-ip',
+  'true-client-ip',
 ])
 
 /** Response headers removed on the way back. */
@@ -268,20 +280,35 @@ export function createProxy(options) {
    * The timeout covers the WAIT FOR THE RESPONSE HEAD only. Once the head arrives
    * it is cleared, because a session stream can legitimately sit silent for a long
    * time between events and a socket-inactivity timeout would sever a perfectly
-   * healthy SSE connection. A client that goes away is detected by `res`'s own
-   * `close`, which is the right signal for a live stream.
+   * healthy SSE connection.
+   *
+   * ## The client can leave before the head arrives
+   *
+   * Nothing on the request side notices that. Measured: a GET whose client aborts
+   * mid-wait emits `end` and `close` on `req` and `res`, but **no `error`** — so
+   * the `req.on('error')` hook below never fires, and the upstream `ClientRequest`
+   * stayed connected until its head timeout (120 s by default) with the upstream
+   * socket held open the whole time. A LAN client can open and drop requests in a
+   * loop and pin one upstream socket per drop for two minutes each.
+   *
+   * So the wait is additionally bound to `res`'s `close`: when the response can no
+   * longer be delivered, the upstream attempt is abandoned immediately. The
+   * listener is detached as soon as the head arrives, because from then on the
+   * live stream is `relay`'s to manage.
    *
    * @param {import('node:http').IncomingMessage} req
+   * @param {import('node:http').ServerResponse} res
    * @param {string | undefined} innerCookie
    * @param {string | undefined} peer
    * @returns {Promise<import('node:http').IncomingMessage>}
    */
-  function send(req, innerCookie, peer) {
+  function send(req, res, innerCookie, peer) {
     return new Promise((resolve, reject) => {
       let settled = false
       const settle = (fn, value) => {
         if (settled) return
         settled = true
+        res.off?.('close', onClientGone)
         fn(value)
       }
 
@@ -294,6 +321,15 @@ export function createProxy(options) {
         headers: upstreamHeaders(req, { upstreamHost, innerCookie, peer }),
         agent: false,
       })
+
+      /* The client hung up before the upstream answered: drop the upstream attempt
+         now rather than paying out its head timeout. */
+      function onClientGone() {
+        if (settled) return
+        upstreamRequest.destroy(proxyError('gateway/client-gone', 'the client disconnected'))
+      }
+
+      res.once?.('close', onClientGone)
 
       upstreamRequest.setTimeout(timeoutMs, () => {
         upstreamRequest.destroy(proxyError('gateway/upstream-timeout', 'the upstream did not answer in time'))
@@ -312,7 +348,7 @@ export function createProxy(options) {
          request's own `error` is handled so a client that aborts mid-upload does
          not leave an unhandled error behind. */
       req.on('error', () => {
-        upstreamRequest.destroy()
+        upstreamRequest.destroy(proxyError('gateway/client-gone', 'the client disconnected'))
       })
       req.pipe(upstreamRequest)
     })
@@ -343,8 +379,14 @@ export function createProxy(options) {
 
     let upstreamResponse
     try {
-      upstreamResponse = await send(req, innerCookie, peer)
-    } catch {
+      upstreamResponse = await send(req, res, innerCookie, peer)
+    } catch (error) {
+      /* A client that hung up is not a gateway fault and has nowhere to receive a
+         status: log at debug and stop. Anything else is a real 502. */
+      if (error?.code === 'gateway/client-gone') {
+        emit(logger, 'debug', `[remote-control] client disconnected before the upstream answered for ${describeMethod(req)}`)
+        return { status: 0, body: null }
+      }
       emit(logger, 'warn', `[remote-control] upstream request failed for ${describeMethod(req)}`)
       writeFailure(res, 502, 'gateway/upstream-unreachable', 'The dsh web instance did not answer.')
       return { status: 502, body: null }
@@ -382,7 +424,7 @@ export function createProxy(options) {
         if (retryCookie !== undefined) {
           upstreamResponse.destroy()
           try {
-            upstreamResponse = await send(req, retryCookie, peer)
+            upstreamResponse = await send(req, res, retryCookie, peer)
           } catch {
             emit(logger, 'warn', '[remote-control] the retry after re-minting the inner credential failed')
             writeFailure(res, 502, 'gateway/upstream-unreachable', 'The dsh web instance did not answer.')

@@ -359,6 +359,65 @@ test('a successful redemption does not spend the failure budget', () => {
   }
 })
 
+test('the per-source map does not grow without bound when sources are rotated', () => {
+  /* `pruneSource` only touches the entry it is asked about, so before the global
+     sweep a source seen once and never again kept its timestamp — and its Map
+     entry — forever. Cycling source values (the same bypass shape the per-source
+     limit exists for) therefore grew the map without limit even though every entry
+     was already older than the window. The sweep is global and cannot widen a
+     budget, only forget what has expired. */
+  const { pairing, clock } = makePairing()
+
+  for (let index = 0; index < 5_000; index += 1) {
+    const source = `198.51.${String(Math.floor(index / 256))}.${String(index % 256)}`
+    try {
+      pairing.redeem('pair_nope', 'AAAAAAAA', { source })
+    } catch {
+      /* expected */
+    }
+  }
+  assert.equal(pairing.sourceCount(), 5_000, 'all five thousand are inside the window')
+
+  /* One window later, one more failure sweeps every expired entry. */
+  clock.now += PAIRING_IP_WINDOW_MS + 1
+  try {
+    pairing.redeem('pair_nope', 'AAAAAAAA', { source: '203.0.113.1' })
+  } catch {
+    /* expected */
+  }
+  assert.equal(pairing.sourceCount(), 1, 'only the address that just failed is still on record')
+})
+
+test('the sweep never forgets a failure that is still inside its window', () => {
+  /* The property that makes the sweep safe: it can only drop entries that have
+     already expired, so it can never be used to escape the limit. */
+  const { pairing } = makePairing()
+  const blocked = '192.0.2.123'
+
+  /* Spend all but one unit of the budget. */
+  for (let index = 0; index < PAIRING_IP_MAX_FAILURES - 1; index += 1) {
+    try {
+      pairing.redeem('pair_nope', 'AAAAAAAA', { source: blocked })
+    } catch {
+      /* expected */
+    }
+  }
+
+  /* Churn 200 other sources inside the same window — each one triggers the sweep. */
+  for (let index = 0; index < 200; index += 1) {
+    try {
+      pairing.redeem('pair_nope', 'AAAAAAAA', { source: `198.51.100.${String(index)}` })
+    } catch {
+      /* expected */
+    }
+  }
+
+  /* The blocked source's budget is intact: the last unit is still there and the
+     attempt that spends it reports the lockout. */
+  assertCode(() => pairing.redeem('pair_nope', 'AAAAAAAA', { source: blocked }), 'pairing/source-locked')
+  assertCode(() => pairing.redeem('pair_nope', 'AAAAAAAA', { source: blocked }), 'pairing/source-locked')
+})
+
 test('resetSource clears one address budget without touching the others', () => {
   const { pairing } = makePairing()
   const blocked = '192.0.2.99'

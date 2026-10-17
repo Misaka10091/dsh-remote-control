@@ -50,7 +50,11 @@
  */
 
 /** Prefix of the cookie minted by the official connection plugin. */
-import { INNER_AUTH_RETRY_INTERVAL_MS, INNER_COOKIE_PREFIX as COOKIE_PREFIX } from '../constants.js'
+import {
+  INNER_AUTH_EXCHANGE_TIMEOUT_MS,
+  INNER_AUTH_RETRY_INTERVAL_MS,
+  INNER_COOKIE_PREFIX as COOKIE_PREFIX,
+} from '../constants.js'
 
 /**
  * Pull the `name=value` of the `dsh-auth-*` cookie out of a `set-cookie` header.
@@ -59,6 +63,14 @@ import { INNER_AUTH_RETRY_INTERVAL_MS, INNER_COOKIE_PREFIX as COOKIE_PREFIX } fr
  * header is nevertheless accepted as a bare string too, because a host with a
  * polyfilled or stubbed `fetch` may hand back a single value, and silently
  * failing to find the cookie there would surface as an unexplained 401.
+ *
+ * **A joined string is split.** `headers.get('set-cookie')` on a `fetch` response
+ * does not return the array; undici joins multiple cookies with `", "`. Measured
+ * on this Node: a response carrying `other=2` and then the credential yields
+ * `"other=2; Path=/, dsh-auth-…=v1.…; Path=/"`. Read as a single cookie, the
+ * name is `other` and the credential is never found — a permanent, silent 401
+ * with no other symptom, and exactly the failure this module exists to prevent.
+ * {@link setCookieValues} prefers `getSetCookie()` and only falls back to this.
  *
  * Only the first `name=value` pair is taken: everything after the first `;` is
  * attributes (`Path`, `HttpOnly`, …), which must not be forwarded.
@@ -71,16 +83,44 @@ export function extractInnerCookie(setCookie) {
   const entries = Array.isArray(setCookie) ? setCookie : [setCookie]
   for (const entry of entries) {
     if (typeof entry !== 'string') continue
-    const separator = entry.indexOf(';')
-    const pair = (separator === -1 ? entry : entry.slice(0, separator)).trim()
-    const equals = pair.indexOf('=')
-    if (equals === -1) continue
-    if (!pair.slice(0, equals).trim().startsWith(COOKIE_PREFIX)) continue
-    const value = pair.slice(equals + 1).trim()
-    if (value === '') continue
-    return `${pair.slice(0, equals).trim()}=${value}`
+    /* A joined list is scanned pair by pair, so a credential that is not the
+       first cookie in a joined header is still found. A comma inside a value only
+       costs a spurious split; it cannot produce a wrong pair. */
+    for (const candidate of entry.split(',')) {
+      const separator = candidate.indexOf(';')
+      const pair = (separator === -1 ? candidate : candidate.slice(0, separator)).trim()
+      const equals = pair.indexOf('=')
+      if (equals === -1) continue
+      if (!pair.slice(0, equals).trim().startsWith(COOKIE_PREFIX)) continue
+      const value = pair.slice(equals + 1).trim()
+      if (value === '') continue
+      return `${pair.slice(0, equals).trim()}=${value}`
+    }
   }
   return undefined
+}
+
+/**
+ * Read every `set-cookie` value off a `fetch` response's headers.
+ *
+ * `getSetCookie()` is the authoritative accessor and is preferred. It is not
+ * present on every runtime this package may run on (it landed in Node 18.14), so
+ * the fallback reads `get('set-cookie')` and lets {@link extractInnerCookie}
+ * split it. Returns an empty array rather than throwing for a shapes-less stub.
+ *
+ * @param {{ getSetCookie?: () => string[], get?: (name: string) => string | null } | null | undefined} headers
+ * @returns {string[]}
+ */
+export function setCookieValues(headers) {
+  if (headers === null || typeof headers !== 'object') return []
+  if (typeof headers.getSetCookie === 'function') {
+    const all = headers.getSetCookie()
+    if (Array.isArray(all)) return all.filter((entry) => typeof entry === 'string')
+  }
+  const joined = typeof headers.get === 'function' ? headers.get('set-cookie') : undefined
+  if (typeof joined === 'string' && joined !== '') return [joined]
+  if (Array.isArray(joined)) return joined.filter((entry) => typeof entry === 'string')
+  return []
 }
 
 /**
@@ -109,6 +149,8 @@ function innerAuthError(code, message) {
  * @param {typeof globalThis.fetch} [options.fetchImpl] Injectable for tests; defaults to global `fetch`.
  * @param {() => number} [options.now] Clock in epoch milliseconds.
  * @param {number} [options.retryIntervalMs] Minimum spacing between failed attempts.
+ * @param {number} [options.exchangeTimeoutMs] Deadline for one exchange; defaults to
+ *   `INNER_AUTH_EXCHANGE_TIMEOUT_MS`.
  * @param {(logger: object, level: 'debug' | 'info' | 'warn' | 'error', message: string) => void} [options.emit]
  *   Logger sink; defaults to a no-op so the module is usable without a host logger.
  * @param {object} [options.logger] Logger passed to `emit`.
@@ -130,6 +172,23 @@ export function createInnerAuth(options) {
     : INNER_AUTH_RETRY_INTERVAL_MS
   const emit = typeof options.emit === 'function' ? options.emit : () => {}
   const logger = options.logger
+
+  /**
+   * Deadline for one exchange.
+   *
+   * The loopback exchange is a `fetch` to `127.0.0.1`; a healthy one resolves in
+   * single-digit milliseconds. Without a deadline a socket that accepts and then
+   * goes quiet blocks the promise forever, and because concurrent callers are
+   * coalesced onto one in-flight exchange, that one stall stops the whole gateway.
+   * Falls back to a fixed bound when the caller does not supply one.
+   *
+   * @returns {number} milliseconds.
+   */
+  function exchangeTimeoutMs() {
+    return Number.isFinite(options.exchangeTimeoutMs) && options.exchangeTimeoutMs > 0
+      ? options.exchangeTimeoutMs
+      : INNER_AUTH_EXCHANGE_TIMEOUT_MS
+  }
 
   /** The cached `name=value`. `null` = no attempt made yet; `undefined` = known-bad. */
   let cached = null
@@ -189,17 +248,29 @@ export function createInnerAuth(options) {
       /* `redirect: 'manual'` is mandatory: the exchange answers 303 with the
          cookie, and a followed redirect discards it (measured, §6 of the
          research note — the parent verified `set-cookie` survives only with
-         `manual`). */
-      response = await fetchImpl(url, { redirect: 'manual', method: 'GET' })
+         `manual`).
+         A timeout is mandatory too. Measured: with the exchange hung and no
+         deadline, EVERY remote request blocked on this promise forever — the
+         in-flight coalescing means one unanswered exchange holds the whole
+         gateway, and `upstreamTimeoutMs` does not cover it because it only bounds
+         the proxied hop. The head timeout is passed in for that reason. */
+      response = await fetchImpl(url, {
+        redirect: 'manual',
+        method: 'GET',
+        signal: AbortSignal.timeout(exchangeTimeoutMs()),
+      })
     } catch {
-      /* Network-level failure: DSH not listening yet, or restarting. Not an
-         exception to the request — the caller passes the upstream 401 through. */
+      /* Network-level failure or the deadline: DSH not listening yet, restarting,
+         or a socket that accepted the connection and went quiet. Not an exception
+         to the request — the caller passes the upstream 401 through. */
       emit(logger, 'warn', '[remote-control] inner credential: the exchange request failed')
       lastFailureAt = now()
       return undefined
     }
 
-    const headerValue = extractInnerCookie(response?.headers?.get?.('set-cookie'))
+    /* `getSetCookie()` is the authoritative accessor; the fallback handles a
+       runtime or stub that only answers `get('set-cookie')`, joined with ", ". */
+    const headerValue = extractInnerCookie(setCookieValues(response?.headers))
     if (headerValue === undefined) {
       /* A 200 instead of a 303 means the launch token was rejected — typically a
          stale URL after a DSH restart. Say the phase, never the value. */

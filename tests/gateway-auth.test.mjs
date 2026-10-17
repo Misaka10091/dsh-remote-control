@@ -68,13 +68,27 @@ function deviceCookie(token) {
  * ------------------------------------------------------------------ */
 
 test('isLoopbackHostname recognizes localhost, IPv6 loopback and 127/8', () => {
-  for (const host of ['localhost', '[::1]', '127.0.0.1', '127.1.2.3', '127.255.255.254']) {
+  for (const host of ['localhost', '[::1]', '::1', '127.0.0.1', '127.1.2.3', '127.255.255.254']) {
     assert.equal(isLoopbackHostname(host), true, host)
   }
   for (const host of ['192.168.1.7', '0.0.0.0', '10.0.0.1', '128.0.0.1', 'localhost.evil.example', '127.0.0.256', '']) {
     assert.equal(isLoopbackHostname(host), false, host)
   }
+  /* A zone index is not loopback, and must not be waved through a `::1` prefix test. */
+  for (const host of ['::1%eth0', '::1.evil.example', 'fe80::1', '::2']) {
+    assert.equal(isLoopbackHostname(host), false, host)
+  }
   assert.equal(isLoopbackHostname(undefined), false)
+})
+
+test('a bare ::1 socket peer counts as loopback', () => {
+  /* `socket.remoteAddress` is `::1` (no brackets) for a request over IPv6
+     loopback; the bracketed form is what a WHATWG Host carries. Handling only the
+     bracketed spelling meant a local request on such a listener was asked for a
+     cookie — the "本机回环访问不需要配对" guarantee failing on a common config. */
+  assert.equal(isLoopbackSocket({ socket: { remoteAddress: '::1' } }), true)
+  assert.equal(isLoopback({ socket: { remoteAddress: '::1' }, headers: { host: '[::1]:3090' } }), true)
+  assert.equal(isLoopback({ socket: { remoteAddress: '::1' }, headers: { host: '192.168.1.7:3090' } }), false)
 })
 
 test('peerAddress unwraps IPv4-mapped IPv6 so one address has one spelling', () => {
@@ -166,6 +180,121 @@ test('a loopback socket with a NON-loopback Host is treated as remote (DNS rebin
     })
     assert.equal(verdict.decision, DECISION.UNAUTHENTICATED)
     assert.equal(verdict.loopback, false)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * The loopback exemption does NOT waive the origin fence
+ *
+ * Measured on the stage-2 build before this was fixed: a page on
+ * `https://evil.example` issuing a no-preflight `POST` to
+ * `http://127.0.0.1:<gatewayPort>/api/…` got a **200 that executed against DSH**.
+ * The browser sets `Host` from the URL, so it is loopback for such a request and
+ * the exemption fired and returned before the fence; the gateway then did what it
+ * is built to do — stripped `Origin`/`Sec-Fetch-*` and attached the instance-wide
+ * `dsh-auth-*` credential — converting a request the official fence refuses into
+ * an authenticated write. `SameSite=Lax` is no defence because the exemption
+ * means no cookie is required.
+ *
+ * The exemption must keep waiving the CREDENTIAL (that is `prd.md` R3) and must
+ * never waive the origin proof.
+ * ------------------------------------------------------------------ */
+
+test('a cross-site write over a loopback socket is refused, not laundered', () => {
+  withDevice(({ store }) => {
+    const verdict = authorize({
+      req: request({
+        method: 'POST',
+        remoteAddress: '127.0.0.1',
+        headers: {
+          host: '127.0.0.1:3090',
+          origin: 'https://evil.example',
+          'sec-fetch-site': 'cross-site',
+          'content-type': 'text/plain',
+        },
+      }),
+      store,
+      cookieName: DEVICE_COOKIE_NAME,
+    })
+    assert.equal(verdict.decision, DECISION.FORBIDDEN, 'a cross-site write must never be laundered by the exemption')
+    assert.equal(verdict.reason, 'cross-site')
+    assert.equal(verdict.loopback, true, 'it is still recognised as a local request; it is just not allowed to write')
+    assert.equal(statusFor(verdict.decision), 403)
+  })
+})
+
+test('a cross-site form POST without Sec-Fetch-Site is refused over a loopback socket', () => {
+  /* The shape an older browser sends for a cross-site form post: an Origin, no
+     Sec-Fetch-Site, and a content type no preflight is required for. */
+  withDevice(({ store }) => {
+    const verdict = authorize({
+      req: request({
+        method: 'POST',
+        remoteAddress: '127.0.0.1',
+        headers: {
+          host: '127.0.0.1:3090',
+          origin: 'https://evil.example',
+          'content-type': 'application/x-www-form-urlencoded',
+        },
+      }),
+      store,
+      cookieName: DEVICE_COOKIE_NAME,
+    })
+    assert.equal(verdict.decision, DECISION.FORBIDDEN)
+    assert.equal(verdict.reason, 'cross-origin')
+  })
+})
+
+test('an unmarked local write is refused, but a local browser write still passes', () => {
+  /* The two sides of the trade. A local write that proves nothing is refused (the
+     CSRF shape); a local write a real browser makes carries `Sec-Fetch-Site:
+     same-origin` or a matching `Origin`, and both pass. */
+  withDevice(({ store }) => {
+    const unmarked = authorize({
+      req: request({
+        method: 'POST',
+        remoteAddress: '127.0.0.1',
+        headers: { host: '127.0.0.1:3090' },
+      }),
+      store,
+      cookieName: DEVICE_COOKIE_NAME,
+    })
+    assert.equal(unmarked.decision, DECISION.FORBIDDEN)
+    assert.equal(unmarked.reason, 'no-origin')
+
+    for (const headers of [
+      { host: '127.0.0.1:3090', 'sec-fetch-site': 'same-origin' },
+      { host: '127.0.0.1:3090', origin: 'http://127.0.0.1:3090' },
+    ]) {
+      const allowed = authorize({
+        req: request({ method: 'POST', remoteAddress: '127.0.0.1', headers }),
+        store,
+        cookieName: DEVICE_COOKIE_NAME,
+      })
+      assert.equal(allowed.decision, DECISION.ALLOW, `${JSON.stringify(headers)} must still work locally`)
+      assert.equal(allowed.device, null, 'and it still needs no device')
+    }
+  })
+})
+
+test('a local READ is never asked for an origin, even a cross-site one', () => {
+  /* `prd.md` acceptance "本机回环访问全程不需要配对" and the local-tool guarantee are
+     about reads as much as anything: opening the URL in a local browser, or a
+     local script fetching it, must keep working with no headers at all. */
+  withDevice(({ store }) => {
+    for (const headers of [
+      { host: '127.0.0.1:3090' },
+      { host: 'localhost:3090' },
+      { host: '127.0.0.1:3090', origin: 'http://127.0.0.1:3090' },
+    ]) {
+      const verdict = authorize({
+        req: request({ remoteAddress: '127.0.0.1', headers }),
+        store,
+        cookieName: DEVICE_COOKIE_NAME,
+      })
+      assert.equal(verdict.decision, DECISION.ALLOW, `${JSON.stringify(headers)} must be allowed`)
+      assert.equal(verdict.device, null)
+    }
   })
 })
 

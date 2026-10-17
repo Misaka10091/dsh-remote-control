@@ -9,10 +9,13 @@
  *
  * The order is `design.md` §3.2's, and it is not arbitrary:
  *
- *   1. **Loopback source → allow.** A request that BOTH arrived over a loopback
- *      socket AND names a loopback authority in `Host` came from this machine,
- *      and `prd.md` requires the local experience to be untouched. Requiring a
- *      cookie here would break every local tool.
+ *   1. **Loopback source → allow, but only past the origin fence.** A request
+ *      that BOTH arrived over a loopback socket AND names a loopback authority in
+ *      `Host` came from this machine, and `prd.md` requires the local experience
+ *      to be untouched: **no cookie is ever required here**. The fence still runs,
+ *      for the reason spelled out under "Why loopback is not exempt from the
+ *      origin fence" below — the exemption waives the credential, never the
+ *      origin proof.
  *   2. **Device cookie → else 401.** The credential. Everything below exists for
  *      a request that has already proven it holds one.
  *   3. **Origin fence → else 403.** Checked only after the credential, so a
@@ -22,6 +25,29 @@
  *   4. **Not revoked → allow; revoked → 401 + clear the cookie.** Revocation is
  *      checked LAST so that a client holding a perfectly valid cookie is told
  *      exactly the truth: the credential is no longer accepted.
+ *
+ * ## Why loopback is not exempt from the origin fence
+ *
+ * The loopback exemption originally returned ALLOW before the fence ran. That is
+ * a complete CSRF bypass, because the gateway is the one hop that *adds* the
+ * instance-wide `dsh-auth-*` credential and *strips* `Origin`/`Sec-Fetch-*`
+ * (`proxy.js`). The official fence denies a cross-site write; laundering it
+ * through the gateway turns that denial into a 200 that executes against DSH.
+ *
+ * Measured on the stage-2 build: a page on `https://evil.example` issuing a
+ * no-preflight `POST http://127.0.0.1:<gatewayPort>/api/…` — a plain-text form
+ * post, which no CORS preflight stops — reached upstream as an authenticated
+ * write with `Origin` and `Sec-Fetch-Site` removed. `Host` is set by the browser
+ * from the URL, so it *is* loopback for such a request and the exemption fired.
+ * `SameSite=Lax` does not help either: the exemption means no cookie is needed.
+ *
+ * So the fence runs on this arm too. What the exemption still buys is exactly
+ * what `prd.md` asks for and nothing more: **no pairing, no cookie, no device**
+ * for local access. Local reads are unaffected (the fence asks nothing of a
+ * read), a local browser's writes carry `Sec-Fetch-Site: same-origin` or a
+ * matching `Origin` and pass, and only an unmarked local write — the shape a
+ * forged cross-site request takes — is refused. That is `design.md` §3.2.1 arm
+ * 4's intent applied consistently.
  *
  * ## Why loopback needs both signals
  *
@@ -60,7 +86,10 @@ import { checkOrigin, isWriteMethod } from './origin.js'
  */
 export function isLoopbackHostname(hostname) {
   if (typeof hostname !== 'string') return false
-  if (hostname === 'localhost' || hostname === '[::1]') return true
+  if (hostname === 'localhost' || hostname === '[::1]' || hostname === '::1') return true
+  /* An IPv6 zone index (`fe80::1%eth0`) is not loopback, and `::1%x` must not be
+     accepted by the prefix test below. */
+  if (hostname.includes(':')) return false
   const parts = hostname.split('.')
   return parts.length === 4
     && parts[0] === '127'
@@ -202,8 +231,18 @@ export function authorize({ req, store, cookieName }) {
   const loopback = isLoopback(req)
 
   /* 1. Local access needs no credential (`prd.md` R3, acceptance "本机回环访问全程
-       不需要配对"). Recorded as ALLOW with no device so audit can distinguish it. */
-  if (loopback) return { decision: DECISION.ALLOW, device: null, loopback: true, reason: null }
+        不需要配对"), but it does not get to skip the origin fence: the gateway is
+        the hop that injects the instance-wide inner credential and removes
+        `Origin`/`Sec-Fetch-*`, so letting a cross-site write through here would
+        hand DSH an authenticated request the official fence would have refused.
+        See "Why loopback is not exempt from the origin fence" above. */
+  if (loopback) {
+    const origin = checkOrigin(req)
+    if (!origin.ok) {
+      return { decision: DECISION.FORBIDDEN, device: null, loopback: true, reason: origin.reason }
+    }
+    return { decision: DECISION.ALLOW, device: null, loopback: true, reason: null }
+  }
 
   /* 2. The device credential. */
   const presented = readCookie(readHeader(req, 'cookie'), cookieName)

@@ -201,6 +201,39 @@ test('a client-supplied X-Forwarded-For is discarded, not appended to', () => {
   assert.equal(headers['x-forwarded-for'], '192.168.1.7')
 })
 
+test('a client cannot supply forwarding headers even when the peer is unknowable', () => {
+  /* The hole this closes: `forwardingHeaders` only writes `x-forwarded-for` when
+     the peer address is a string, and drops `forwarded` alone. With an unknowable
+     peer (`peerAddress` returns undefined for a socket with no string
+     `remoteAddress`) the client's own `x-forwarded-for` was therefore forwarded
+     VERBATIM — measured — so a device could pick the address the upstream and the
+     future audit trail believe it came from. Every field this hop synthesizes is
+     now dropped on the way in and re-written from the real connection. */
+  const headers = upstreamHeaders(
+    request({
+      host: 'lan:3090',
+      'x-forwarded-for': '203.0.113.250',
+      'x-real-ip': '203.0.113.250',
+      'x-client-ip': '203.0.113.250',
+      'x-cluster-client-ip': '203.0.113.250',
+      'true-client-ip': '203.0.113.250',
+      'x-forwarded-host': 'evil.example',
+      'x-forwarded-proto': 'https',
+      'x-forwarded-port': '443',
+      forwarded: 'for=203.0.113.250',
+    }),
+    { upstreamHost: '127.0.0.1:19387', innerCookie: undefined, peer: undefined },
+  )
+
+  assert.equal(headers['x-forwarded-for'], undefined, 'no spoofable source address survives')
+  for (const name of ['x-real-ip', 'x-client-ip', 'x-cluster-client-ip', 'true-client-ip', 'forwarded']) {
+    assert.equal(headers[name], undefined, `${name} must not cross the hop`)
+  }
+  /* The two the gateway always sets describe the real hop, not the client's claim. */
+  assert.equal(headers['x-forwarded-host'], 'lan:3090', 'the authority this hop was addressed with')
+  assert.equal(headers['x-forwarded-proto'], 'http', 'the transport this hop actually used')
+})
+
 test('a duplicated header value survives as-is', () => {
   /* Node hands repeated headers back as arrays; forwarding the array is what lets
      `cookie` and `x-forwarded-*` chain correctly. Nothing here inspects them. */

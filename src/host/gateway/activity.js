@@ -112,20 +112,28 @@ export function createActivityTracker(options) {
   /**
    * Persist one device now, or every device with unflushed activity.
    *
+   * A FAILED write keeps the device pending. Deleting the stamp before the attempt
+   * (as the throttle in {@link record} deliberately does) would be wrong here: the
+   * whole purpose of `flush` is that the panel and the shutdown disposer see the
+   * truth, so a write that did not happen must leave the device in `pending()` for
+   * the next flush to retry. Dropping it would silently lose the last activity of a
+   * device that is never heard from again — the one case a flush exists for.
+   *
    * @param {string} [deviceId] Flush only this device; omit to flush all.
-   * @returns {number} how many writes were attempted.
+   * @returns {number} how many writes succeeded.
    */
   function flush(deviceId) {
     if (typeof deviceId === 'string' && deviceId !== '') {
       if (!lastPersistedAt.has(deviceId)) return 0
-      lastPersistedAt.delete(deviceId)
       try {
         touch(deviceId)
-        stats.persisted += 1
-        return 1
       } catch {
+        /* Left pending on purpose — see the note above. */
         return 0
       }
+      lastPersistedAt.delete(deviceId)
+      stats.persisted += 1
+      return 1
     }
     let count = 0
     for (const id of [...lastPersistedAt.keys()]) count += flush(id)

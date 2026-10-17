@@ -823,6 +823,119 @@ test('a client disconnect does not take the process down', async () => {
 })
 
 /* ------------------------------------------------------------------ *
+ * Client disconnect BEFORE the upstream answers
+ * ------------------------------------------------------------------ */
+
+test('a client that disconnects before the upstream answers does not pin the upstream socket', async () => {
+  /* Measured on the stage-2 build: a GET whose client aborts mid-wait emits `end`
+     and `close` on `req`/`res` but **no `error`**, so the `req.on('error')` hook
+     never fired and the upstream `ClientRequest` stayed connected until its head
+     timeout — 120 s by default. One upstream socket per dropped request, for two
+     minutes, from a LAN client in a loop. The wait is now bound to `res` `close`.
+     
+     Two listeners are needed to see this: the upstream answers the credential
+     exchange (so the exchange's own socket is not the one under test) and hangs on
+     every other path. */
+  const state = { exchange: 0, hung: 0, opened: 0, closed: 0, sockets: new Map() }
+  const hung = createServer((req, res) => {
+    const url = new URL(req.url ?? '/', 'http://x')
+    if (url.pathname === '/' && url.searchParams.has('token')) {
+      state.exchange += 1
+      res.writeHead(303, { location: '/', 'set-cookie': 'dsh-auth-stub=v1.s; Path=/' })
+      res.end()
+      return
+    }
+    /* Only `/hang` is silent; the health probe below needs an answer. */
+    if (url.pathname === '/hang') {
+      state.hung += 1
+      return
+    }
+    res.writeHead(200, { 'content-type': 'text/plain' })
+    res.end('official')
+  })
+  hung.on('connection', (socket) => {
+    state.opened += 1
+    /* Keyed by the request path the socket serves, so the test can tell the
+       poolable exchange socket (which undici keeps alive by design) from the
+       proxied request's socket, which must be dropped. */
+    const id = state.opened
+    state.sockets.set(id, { path: null, state: 'open' })
+    socket.on('close', () => { state.closed += 1; state.sockets.get(id).state = 'closed' })
+    socket.once('data', (chunk) => { state.sockets.get(id).path = String(chunk).split(' ')[1] })
+  })
+  await new Promise((resolve) => hung.listen(0, '127.0.0.1', resolve))
+  const hungPort = hung.address().port
+
+  const dir = makeTempDir()
+  const { store } = makeStore(dir)
+  const minted = createDeviceToken()
+  store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: minted.tokenHash })
+
+  const gateway = await startGateway({
+    ctx: { get: () => ({ authenticatedUrl: (base) => `${base}?token=L` }), effect: () => () => {} },
+    store,
+    officialPort: hungPort,
+    port: 0,
+    host: '127.0.0.1',
+    cookieName: DEVICE_COOKIE_NAME,
+    /* Long on purpose: if the disconnect is not noticed, the assertion below fails
+       on a still-open socket rather than on a timeout. */
+    upstreamTimeoutMs: 30_000,
+    innerAuthTimeoutMs: 30_000,
+  })
+
+  try {
+    /* Prime the credential so the exchange does not race the request under test. */
+    assert.equal(typeof (await gateway.innerAuth.refresh()), 'string', 'the credential was minted')
+
+    /* A local (loopback, no pairing) GET, aborted while the upstream is silent. */
+    await new Promise((resolve) => {
+      const req = httpRequest({
+        host: '127.0.0.1',
+        port: gateway.port,
+        path: '/hang',
+        headers: { host: `127.0.0.1:${String(gateway.port)}` },
+        agent: false,
+      })
+      req.on('error', () => resolve(undefined))
+      req.on('response', (res) => { res.destroy(); resolve(undefined) })
+      req.end()
+      setTimeout(() => { req.destroy(); resolve(undefined) }, 100)
+    })
+
+    /* Give the close a moment to propagate through the gateway. */
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert.ok(state.hung >= 1, 'the upstream really was contacted for the request')
+
+    /* The proxied request's socket must be gone. The exchange socket is
+       deliberately excluded: undici pools it for reuse across redemptions, which
+       is expected and is not the leak under test. */
+    const proxied = [...state.sockets.values()].filter((entry) => entry.path === '/hang')
+    assert.equal(proxied.length, 1, 'exactly one socket served the aborted request')
+    assert.equal(proxied[0].state, 'closed', 'it was released, not held for the head timeout')
+
+    /* And the gateway is still serving. */
+    const after = await new Promise((resolve, reject) => {
+      const probe = httpRequest({
+        host: '127.0.0.1',
+        port: gateway.port,
+        path: '/',
+        headers: { host: `127.0.0.1:${String(gateway.port)}` },
+        agent: false,
+      }, (res) => { res.resume(); resolve(res.statusCode) })
+      probe.on('error', reject)
+      probe.end()
+      setTimeout(() => reject(new Error('the gateway stopped serving after a disconnect')), 2_000)
+    })
+    assert.equal(typeof after, 'number')
+  } finally {
+    await gateway.close()
+    await new Promise((resolve) => { hung.closeAllConnections(); hung.close(resolve) })
+    cleanupDir(dir)
+  }
+})
+
+/* ------------------------------------------------------------------ *
  * Activity throttling through the real request path
  * ------------------------------------------------------------------ */
 
@@ -904,6 +1017,96 @@ test('a loopback socket with a public Host is NOT exempted (DNS rebinding)', asy
     })
     assert.equal(res.status, 401, 'a rebound request gets the remote treatment')
     assert.equal(upstream.state.requests.length, 0)
+  } finally {
+    await stop()
+  }
+})
+
+test('a cross-site write cannot be laundered into an authenticated upstream write', async () => {
+  /* Measured on the stage-2 build before the fix: this exact request returned 200
+     and the upstream stub received an authenticated POST with `Origin` and
+     `Sec-Fetch-Site` stripped and the inner `dsh-auth-*` credential attached — the
+     gateway doing precisely what it is built to do, on behalf of a page that must
+     never be able to. `Host` is set by the browser from the URL, so it is loopback
+     for such a request, and the exemption fired before the fence ran.
+     `SameSite=Lax` is no defence: the exemption requires no cookie at all.
+     A plain-text form post needs no CORS preflight, so this is a real page's move. */
+  const upstream = await startUpstream()
+  const { gateway, stop } = await startGatewayUnderTest({ officialPort: upstream.port })
+
+  try {
+    const res = await send({
+      port: gateway.port,
+      method: 'POST',
+      path: '/api/session/sendMessage',
+      headers: {
+        /* Loopback Host — what the browser sends for a request to 127.0.0.1. */
+        host: `127.0.0.1:${String(gateway.port)}`,
+        origin: 'https://evil.example',
+        'sec-fetch-site': 'cross-site',
+        'content-type': 'text/plain',
+        'content-length': '7',
+      },
+      body: 'PAYLOAD',
+    })
+
+    assert.equal(res.status, 403, 'the forged write is refused at the gateway')
+    assert.equal(JSON.parse(res.body).error.code, 'gateway/cross-origin')
+    assert.equal(upstream.state.requests.length, 0, 'and it never reaches DSH')
+
+    /* The same page using a form POST, which older browsers send without
+       Sec-Fetch-Site: refused on the Origin arm instead. */
+    const form = await send({
+      port: gateway.port,
+      method: 'POST',
+      path: '/api/session/sendMessage',
+      headers: {
+        host: `127.0.0.1:${String(gateway.port)}`,
+        origin: 'https://evil.example',
+        'content-type': 'application/x-www-form-urlencoded',
+        'content-length': '7',
+      },
+      body: 'PAYLOAD',
+    })
+    assert.equal(form.status, 403)
+    assert.equal(JSON.parse(form.body).error.code, 'gateway/cross-origin')
+    assert.equal(upstream.state.requests.length, 0, 'neither variant reached DSH')
+  } finally {
+    await stop()
+  }
+})
+
+test('local writes and reads still work with no pairing after the fence applies to loopback', async () => {
+  /* The guarantee that must survive the fix: `prd.md` "本机回环访问全程不需要配对".
+     A local browser's write carries `Sec-Fetch-Site: same-origin` or a matching
+     `Origin`, and a local read carries nothing at all. Neither may require a
+     cookie. */
+  const upstream = await startUpstream()
+  const { gateway, stop } = await startGatewayUnderTest({ officialPort: upstream.port })
+
+  try {
+    const host = `127.0.0.1:${String(gateway.port)}`
+
+    const read = await send({ port: gateway.port, headers: { host } })
+    assert.equal(read.status, 200, 'a local read needs no headers and no cookie')
+
+    const sameOrigin = await send({
+      port: gateway.port,
+      method: 'POST',
+      path: '/api/message',
+      headers: { host, 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+      body: '{}',
+    })
+    assert.equal(sameOrigin.status, 200, 'a local same-origin write needs no cookie')
+
+    const withOrigin = await send({
+      port: gateway.port,
+      method: 'POST',
+      path: '/api/message',
+      headers: { host, origin: `http://${host}`, 'content-type': 'application/json' },
+      body: '{}',
+    })
+    assert.equal(withOrigin.status, 200, 'a local write with a matching Origin needs no cookie')
   } finally {
     await stop()
   }

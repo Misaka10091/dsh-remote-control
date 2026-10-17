@@ -124,3 +124,14 @@ export const ACTIVITY_PERSIST_INTERVAL_MS = 30_000
  * without pinning the gateway into permanent degradation.
  */
 export const INNER_AUTH_RETRY_INTERVAL_MS = 1_000
+
+/**
+ * Deadline for one inner-credential exchange.
+ *
+ * The exchange is a `fetch` to loopback that answers in single-digit milliseconds
+ * when healthy. Without a deadline a socket that accepts and then goes quiet
+ * blocks the exchange forever, and since concurrent callers are coalesced onto one
+ * in-flight exchange, that single stall stops every remote request — measured.
+ * Five seconds is far above a healthy exchange and far below a user's patience.
+ */
+export const INNER_AUTH_EXCHANGE_TIMEOUT_MS = 5_000

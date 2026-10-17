@@ -149,6 +149,7 @@ function pairingError(code, message) {
  *   sweep: () => number,
  *   pending: () => number,
  *   resetSource: (source: unknown) => boolean,
+ *   sourceCount: () => number,
  * }}
  */
 export function createPairingStore(options = {}) {
@@ -212,12 +213,32 @@ export function createPairingStore(options = {}) {
   }
 
   /**
+   * Drop aged-out timestamps for every source, not just the one being consulted.
+   *
+   * `pruneSource` only touches the entry it was asked about, so a source that is
+   * never heard from again keeps its timestamps — and its Map entry — forever. The
+   * budget is a sliding window, so anything older than `ipWindowMs` is already
+   * dead weight; sweeping it globally once per recorded failure bounds the map to
+   * "addresses that failed inside the current window", which is exactly the state
+   * a rate limiter needs.
+   *
+   * Deliberately a sweep and NOT an eviction: dropping a still-live entry would
+   * reset that address's budget and turn the map's size limit into a way to
+   * escape the limit. Nothing here can widen a budget, only forget what has
+   * already expired.
+   */
+  function sweepSources(at) {
+    for (const source of [...sourceFailures.keys()]) pruneSource(source, at)
+  }
+
+  /**
    * Record one failed redemption against its source.
    *
    * @param {string | undefined} source Caller-supplied address, or `undefined` when unknowable.
    */
   function recordSourceFailure(source, at) {
     if (source === undefined || source === '') return
+    sweepSources(at)
     const recorded = pruneSource(source, at)
     recorded.push(at)
     sourceFailures.set(source, recorded)
@@ -395,5 +416,18 @@ export function createPairingStore(options = {}) {
     return sourceFailures.delete(source)
   }
 
-  return { create, redeem, sweep, pending, resetSource }
+  /**
+   * How many addresses currently hold failure history.
+   *
+   * A diagnostics accessor, in the same spirit as `activity.js`'s `stats`: the map
+   * is attacker-reachable (a source string comes off a request), so its size is a
+   * property worth being able to assert on without reaching into module internals.
+   *
+   * @returns {number}
+   */
+  function sourceCount() {
+    return sourceFailures.size
+  }
+
+  return { create, redeem, sweep, pending, resetSource, sourceCount }
 }

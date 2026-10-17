@@ -127,6 +127,45 @@ test('dispose flushes everything, so shutdown does not lose the last interval', 
   assert.deepEqual(touch.calls, ['dev_1', 'dev_2', 'dev_1', 'dev_2'])
 })
 
+test('a FAILED flush keeps the device pending so the final write is not silently lost', () => {
+  /* The failure mode this pins: `flush` used to delete the pending stamp BEFORE
+     attempting the write, so a write that threw dropped the device entirely. The
+     one place that matters most is the shutdown disposer — a locked file or a full
+     disk at unload would mean the last half-minute of "last seen" is lost with no
+     retry and no signal. The panel-read flush has the same problem: the panel
+     would render a stale value and the device would then never be re-flushed. */
+  let failing = true
+  let writes = 0
+  const touch = () => {
+    writes += 1
+    if (failing) {
+      throw Object.assign(new Error('devices.json could not be written'), { code: 'store/write-failed' })
+    }
+    return { id: 'dev_1' }
+  }
+  const activity = createActivityTracker({ touch, now: () => 0, intervalMs: 30_000 })
+
+  activity.record('dev_1')
+  assert.deepEqual(activity.pending(), ['dev_1'])
+  assert.equal(writes, 1, 'the throttled record attempted its one write, and it failed')
+
+  assert.equal(activity.flush('dev_1'), 0, 'the write failed')
+  assert.equal(writes, 2, 'flush retried rather than trusting the failed attempt')
+  assert.deepEqual(activity.pending(), ['dev_1'], 'the activity is still outstanding, not forgotten')
+
+  /* Second attempt while still failing: it tries again rather than being throttled
+     away — `flush` is the caller saying "persist this now". */
+  assert.equal(activity.flush(), 0)
+  assert.equal(writes, 3)
+  assert.deepEqual(activity.pending(), ['dev_1'])
+
+  /* Recovery: the very next flush lands it. */
+  failing = false
+  assert.equal(activity.flush(), 1)
+  assert.equal(writes, 4)
+  assert.deepEqual(activity.pending(), [])
+})
+
 test('a failing touch is swallowed so an authorized request is not failed by bookkeeping', () => {
   /* The request was already authorized; a locked file or a full disk must not turn
      a successful page load into a 500. It is retried on a later request. */

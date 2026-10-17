@@ -18,6 +18,7 @@ import {
   carriesInnerCookie,
   createInnerAuth,
   extractInnerCookie,
+  setCookieValues,
 } from '../src/host/gateway/inner-auth.js'
 
 /** A `set-cookie` header shaped like the one the official exchange returns. */
@@ -89,6 +90,7 @@ function makeInnerAuth(overrides = {}) {
     fetchImpl,
     now: () => clock.now,
     retryIntervalMs: overrides.retryIntervalMs ?? 0,
+    exchangeTimeoutMs: overrides.exchangeTimeoutMs,
     emit,
     logger,
   })
@@ -110,6 +112,126 @@ test('extractInnerCookie accepts a single string instead of an array', () => {
 test('extractInnerCookie picks the dsh-auth entry out of several cookies', () => {
   const header = ['other=1; Path=/', INNER, 'another=2']
   assert.equal(extractInnerCookie(header), 'dsh-auth-abc123=v1.payload.signature')
+})
+
+test('extractInnerCookie finds a credential that is not first in a comma-joined header', () => {
+  /* `headers.get('set-cookie')` on a `fetch` response does NOT return an array:
+     undici joins multiple cookies with ", ". Measured on this Node, a response
+     carrying `other=2` then the credential yields
+     `"other=2; Path=/, dsh-auth-…=v1.…; Path=/"`. Read as one cookie the name is
+     `other`, the credential is never found, and the gateway degrades to a silent
+     permanent 401 — the exact failure this module exists to prevent. */
+  assert.equal(
+    extractInnerCookie('other=2; Path=/, dsh-auth-s=v1.a.b; Path=/'),
+    'dsh-auth-s=v1.a.b',
+  )
+  /* First in the joined list still works, and a value containing a comma does not
+     produce a wrong pair. */
+  assert.equal(extractInnerCookie('dsh-auth-s=v1.a.b; Path=/, other=2'), 'dsh-auth-s=v1.a.b')
+  assert.equal(extractInnerCookie('other=1, another=2'), undefined)
+})
+
+test('setCookieValues prefers getSetCookie and falls back to a joined get()', () => {
+  assert.deepEqual(
+    setCookieValues({
+      getSetCookie: () => ['a=1', 'dsh-auth-s=v1.s'],
+      get: () => 'a=1, dsh-auth-s=v1.s',
+    }),
+    ['a=1', 'dsh-auth-s=v1.s'],
+    'the authoritative accessor wins, so values are never split',
+  )
+  assert.deepEqual(
+    setCookieValues({ get: () => 'a=1, dsh-auth-s=v1.s' }),
+    ['a=1, dsh-auth-s=v1.s'],
+    'the fallback passes the joined header through for extractInnerCookie to split',
+  )
+  assert.deepEqual(setCookieValues({ get: () => null }), [])
+  assert.deepEqual(setCookieValues(undefined), [])
+  assert.deepEqual(setCookieValues({}), [])
+})
+
+test('the redemption finds the credential when fetch only exposes a joined set-cookie', async () => {
+  /* End of the chain: a `fetch` stub shaped like real undici — `getSetCookie`
+     absent, `get` joins with ", " — must still yield the credential. */
+  const fetchImpl = async () => ({
+    status: 303,
+    headers: {
+      get: (name) => (name.toLowerCase() === 'set-cookie'
+        ? 'other=2; Path=/, dsh-auth-real=v1.joined.sig; Path=/; HttpOnly'
+        : null),
+    },
+  })
+  const { innerAuth } = makeInnerAuth({ fetchImpl })
+
+  assert.equal(await innerAuth.header(), 'dsh-auth-real=v1.joined.sig')
+  assert.equal(innerAuth.peek(), 'dsh-auth-real=v1.joined.sig')
+})
+
+test('the exchange carries a deadline, so a hung upstream cannot block every request', async () => {
+  /* Measured on the stage-2 build: the exchange is a `fetch` with no signal, and
+     concurrent callers are coalesced onto one in-flight promise. An upstream that
+     accepts the connection and then goes quiet therefore stalled EVERY remote
+     request indefinitely — `upstreamTimeoutMs` does not cover it, because it bounds
+     only the proxied hop, not this one. Three concurrent requests, 1.5 s client
+     bound, all hung.
+     
+     The assertion is on the SIGNAL rather than on a wall clock, so a regression
+     fails immediately instead of hanging the suite: without `signal` there is
+     nothing that can release the caller, which is the whole defect. */
+  let sawSignal
+  const fetchImpl = async (url, init) => {
+    sawSignal = init.signal
+    if (sawSignal === undefined || sawSignal === null) {
+      /* Fail fast. The production consequence of this branch is a request that
+         never completes, and a test that hangs is not a test that reports. */
+      throw new Error('the exchange passed no abort signal, so a silent upstream would stall forever')
+    }
+    return new Promise((_resolve, reject) => {
+      init.signal.addEventListener('abort', () => reject(new Error('aborted')))
+    })
+  }
+  const { innerAuth } = makeInnerAuth({ fetchImpl, exchangeTimeoutMs: 30 })
+
+  assert.equal(await innerAuth.header(), undefined, 'a timed-out exchange yields no credential and does not throw')
+  assert.ok(sawSignal !== undefined && sawSignal !== null, 'the exchange must pass an abort signal')
+  assert.equal(typeof sawSignal.aborted, 'boolean', 'and it must be a real AbortSignal')
+})
+
+test('a hung exchange does not block a later request once the deadline has passed', async () => {
+  /* The blast radius, not just the one call: with no deadline the coalesced
+     in-flight promise is shared by every concurrent caller, so one silent socket
+     stops the whole gateway. After the deadline each caller must get its answer. */
+  let attempt = 0
+  const fetchImpl = async (url, init) => {
+    attempt += 1
+    if (attempt === 1) {
+      if (init.signal === undefined || init.signal === null) {
+        throw new Error('the exchange passed no abort signal')
+      }
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener('abort', () => reject(new Error('aborted')))
+      })
+    }
+    return { status: 303, headers: { getSetCookie: () => [INNER] } }
+  }
+  const clock = { now: 1_000 }
+  const innerAuth = createInnerAuth({
+    getConnection: () => stubConnection().service,
+    upstreamOrigin: 'http://127.0.0.1:19387',
+    fetchImpl,
+    now: () => clock.now,
+    retryIntervalMs: 0,
+    exchangeTimeoutMs: 30,
+    emit: () => {},
+  })
+
+  /* The first attempt hangs, times out, and yields nothing. */
+  assert.equal(await innerAuth.header(), undefined)
+
+  /* The retry-interval shield must not pin the gateway into permanent degradation:
+     past the interval a new request tries again and succeeds. */
+  clock.now += 10_000
+  assert.equal(await innerAuth.header(), 'dsh-auth-abc123=v1.payload.signature')
 })
 
 test('extractInnerCookie returns undefined when no dsh-auth cookie is present', () => {

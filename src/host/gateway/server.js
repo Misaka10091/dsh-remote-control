@@ -82,6 +82,7 @@ export function upstreamFor(officialPort) {
  * @param {typeof globalThis.fetch} [options.fetchImpl] Injectable for tests.
  * @param {number} [options.activityIntervalMs] Persist throttle; injectable for tests.
  * @param {number} [options.upstreamTimeoutMs] Bound on the wait for an upstream response head.
+ * @param {number} [options.innerAuthTimeoutMs] Bound on one inner-credential exchange.
  * @param {object} [options.logger]
  * @returns {Promise<{
  *   server: import('node:http').Server,
@@ -123,6 +124,7 @@ export async function startGateway(options) {
     now,
     emit,
     logger,
+    exchangeTimeoutMs: options.innerAuthTimeoutMs,
   })
 
   const proxy = createProxy({
