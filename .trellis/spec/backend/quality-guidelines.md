@@ -48,10 +48,24 @@
 7. **单向依赖。** 见 `directory-structure.md`：领域模块不得 import `gateway/*`。
 
 8. **固定顺序的鉴权判定。** loopback 豁免 → 设备 Cookie → Origin → 吊销状态。顺序写死在一处（`gateway/auth.js`），不要散落在多个 handler 里。
+   **但「豁免」只免凭证，不免 Origin 判定。** 阶段 2 复核发现的真实缺陷：`authorize` 的回环分支直接 `return ALLOW`，围栏没跑；而网关正是「注入内层 `dsh-auth-*` + 剥离 `Origin`/`Sec-Fetch-*`」那一跳，于是任意网页对本机网关发一个**免预检**的 `POST`（`text/plain` 表单，浏览器 `Host` 由 URL 决定就是回环）就能得到 200 且已对 DSH 执行——官方围栏本来会拒的请求被网关洗成了认证请求。`SameSite=Lax` 救不了，因为豁免本就不要求 Cookie。
+   **任何「跳过某个检查直接放行」的分支，都要先问：这个网关自己会不会补上攻击者缺少的那部分？** 会，就不能跳。
 
-9. **短写必须处理。** `writeSync` 的返回值不能忽略，要按 offset 循环。否则短写会通过 `rename` 发布一个被截断的文档——正好是临时文件那套机制要防的事。
+9. **代理自己合成的头，绝不能让客户端决定。** 阶段 2 复核发现的真实缺陷：`forwardingHeaders` 只在 peer 地址是字符串时才写 `x-forwarded-for`，而 `peerAddress` 在 socket 无 `remoteAddress` 时返回 `undefined`，于是客户端自带的 `x-forwarded-for` 原样透传，可任选上游与审计以为的来源 IP。规则：`x-forwarded-*` / `x-real-ip` / `forwarded` 等一律**先丢再写**，不做「有就保留」。
 
-10. **版本一致。** `package.json` 与 `dsh.plugin.json` 的 `version` 必须相等，且 `files` 列出的每个产物必须真实存在。
+10. **凡是有超时的地方，想想它对整个网关的爆炸半径。** 阶段 2 复核发现：内层凭证兑换的 `fetch` 没有 signal，而并发调用被合并到同一个 in-flight promise，所以上游「接了连接但不回」会永久挂起**每一个**远程请求（实测 3 个并发全悬挂），而 `upstreamTimeoutMs` 覆盖不到那一跳。合并 in-flight 的设计会把单点故障放大成全站故障，必须配 deadline。
+
+11. **`pipe()` 的两端都要有错误出口，且「断开」不一定走 `error`。** 实测客户端在响应头之前中断，`req`/`res` 只发 `end`/`close`，**不发 `error`**；只监听 `error` 会让上游 socket 一直连到 head 超时（默认 120s），局域网客户端可「开一个丢一个」批量扣住上游连接。等待上游响应头的那一段必须额外绑到 `res` 的 `close`。
+
+12. **`fetch` 的 `set-cookie` 不是数组。** undici 的 `headers.get('set-cookie')` 返回的是 `", "` 拼接串（实测），只有 `getSetCookie()` 才是数组。把拼接串当单条 Cookie 解析，凭证不在第一位就永远找不到 → 表现为永久静默 401。取 `set-cookie` 一律优先 `getSetCookie()`。
+
+13. **`flush` / `dispose` 这类「最终落盘」路径：写入成功后才清 pending。** 阶段 2 复核发现 `activity.flush` 先 `delete` 再 `touch`，写盘抛错就把该设备从 pending 丢掉——正好是「进程退出时保住最后 30 秒活动」这条要防的事。反过来，节流路径（`record`）**故意**先打时间戳再写，这是对的：它要防的是对坏文件系统的写风暴。两条路径的取舍方向相反，别互相抄。
+
+14. **attacker-reachable 的 Map 要能自己收敛。** 阶段 2 复核发现 `pairing` 的源级失败表只清「被查询的那一条」，扫过即弃的源永久占位。收敛策略只允许删**已过期**的条目；按容量驱逐仍有效的条目等于把限流上限变成绕过手段。
+
+15. **短写必须处理。** `writeSync` 的返回值不能忽略，要按 offset 循环。否则短写会通过 `rename` 发布一个被截断的文档——正好是临时文件那套机制要防的事。
+
+16. **版本一致。** `package.json` 与 `dsh.plugin.json` 的 `version` 必须相等，且 `files` 列出的每个产物必须真实存在。
     `engines.dsh` 必须与**实测**的宿主版本对齐（用 `dsh --version` 复验，不要从二手信息推断——阶段 1 复核曾误判一次）。
 
 ---
@@ -72,6 +86,11 @@
 ## Code Review Checklist
 
 - [ ] 鉴权判定是否只在 `gateway/auth.js` 一处？有没有 handler 自己判断 Cookie？
+- [ ] **有没有哪个「直接放行」的分支跳过了某项检查，而网关自己会补上攻击者缺的那部分？**（阶段 2 真实缺陷：回环豁免跳过 Origin 围栏，而网关恰好注入内层凭证并剥离 Origin）
+- [ ] 代理自己合成的头（`x-forwarded-*` 等）是不是「先丢再写」，而不是「有就保留」？
+- [ ] 每个可能挂住的 `await` / `fetch` / 上游等待都有 deadline 吗？合并 in-flight 的那一处失败会不会放大成全站？
+- [ ] `pipe()` 的源与目标是否都监听了 `error`，并且**等待阶段**是否也绑定了 `close`（断开不一定走 `error`）？
+- [ ] `set-cookie` 是不是优先用 `getSetCookie()`？（`get()` 返回的是逗号拼接串）
 - [ ] 内层 Cookie 是否只存在于网关→上游这一跳？有没有可能出现在响应头或日志里？
 - [ ] 每个 `register*` / `listen` / `setInterval` 都有对应 disposer？
 - [ ] 新增的 `catch` 是否吞掉了不该吞的错误？

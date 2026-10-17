@@ -35,6 +35,20 @@
 > - **端口覆盖**：`apply(ctx, config)` 支持 `config.port` / `config.host` 覆盖存储里的端口，测试用 `port: 0` 绑定 OS 分配端口，绝不占真实端口。
 > - 测试 82 → 232。
 
+> **阶段 2 复核（trellis-check）发现并修复 7 处，测试 232 → 249**：
+>
+> 1. **回环豁免绕过 Origin 围栏（安全，最严重）**：`authorize` 的回环分支直接 `return ALLOW`，围栏根本没跑。因为网关正是那条「注入 `dsh-auth-*` + 剥离 `Origin`/`Sec-Fetch-*`」的跳，于是任意网页向 `http://127.0.0.1:<网关端口>/api/…` 发一个**免预检**的 `POST`（`text/plain` 或 `enctype=text/plain` 表单，浏览器 `Host` 由 URL 决定、就是回环），实测返回 **200 且已对 DSH 执行**，上游收到的是带内层凭证、无 `Origin` 的已认证写。`SameSite=Lax` 无效——豁免本就不要求 Cookie。修法：回环分支仍然免**凭证**（`prd.md` R3 不变），但必须过围栏；本地读、本地同源写（`Sec-Fetch-Site: same-origin` 或 Origin 匹配）照常放行，只有「本机且未声明来源的写」被拒。
+> 2. **`X-Forwarded-For` 可伪造**：`peerAddress` 在 socket 无 `remoteAddress` 时返回 `undefined`，而 `forwardingHeaders` 只在 peer 是字符串时才写该头，于是客户端自带的 `x-forwarded-for` 原样透传——实测可任选「上游与审计以为你来自哪个 IP」。修法：把所有 `x-forwarded-*` / `x-real-ip` / `forwarded` 等一律丢弃后由本跳重写。
+> 3. **内层凭证兑换无超时**：`fetch` 没有 signal，而并发调用被合并到同一个 in-flight promise，所以上游「接了连接但不回」会让**每一个**远程请求永久挂起——实测 3 个并发请求全部悬挂。`upstreamTimeoutMs` 覆盖不到这一跳。修法：加 `AbortSignal.timeout`（`INNER_AUTH_EXCHANGE_TIMEOUT_MS`，5s）。
+> 4. **客户端在响应头之前断开 → 上游 socket 被扣住**：实测 GET 客户端中断只触发 `req`/`res` 的 `end`/`close`，**不触发 `error`**，故原有的 `req.on('error')` 钩子不生效，上游 `ClientRequest` 一直连到它的 head 超时（默认 120s）。局域网客户端可以「开一个丢一个」把上游 socket 一个个扣两分钟。修法：等待阶段额外绑到 `res` 的 `close`。
+> 5. **`extractInnerCookie` 解析不了逗号拼接的 `set-cookie`**：`headers.get('set-cookie')` 在 undici 上返回的是 `", "` 拼接串而非数组（实测），凭证不在第一位时永远找不到 → 表现为永久静默 401。修法：优先 `getSetCookie()`，回退时按逗号逐段扫描。
+> 6. **`activity.flush` 静默丢失最后一次写盘**：原先先 `delete` 再 `touch`，写盘抛错就把该设备从 pending 里丢掉——正好是「进程退出时保住最后 30 秒活动」这条要防的事。修法：成功后才 `delete`，失败留在 pending 等下次。
+> 7. **`pairing` 的源级失败表无界增长**：`pruneSource` 只清被查询的那一条，扫过即弃的源会永久占位。修法：记录失败时做一次全局过期清扫（只删已过窗口的条目，不可能放宽预算）。
+>
+> 另修：`isLoopbackHostname` 不认裸 `::1`（socket 侧就是这种拼写），IPv6 回环监听上的本机请求会被误要 Cookie。
+>
+> 测试能失败的抽查（各自单独破坏实现确认变红后还原）：回环围栏、转发头丢弃、兑换超时、`flush` 顺序、拼接 `set-cookie`、源级清扫——6 项全部变红。
+
 ## 阶段 3：网关 WebSocket 侧
 
 - [ ] `src/host/gateway/wsproxy.js`：升级鉴权 + 双向帧透传
