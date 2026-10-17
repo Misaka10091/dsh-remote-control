@@ -51,10 +51,43 @@
 
 ## 阶段 3：网关 WebSocket 侧
 
-- [ ] `src/host/gateway/wsproxy.js`：升级鉴权 + 双向帧透传
-- [ ] 处理 `/api/remote.mux` 多路复用连接（upgrade 同样需要 Host 改写 + 内层 Cookie，见 `design.md` §4.4）
-- [ ] ping/pong 控制帧透传
+- [x] `src/host/gateway/wsproxy.js`：升级鉴权 + 双向帧透传
+- [x] 处理 `/api/remote.mux` 多路复用连接（upgrade 同样需要 Host 改写 + 内层 Cookie，见 `design.md` §4.4）
+- [x] ping/pong 控制帧透传
 - **验收**：远程浏览器能收到流式输出；断线后重连可用
+
+> **实施记录（阶段 3 完成）**：
+> - **不引入 `ws`**：`http.Server` 的 `'upgrade'` 事件 → `net.connect` 上游 → 手写请求行与头 → 收到 `101` 后双向 `pipe` 原始字节。网关不解析帧，因此控制帧（ping/pong/close）天然透传。零运行时依赖保持。
+> - **升级 Origin 校验是独立且更严的入口**：`origin.js` 新增 `checkUpgradeOrigin()`，`checkOrigin()` 一行未改。差别只有一条，但它是关键的一条——**只要带了 `Origin` 就必须与 `Host` 同源**，不像读请求那样可以忽略。原因见下方 CSWSH 小节。`auth.js` 的 `authorize()` 新增 `upgrade` 参数，通过内部的 `fenceFor()` 选择围栏，**判定点仍然只有 `authorize()` 一处**。
+> - **A/B/C 三件事复用 `proxy.js` 的 `upstreamHeaders()`**，不另写一份头构造器，避免两条路径的围栏要求漂移。升级路径额外补回本跳自己的 `connection: Upgrade` / `upgrade: websocket`，并删掉 `content-length` / `content-type`（握手没有 body）。
+> - **吊销即时生效**：`createSocketRegistry()` 按 `deviceId` 记录活动 socket，**在第一个 `await` 之前**注册（否则凭证兑换窗口内吊销不生效）。`server.js` 暴露 `gateway.revokeDevice(id)`，一次调用完成「写存储 + 关活动 socket」，供阶段 4 面板调用。`close()` 也会 `closeAll()`——`server.closeAllConnections()` 明确不覆盖已升级的 socket。
+> - 测试 249 → 282。
+
+> **阶段 3 实测：WebSocket 特有的 CSWSH 漏洞（已修）**
+>
+> 升级请求就是一个 `GET`，而 `checkOrigin()` 对读请求是宽松的：只在 `Sec-Fetch-Site: cross-site` 时拒，**带了 Origin 但不带 Sec-Fetch-Site 时放行**。实测这三种组合：
+>
+> ```
+> GET + Origin=http://evil.com (无 Sec-Fetch-Site)  -> {"ok":true}   ← 放行
+> GET + Origin=evil + cross-site                    -> {"ok":false}
+> GET + Origin 同源                                  -> {"ok":true}
+> ```
+>
+> 对普通 HTTP GET 这只是读；但 WebSocket 有三点不同：**没有 CORS 预检**（浏览器直接连）、**一定带 Origin 但不保证带 Sec-Fetch-Site**、**连接是双向持久的**（可读走全部流式输出、可代表受害者发指令）。实测在 `'upgrade'` 事件里 `req.headers` 完整保留客户端头，且 `Sec-Fetch-Site` **确实缺失**：
+>
+> ```
+> url=/api/remote.mux  host="127.0.0.1:65485"  origin="http://evil.com"  sfs=undefined
+> ```
+>
+> 若升级路径复用读请求那套规则，任意网页可连上 `ws://127.0.0.1:<网关端口>/api/remote.mux`。修法：独立入口 `checkUpgradeOrigin()`，规则见上。表内每一行都有测试，其中「有 Origin、不同源、无 Sec-Fetch-Site」单独一条。
+
+> **阶段 3 实测：升级 socket 的断开只发 `end`（规范 11 的加强版）**
+>
+> 规范 11 记的是「TCP 断开不一定走 `error`，要绑 `close`」。在升级路径上还多一层：等待 `101` 期间客户端 socket 处于 **paused**（还没人读它），此时客户端 `destroy()` 在服务端**只触发 `end`**——不触发 `close`，也不触发 `error`。只绑 `close`（HTTP 路径的修法）仍然会漏，表现是一个被丢弃的握手各扣住一条上游 socket 直到 head 超时。现在 `error` / `close` / `end` 三个都绑，`teardown` 幂等所以重叠无害。
+>
+> 另测出两个影响**测试写法**的事实（不是产品缺陷，但写错会得到假绿/假红）：
+> 1. 对端 socket 若没人读（paused），**永远观察不到 FIN**。真实 `ws` 服务端挂上 `data` 监听所以是 flowing，桩必须 `resume()`，否则测的是桩而不是代理。
+> 2. 交给 `'upgrade'` 监听器的 socket 是 **`allowHalfOpen: true`**（普通 `net` 服务端是 `false`），所以对端只发 FIN 时本地只有 `end`、没有 `close`。`ws` 在 `end` 时主动关，桩也照做。
 
 ## 阶段 2 补充：配对码防爆破（阶段 1 复盘遗留）
 
