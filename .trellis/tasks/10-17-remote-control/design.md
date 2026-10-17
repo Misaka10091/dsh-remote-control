@@ -89,7 +89,8 @@ WebSocket 升级无法携带自定义头，且浏览器会自动带上 Cookie，
 
 - 升级请求同样走 3.2 的判定（Cookie + Origin）。
 - 校验失败直接 `socket.destroy()`，不做 401 响应体。
-- 代理侧使用 `ws` 的 `WebSocketServer({ noServer: true })` + `handleUpgrade` 与官方端口建立上游连接，双向转发帧。
+- 代理侧**不使用 `ws` 库**：网关只做字节透传、不解析帧，用裸 `node:net` 连上游、手写升级请求行、拿到 `101` 后双向 pipe 即可（已实测，见 `research/official-connection-fence.md` §6.1）。这样保持零运行时依赖。
+- 上游升级请求同样要带 Host 改写与内层 Cookie（§4.4）。
 
 ## 4. 反向代理细节
 
