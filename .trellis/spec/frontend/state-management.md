@@ -1,51 +1,45 @@
 # State Management
 
-> How state is managed in this project.
+> How state is managed in the browser half.
 
 ---
 
 ## Overview
 
-<!--
-Document your project's state management conventions here.
+没有状态库。客户端半边是一个**插件注入的座位**，不是独立应用：它不拥有会话数据，也不缓存业务状态。
 
-Questions to answer:
-- What state management solution do you use?
-- How is local vs global state decided?
-- How do you handle server state?
-- What are the patterns for derived state?
--->
-
-(To be filled by the team)
+原则：**组件内有状态，模块间无共享状态**。
 
 ---
 
 ## State Categories
 
-<!-- Local state, global state, server state, URL state -->
-
-(To be filled by the team)
-
----
+| 类别 | 存放位置 | 例子 |
+|---|---|---|
+| 面板可见性 | 组件 `useState` | 设备面板开/关 |
+| 面板数据 | 组件 `useState` + 拉取 | 设备列表、开关状态、端口 |
+| 配对流程的临时态 | 组件 `useState` | 当前配对码、倒计时剩余秒数、是否已复制 |
+| 流式连接 | 组件 `useRef` + effect cleanup | 状态订阅的 EventSource |
+| 跨挂载存活 | **不允许** | —— |
 
 ## When to Use Global State
 
-<!-- Criteria for promoting state to global -->
+不提升。理由：
 
-(To be filled by the team)
-
----
+- 这个插件只有一个座位（侧边栏底部入口），没有第二个 UI 需要读同一份数据。
+- 提升到模块级变量会在热加载/禁用插件后残留，与"必须可清理"的约束冲突。
+- 设备数据是**服务端状态**，每次开面板重新拉一次比维护缓存更简单，也不会出现本地陈旧状态误导用户（比如设备已被别处吊销但面板还显示在线）。
 
 ## Server State
 
-<!-- How server data is cached and synchronized -->
-
-(To be filled by the team)
-
----
+- 拉取时机：面板打开时拉一次；面板保持打开时用 SSE/轮询刷新（吊销后列表必须即时更新，见 PRD R4）。
+- 不做乐观更新。吊销是个危险动作，必须等服务端确认再改列表。
+- 错误态要显式渲染（网络失败、403 loopback 限制、409 未监听），不要静默停在旧数据上。
+- 所有请求用挂载相对路径，支持子路径部署。
 
 ## Common Mistakes
 
-<!-- State management mistakes your team has made -->
-
-(To be filled by the team)
+- **把 EventSource 放模块作用域。** 面板关掉后连接不断，服务端持续推送，且重复打开会叠加多个连接。
+- **用模块级变量当缓存。** 热加载后取到上一次的陈旧值。
+- **乐观更新吊销列表。** 服务端若失败（例如设备已被别的路径移走），UI 会显示一个实际仍可用的设备被吊销了，属于安全误导。
+- **在 `setState` updater 里做副作用。** React 18 严格模式下 updater 可能执行两次；需要读最新值时用 `useRef` 镜像。
