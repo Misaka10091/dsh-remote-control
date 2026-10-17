@@ -68,6 +68,10 @@
 16. **版本一致。** `package.json` 与 `dsh.plugin.json` 的 `version` 必须相等，且 `files` 列出的每个产物必须真实存在。
     `engines.dsh` 必须与**实测**的宿主版本对齐（用 `dsh --version` 复验，不要从二手信息推断——阶段 1 复核曾误判一次）。
 
+17. **「对某种请求够用」的宽松规则，不能给语义不同的请求复用。** 阶段 3 前置发现的真实缺陷：`origin.js` 的读请求分支对 GET 只在 `Sec-Fetch-Site: cross-site` 时才拒，带了 Origin 但不带该头时**放行**（对只读请求勉强可接受）。而 **WebSocket 升级本身就是一个 GET**，且不受 CORS 预检约束、浏览器发 `ws://` 时一定带 `Origin` 却不保证带 `Sec-Fetch-Site` —— 于是这个宽松分支直接把跨站 WebSocket 劫持（CSWSH）放了进来。
+    **规矩**：给升级/长连接这类语义不同的请求，写**独立**的判定入口，不要去改已有入口来「顺便复用」。升级路径的 Origin 校验必须更严：只要有 `Origin` 就必须与 `Host` 同源，不能像读请求那样可以忽略。
+    已实测的正确分支见 `research/official-connection-fence.md` §9.2。
+
 ---
 
 ## Testing Requirements

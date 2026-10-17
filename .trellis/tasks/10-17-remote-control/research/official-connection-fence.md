@@ -300,3 +300,47 @@ cordis                 → 4.0.4
 `engines.dsh: ">=0.2.0-rc.2"` 与实际宿主**完全一致，不需要改**。
 
 > 教训：涉及版本号的结论必须用 `dsh --version` 或直接读 `package.json` 复验一次，不要从二手信息推断。
+## 9. 阶段 3 前置发现：WebSocket 升级的 Origin 校验不能复用读请求规则
+
+### 9.1 实测现象
+
+`origin.js` 对**读请求**是宽松的：GET 只在 `Sec-Fetch-Site: cross-site` 时才拒；带了 Origin 但不带 `Sec-Fetch-Site` 时放行。
+
+```
+GET + Origin=http://evil.com (无 Sec-Fetch-Site)  -> {"ok":true}   ← 放行
+GET + Origin=evil + cross-site                    -> {"ok":false}
+GET + Origin 同源                                  -> {"ok":true}
+```
+
+对普通 HTTP GET 这勉强可以接受（只读）。**但 WebSocket 升级本身就是一个 GET**，于是这个宽松规则会直接变成跨站 WebSocket 劫持（CSWSH）：
+
+1. WebSocket **完全不受 CORS 预检约束**——浏览器不发 OPTIONS，直接连；
+2. 浏览器发起 `ws://` 时**一定**带 `Origin`，但**不保证**带 `Sec-Fetch-Site`；
+3. 连接一旦建立就是双向持久信道——攻击者页面能读走全部流式输出，还能代表受害者发指令。
+
+即：任意网页都能连上 `ws://127.0.0.1:<网关端口>/api/remote.mux`。
+
+### 9.2 修复要求（阶段 3 实施）
+
+升级路径必须用**独立的、更严格**的 Origin 校验，不能复用读请求分支：
+
+| 升级请求情形 | 结果 |
+|---|---|
+| 有 `Origin` 且与 `Host` 同源 | 放行 |
+| 有 `Origin` 但不同源（无论有无 `Sec-Fetch-Site`） | **拒绝，destroy socket** |
+| `Sec-Fetch-Site: cross-site` | **拒绝** |
+| 无 `Origin` 且无 `Sec-Fetch-Site` | 放行（CLI／测试等非浏览器客户端） |
+| 无 `Origin` + `Sec-Fetch-Site` 为 `same-origin`/`same-site` | 放行 |
+
+关键差别是第 2 行：**只要有 Origin 就必须匹配**。
+
+实现上新增独立入口（如 `checkUpgradeOrigin(req)`），**不要修改 `checkOrigin`**——HTTP 路径的行为已通过阶段 2 复核，改动它有回归风险。
+
+### 9.3 与阶段 2 漏洞的关系
+
+这两个是同一类错误的两个面：
+
+- 阶段 2：回环豁免**跳过**了围栏 → 免预检表单被洗成认证写。
+- 阶段 3：读请求的**宽松分支**被升级请求继承 → 跨站 WS 连接被放行。
+
+共同教训：**「对某种请求够用」的宽松规则，不能想当然地给另一种语义完全不同的请求复用。** 已写入 `spec/backend/quality-guidelines.md`。
