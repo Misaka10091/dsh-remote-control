@@ -45,6 +45,17 @@
  * it carries no cookie effect and is answered for browsers by the proxy, so
  * treating it as a read is both correct and the only way a cross-origin preflight
  * can be handled without a special case elsewhere.
+ *
+ * ## Two entries, because a WebSocket upgrade is a GET with a worse failure mode
+ *
+ * {@link checkOrigin} is the HTTP fence and keeps the four arms above unchanged.
+ * {@link checkUpgradeOrigin} is a **separate, stricter** fence for upgrade
+ * requests: a browser opens a WebSocket with no CORS preflight at all and is not
+ * obliged to send `Sec-Fetch-Site`, so a live `Origin` with no `Sec-Fetch-Site` —
+ * measured on a real upgrade request — would sail through the read arms and hand a
+ * page on `evil.example` a persistent bidirectional channel to DSH. On the upgrade
+ * path an `Origin`, when present, must match `Host`; the HTTP path is deliberately
+ * not changed, because there a foreign `Origin` on a GET is what CORS is for.
  */
 
 /** Methods a request may use without proving its origin. */
@@ -153,4 +164,88 @@ export function checkOrigin(req) {
 
   /* Arm 4. No Origin, no (usable) Sec-Fetch-Site: nothing proves the origin. */
   return { ok: false, reason: 'no-origin', detail: 'write request carries neither Origin nor a same-site Sec-Fetch-Site' }
+}
+
+/**
+ * Decide whether a **WebSocket upgrade** passes the origin fence.
+ *
+ * ## Why this is a second entry and not an argument to `checkOrigin`
+ *
+ * A WebSocket upgrade is a `GET`, so the read arms above would hand it a decision
+ * built for a request whose worst outcome is reading a response. For a WS upgrade
+ * the worst outcome is a persistent bidirectional channel: the attacker page reads
+ * every streamed token AND issues instructions on the victim's behalf. That is
+ * CSWSH, and three properties of WebSocket turn the read arms into a hole:
+ *
+ *   1. **No CORS preflight exists.** A page opens `new WebSocket(url)` and the
+ *      browser sends the handshake directly; there is no `OPTIONS` phase to fail.
+ *   2. **The browser always sends `Origin`** (RFC 6455 §4.1) — but it is **not
+ *      obliged to send `Sec-Fetch-Site`**, and measured against this host that
+ *      header is simply absent on a real upgrade request. `checkOrigin`'s read path
+ *      only consults `Sec-Fetch-Site`, so a live `Origin: http://evil.com` with no
+ *      `Sec-Fetch-Site` came out `{ ok: true }` — measured.
+ *   3. **The channel is long-lived**, so one admitted handshake is unbounded
+ *      access, not one read.
+ *
+ * So the rule here is strictly stronger than the read arms: **if `Origin` is
+ * present, it must match the authority the request was addressed to** — no
+ * exception for "it is only a read". `checkOrigin` keeps its behaviour untouched,
+ * because the HTTP path has been reviewed against those four arms and a GET with a
+ * foreign `Origin` is legitimately served (CORS decides what the browser may read).
+ * Same fence, different consequence; two entries.
+ *
+ * ## The arms, and why a missing `Origin` is allowed
+ *
+ * | # | upgrade request | verdict |
+ * |---|---|---|
+ * | 1 | `Sec-Fetch-Site: cross-site` | reject — unforgeable, strongest signal |
+ * | 2 | `Origin` present and matching `Host` | allow |
+ * | 3 | `Origin` present and **not** matching `Host` | reject, **even with no `Sec-Fetch-Site`** |
+ * | 4 | `Origin` malformed (`null`), or `Host` unparsable | reject — cannot prove a match |
+ * | 5 | no `Origin` | allow — only a non-browser client omits it |
+ *
+ * Arm 5 rests on a specification guarantee, not on optimism: a browser's
+ * `WebSocket` constructor is required to send `Origin`, so a handshake without one
+ * cannot have come from a page. That is what keeps a CLI client, a script and this
+ * project's own tests working without inventing an `Origin` they do not have.
+ * `Sec-Fetch-Site` is therefore *not consulted* in the no-`Origin` case: it can
+ * only ever be absent or hostile there, and treating a hostile-but-irrelevant
+ * header as a reason to allow would be backwards.
+ *
+ * Pure: reads the request, returns a verdict, never writes and never throws.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {{ ok: true } | { ok: false, reason: string, detail: string }}
+ */
+export function checkUpgradeOrigin(req) {
+  const site = headerOf(req, 'sec-fetch-site')
+  const origin = headerOf(req, 'origin')
+  const host = headerOf(req, 'host')
+
+  /* Arm 1. Applies whether or not an Origin is present, and beats a matching
+     Origin: a page cannot forge this header, so it is believed over one it can. */
+  if (typeof site === 'string' && site.toLowerCase() === 'cross-site') {
+    return { ok: false, reason: 'cross-site', detail: 'the upgrade declares Sec-Fetch-Site: cross-site' }
+  }
+
+  /* Arms 2-4. THIS is the arm the read path does not have. */
+  if (origin !== undefined) {
+    const originAuthority = authorityOf(origin)
+    if (originAuthority === undefined) {
+      /* `null` is what a sandboxed iframe sends. Not an origin we can compare. */
+      return { ok: false, reason: 'bad-origin', detail: 'the upgrade Origin is not a parsable origin' }
+    }
+    const hostAuthority = authorityOf(`http://${host ?? ''}`)
+    if (hostAuthority === undefined) {
+      return { ok: false, reason: 'bad-host', detail: 'the upgrade Host is not a parsable authority' }
+    }
+    if (originAuthority !== hostAuthority) {
+      return { ok: false, reason: 'cross-origin', detail: 'the upgrade Origin does not match Host' }
+    }
+    return { ok: true }
+  }
+
+  /* Arm 5. No Origin: no browser can produce this handshake (RFC 6455 §4.1), so it
+     is a non-browser client, which holds no cookie of its own accord. */
+  return { ok: true }
 }

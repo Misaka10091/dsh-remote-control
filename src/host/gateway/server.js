@@ -33,8 +33,19 @@
  * both release the port. `closeAllConnections()` is called as well: `server.close()`
  * alone waits for keep-alive sockets to go idle, which can be minutes, and a
  * hot-reload would then fail to rebind (`EADDRINUSE`) while the old listener is
- * still draining. The activity tracker is flushed in the same disposer so the last
- * half-minute of "last seen" data is not lost.
+ * still draining. That call does NOT cover upgraded sockets, so
+ * `upgradeProxy.sockets.closeAll()` runs immediately before it. The activity
+ * tracker is flushed in the same disposer so the last half-minute of "last seen"
+ * data is not lost.
+ *
+ * ## Two transports, one decision
+ *
+ * HTTP requests go through `proxy.forward`. WebSocket handshakes go through
+ * `handleUpgrade` → `authorize({ upgrade: true })` → `upgradeProxy.handle`. Both
+ * call the SAME `authorize()`; the `upgrade` flag only swaps which origin fence
+ * runs (`checkUpgradeOrigin`, strictly; see `origin.js` for why an upgrade cannot
+ * use the read arms). No second decision path exists, which is the property
+ * `quality-guidelines.md` §8 demands.
  */
 import { createServer } from 'node:http'
 
@@ -52,6 +63,7 @@ import {
 import { createInnerAuth } from './inner-auth.js'
 import { createProxy } from './proxy.js'
 import { clearDeviceCookie, emit, sendError, sendHtml, wantsHtml } from './wire.js'
+import { createUpgradeProxy, refuseUpgrade } from './wsproxy.js'
 
 /**
  * Build the upstream coordinates for the official port.
@@ -83,6 +95,8 @@ export function upstreamFor(officialPort) {
  * @param {number} [options.activityIntervalMs] Persist throttle; injectable for tests.
  * @param {number} [options.upstreamTimeoutMs] Bound on the wait for an upstream response head.
  * @param {number} [options.innerAuthTimeoutMs] Bound on one inner-credential exchange.
+ * @param {number} [options.upgradeHeadTimeoutMs] Bound on the wait for an upstream `101`.
+ * @param {number} [options.upgradeLingerMs] Grace for a clean upstream WebSocket close.
  * @param {object} [options.logger]
  * @returns {Promise<{
  *   server: import('node:http').Server,
@@ -91,6 +105,8 @@ export function upstreamFor(officialPort) {
  *   upstream: { origin: string, host: string },
  *   innerAuth: ReturnType<typeof createInnerAuth>,
  *   activity: ReturnType<typeof createActivityTracker>,
+ *   upgradeProxy: ReturnType<typeof createUpgradeProxy>,
+ *   revokeDevice: (deviceId: string) => { device: object | null, closedSockets: number },
  *   close: () => Promise<void>,
  * }>}
  */
@@ -135,6 +151,72 @@ export async function startGateway(options) {
     logger,
     timeoutMs: options.upstreamTimeoutMs,
   })
+
+  /* Stage 3: the multiplexed WebSocket behind `/api/remote.mux` (`design.md` §4.2).
+     It shares ONE `innerAuth` with the HTTP hop on purpose — the credential is
+     bound to the upstream authority, so a single redemption covers both, and a
+     second cache would double the exchanges after a DSH restart. */
+  const upgradeProxy = createUpgradeProxy({
+    upstreamAuthority: upstream.host,
+    upstreamHost: '127.0.0.1',
+    upstreamPort: Number.isInteger(options.officialPort) ? options.officialPort : 0,
+    innerAuth,
+    emit,
+    logger,
+    headTimeoutMs: options.upgradeHeadTimeoutMs,
+    lingerMs: options.upgradeLingerMs,
+  })
+
+  /**
+   * Answer one WebSocket upgrade handshake.
+   *
+   * Runs `authorize` with `upgrade: true`, which routes the origin fence to the
+   * strict `checkUpgradeOrigin()` — an upgrade is a `GET`, and the read arms of
+   * `checkOrigin` would admit a live `Origin: http://evil.example` with no
+   * `Sec-Fetch-Site` (measured on a real handshake, and CSWSH if allowed). The
+   * decision still lives in `auth.js` and nowhere else.
+   *
+   * Every refusal ends in a destroyed socket, never in a forwarded request: a
+   * refusal that fell through to the proxy would be the one bug class this whole
+   * module exists to prevent.
+   *
+   * @param {import('node:http').IncomingMessage} req
+   * @param {import('node:net').Socket} socket
+   * @param {Buffer} head Bytes already read past the request head.
+   */
+  function handleUpgrade(req, socket, head) {
+    const peer = peerAddress(socket)
+    let verdict
+    try {
+      verdict = authorize({ req, store, cookieName, upgrade: true })
+    } catch (error) {
+      /* Store damage (`store/corrupt`) surfaces here, exactly as on the HTTP path.
+         An upgrade has no response body, so the socket is destroyed. */
+      emit(logger, 'error', `[remote-control] upgrade authorization failed: ${describeError(error)}`)
+      refuseUpgrade(socket, 500)
+      return
+    }
+
+    if (!isAllowed(verdict)) {
+      /* `design.md` §3.3: a refused handshake is not answered with a body. A status
+         line is still written because a browser console reporting the code is
+         diagnosable while a bare reset is not; no address, path or credential
+         appears in it. */
+      refuseUpgrade(socket, statusFor(verdict.decision))
+      emit(
+        logger,
+        'debug',
+        `[remote-control] upgrade refused (${codeFor(verdict.decision, verdict.reason)})`,
+      )
+      return
+    }
+
+    if (verdict.device !== null && verdict.device !== undefined) {
+      activity.record(verdict.device.id)
+    }
+
+    upgradeProxy.handle({ req, socket, head, verdict, peer })
+  }
 
   /**
    * Answer one request.
@@ -237,6 +319,26 @@ export async function startGateway(options) {
     }
   })
 
+  /* The upgrade listener is attached AFTER `createServer` because it closes over
+     the instance; registering it earlier would touch a `const` in its temporal dead
+     zone and fail the whole start. */
+  server.on('upgrade', (req, socket, head) => {
+    /* Same belt-and-braces rule as the request listener: an exception escaping a
+       socket event is an unhandled error, and one malformed handshake must not
+       take remote access down for everyone. Failing closed means destroying the
+       socket, never letting it through. */
+    try {
+      handleUpgrade(req, socket, head)
+    } catch (error) {
+      emit(logger, 'error', `[remote-control] unhandled upgrade failure: ${describeError(error)}`)
+      try {
+        socket?.destroy?.()
+      } catch {
+        /* already gone */
+      }
+    }
+  })
+
   /* A client that disconnects mid-request surfaces as a socket error. Without a
      listener Node treats it as unhandled and takes the process down, which would
      let one flaky phone kill remote access for everyone. */
@@ -275,6 +377,17 @@ export async function startGateway(options) {
   const boundPort = address !== null && typeof address === 'object' ? address.port : port
 
   const close = () => new Promise((resolve) => {
+    /* Upgraded sockets first: `server.closeAllConnections()` below deliberately
+       does NOT touch them (Node's docs are explicit — that is what
+       `closeAllConnections()` does not cover, and an upgraded socket is no longer
+       an HTTP connection as far as the server is concerned). Without this, a
+       hot-reload leaves the old listener's `/api/remote.mux` streams running
+       against a dead authorization decision. */
+    try {
+      upgradeProxy.sockets.closeAll()
+    } catch {
+      /* the registry must never make a close fail */
+    }
     if (server.listening === false) {
       resolve(undefined)
       return
@@ -284,6 +397,42 @@ export async function startGateway(options) {
        hot-reload cannot rebind a port the old listener still holds. */
     server.closeAllConnections()
   })
+
+  /**
+   * Revoke a device and close its live connections.
+   *
+   * This is the "即时生效" requirement of `prd.md` constraint 5, and it has two
+   * halves that cannot be separated: the store marks the device so the NEXT
+   * request is refused, and every upgraded socket it currently holds is destroyed
+   * so the CURRENT session stops streaming. Doing only the first leaves a revoked
+   * phone watching the session and able to send, indefinitely.
+   *
+   * `store.revokeDevice` is idempotent, so closing sockets on an already-revoked
+   * device is harmless and is still done: a socket could in principle have been
+   * admitted between the two calls.
+   *
+   * @param {string} deviceId
+   * @returns {{ device: object | null, closedSockets: number }}
+   */
+  function revokeDevice(deviceId) {
+    /* Activity is flushed FIRST: after this call there will be no further request
+       from the device to eventually write its final `lastSeenAt` (`activity.js`). */
+    try {
+      activity.flush(deviceId)
+    } catch {
+      /* a failed flush must not abort a revocation */
+    }
+    const device = store.revokeDevice(deviceId)
+    const closedSockets = upgradeProxy.sockets.closeDevice(deviceId)
+    if (closedSockets > 0) {
+      emit(
+        logger,
+        'info',
+        `[remote-control] device ${deviceId} revoked; closed ${String(closedSockets)} live connection(s)`,
+      )
+    }
+    return { device, closedSockets }
+  }
 
   /* The disposer. Registered AFTER the listen succeeds, so a failed start leaves
      nothing to clean up. Everything this module acquired is released here. */
@@ -308,6 +457,8 @@ export async function startGateway(options) {
     upstream,
     innerAuth,
     activity,
+    upgradeProxy,
+    revokeDevice,
     close,
   }
 }

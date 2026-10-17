@@ -71,7 +71,7 @@
  * this function pure enough to reason about in isolation.
  */
 import { hashToken, sameTokenHash } from '../tokens.js'
-import { checkOrigin, isWriteMethod } from './origin.js'
+import { checkOrigin, checkUpgradeOrigin, isWriteMethod } from './origin.js'
 
 /**
  * Whether a hostname names loopback.
@@ -209,6 +209,23 @@ export const DECISION = {
 }
 
 /**
+ * Run the fence that matches the transport.
+ *
+ * One line, and it is the reason the two fences cannot drift apart at the call
+ * sites: an upgrade request never reaches `checkOrigin`'s read arms, and an HTTP
+ * request never reaches the upgrade fence. Which fence applies is decided HERE and
+ * nowhere else, so `authorize` keeps its "one decision point" property
+ * (`quality-guidelines.md` §8) even though there are now two fences.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {boolean} upgrade
+ * @returns {{ ok: true } | { ok: false, reason: string, detail: string }}
+ */
+function fenceFor(req, upgrade) {
+  return upgrade === true ? checkUpgradeOrigin(req) : checkOrigin(req)
+}
+
+/**
  * Decide one request.
  *
  * Returns a verdict; it never writes a response and never throws. The caller
@@ -220,6 +237,7 @@ export const DECISION = {
  * @param {import('node:http').IncomingMessage} input.req
  * @param {ReturnType<typeof import('../store.js').createStore>} input.store Device table.
  * @param {string} input.cookieName Name of the device cookie.
+ * @param {boolean} [input.upgrade] Whether this is a WebSocket upgrade handshake.
  * @returns {{
  *   decision: string,
  *   device: { id: string, name: string, revokedAt: string | null } | null,
@@ -227,7 +245,7 @@ export const DECISION = {
  *   reason: string | null,
  * }}
  */
-export function authorize({ req, store, cookieName }) {
+export function authorize({ req, store, cookieName, upgrade = false }) {
   const loopback = isLoopback(req)
 
   /* 1. Local access needs no credential (`prd.md` R3, acceptance "本机回环访问全程
@@ -235,9 +253,16 @@ export function authorize({ req, store, cookieName }) {
         the hop that injects the instance-wide inner credential and removes
         `Origin`/`Sec-Fetch-*`, so letting a cross-site write through here would
         hand DSH an authenticated request the official fence would have refused.
-        See "Why loopback is not exempt from the origin fence" above. */
+        See "Why loopback is not exempt from the origin fence" above.
+
+        On the upgrade path the fence is the STRICTER one (`origin.js`
+        {@link checkUpgradeOrigin}): a WebSocket handshake is a GET, so the read
+        arms would wave through a live `Origin: http://evil.example` with no
+        `Sec-Fetch-Site`, which is exactly what a page opening a socket looks
+        like — measured. Same order, same exemption for the CREDENTIAL, harder
+        fence for the origin proof. */
   if (loopback) {
-    const origin = checkOrigin(req)
+    const origin = fenceFor(req, upgrade)
     if (!origin.ok) {
       return { decision: DECISION.FORBIDDEN, device: null, loopback: true, reason: origin.reason }
     }
@@ -262,7 +287,7 @@ export function authorize({ req, store, cookieName }) {
         Runs before revocation is reported: a forged cross-site write is refused
         as a forgery, not as an authentication failure, because the two lead an
         operator to completely different conclusions. */
-  const origin = checkOrigin(req)
+  const origin = fenceFor(req, upgrade)
   if (!origin.ok) {
     return { decision: DECISION.FORBIDDEN, device: null, loopback: false, reason: origin.reason }
   }

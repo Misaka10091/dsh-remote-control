@@ -7,7 +7,7 @@
  * The official port stays on `127.0.0.1`, so an unpaired request is stopped
  * before it can reach DSH at all.
  *
- * Stage 2 scope — what exists here today:
+ * Stage 3 scope — what exists here today:
  *
  *   - the package/manifest skeleton, so the bundle patch installs and the row
  *     loads (this file is the only thing the Node half needs at load time);
@@ -15,13 +15,14 @@
  *     tokens — each pure and independently testable;
  *   - the HTTP gateway under `src/host/gateway/`: the listener, the single
  *     authorization decision, the origin fence, the inner-credential provider and
- *     the reverse proxy.
+ *     the reverse proxy;
+ *   - the WebSocket upgrade passthrough (`gateway/wsproxy.js`), so the official
+ *     `/api/remote.mux` stream reaches a paired device's browser.
  *
- * The WebSocket upgrade proxy (stage 3), the loopback-only admin API and audit
- * writer (stage 4) and the client UI (stage 5) land later. Until then a started
- * gateway forwards HTTP only; `design.md` §4.2's `/api/remote.mux` upgrade is not
- * yet handled, so a browser that connects can load and read but its live stream
- * will not establish.
+ * The loopback-only admin API and audit writer (stage 4) and the client UI (stage
+ * 5) land later. Until then the gateway can be driven programmatically —
+ * `gateway.revokeDevice(id)` is the entry point the panel will call, and it
+ * already closes the revoked device's live sockets (`prd.md` constraint 5).
  *
  * ## Default off (`prd.md` D1, acceptance 1)
  *

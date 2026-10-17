@@ -135,3 +135,25 @@ export const INNER_AUTH_RETRY_INTERVAL_MS = 1_000
  * Five seconds is far above a healthy exchange and far below a user's patience.
  */
 export const INNER_AUTH_EXCHANGE_TIMEOUT_MS = 5_000
+
+/**
+ * Deadline for the upstream to answer a WebSocket upgrade with a response head.
+ *
+ * Same rule as the HTTP head timeout, and the same reason: an upstream that
+ * accepts the TCP connection and then says nothing must not hold a gateway socket
+ * open forever (`quality-guidelines.md` §10). Shorter than the HTTP one because a
+ * healthy loopback handshake is a single round trip; a minute of silence is a
+ * fault, not a slow stream. It bounds ONLY the wait for the head — once `101`
+ * arrives the connection is long-lived by design and must not be timed out.
+ */
+export const UPGRADE_HEAD_TIMEOUT_MS = 10_000
+
+/**
+ * Longest `Sec-WebSocket-Protocol` list the gateway forwards.
+ *
+ * The value is attacker-reachable and is copied into a header this hop
+ * synthesizes, so it is bounded rather than trusted: a subprotocol list longer
+ * than this is dropped (the client gets no protocol, never a corrupted handshake).
+ * Real clients send at most one or two short tokens.
+ */
+export const UPGRADE_MAX_SUBPROTOCOL_LENGTH = 512

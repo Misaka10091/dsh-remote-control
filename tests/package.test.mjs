@@ -165,16 +165,23 @@ test('the host half imports only node: built-ins and its own modules', () => {
   }
 })
 
-test('the WebSocket proxy does not exist yet and nothing imports ws', () => {
-  /* Stage 3 owns the upgrade passthrough. Measured ground truth
-     (`research/official-connection-fence.md` §6.1) is that it needs no `ws` — bare
-     `node:net` byte passthrough — so the zero-dependency claim survives it. This
-     assertion guards the claim from being quietly abandoned in stage 3. */
+test('the WebSocket proxy imports no frame library, so zero dependencies holds', () => {
+  /* `research/official-connection-fence.md` §6.1: the measured ground truth is
+     that a byte-forwarding upgrade needs no `ws` — bare `node:net`, a hand-written
+     request line and a bidirectional pipe. The zero-dependency claim survives
+     stage 3 because of it, so this guards the claim from being quietly abandoned
+     for a library that would only parse frames nobody reads. */
   for (const relative of hostSources()) {
     const source = readFileSync(path.join(repoRoot, relative), 'utf8')
     assert.ok(!/from\s+['"]ws['"]/.test(source), `${relative} must not import ws`)
     assert.ok(!/require\(\s*['"]ws['"]\s*\)/.test(source), `${relative} must not require ws`)
+    assert.ok(!/node:http2/.test(source), `${relative} must not pull in the http2 stack`)
   }
+
+  /* And the passthrough really is built on raw sockets. */
+  const wsproxy = readFileSync(path.join(repoRoot, 'src/host/gateway/wsproxy.js'), 'utf8')
+  assert.match(wsproxy, /from 'node:net'/, 'the upgrade hop speaks the handshake over node:net')
+  assert.match(wsproxy, /connection = 'Upgrade'/, 'this hop writes its own upgrade handshake')
 })
 
 test('the gateway modules exist and are all packaged', () => {
@@ -186,7 +193,9 @@ test('the gateway modules exist and are all packaged', () => {
     'src/host/gateway/origin.js',
     'src/host/gateway/inner-auth.js',
     'src/host/gateway/proxy.js',
+    'src/host/gateway/wsproxy.js',
     'src/host/gateway/activity.js',
+    'src/host/gateway/wire.js',
   ]
   for (const relative of gatewayModules) {
     assert.ok(existsSync(path.join(repoRoot, relative)), `missing gateway module: ${relative}`)
