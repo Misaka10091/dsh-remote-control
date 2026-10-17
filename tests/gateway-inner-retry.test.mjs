@@ -17,9 +17,8 @@ import { test } from 'node:test'
 import { createServer, request as httpRequest } from 'node:http'
 
 import { DEVICE_COOKIE_NAME } from '../src/host/constants.js'
-import { createDeviceToken } from '../src/host/tokens.js'
 import { startGateway } from '../src/host/gateway/server.js'
-import { cleanupDir, makeStore, makeTempDir } from './helpers.mjs'
+import { TEST_JWT_KEY, cleanupDir, makeStore, makeTempDir, pairDevice } from './helpers.mjs'
 
 /** Issue one request against a gateway. */
 function send(port, headers) {
@@ -72,8 +71,7 @@ test('an upstream 401 re-mints the inner credential once and the retry succeeds'
   const dir = makeTempDir()
   const { store } = makeStore(dir)
   /* The device whose token this test presents. */
-  const minted = createDeviceToken()
-  store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: minted.tokenHash })
+  const { token } = pairDevice(store, { id: 'dev_1', name: 'phone' })
 
   const gateway = await startGateway({
     ctx: {
@@ -85,11 +83,12 @@ test('an upstream 401 re-mints the inner credential once and the retry succeeds'
     port: 0,
     host: '127.0.0.1',
     cookieName: DEVICE_COOKIE_NAME,
+    jwtKey: TEST_JWT_KEY,
   })
 
   const headers = {
     host: `127.0.0.1:${String(gateway.port)}`,
-    cookie: `${DEVICE_COOKIE_NAME}=${minted.token}`,
+    cookie: `${DEVICE_COOKIE_NAME}=${token}`,
   }
 
   try {
@@ -142,8 +141,7 @@ test('a permanently failing credential does not loop: one retry, then the 401 is
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
   const dir = makeTempDir()
   const { store } = makeStore(dir)
-  const { token, tokenHash } = createDeviceToken()
-  store.addDevice({ id: 'dev_1', name: 'phone', tokenHash })
+  const { token } = pairDevice(store, { id: 'dev_1', name: 'phone' })
 
   const gateway = await startGateway({
     ctx: {
@@ -155,6 +153,7 @@ test('a permanently failing credential does not loop: one retry, then the 401 is
     port: 0,
     host: '127.0.0.1',
     cookieName: DEVICE_COOKIE_NAME,
+    jwtKey: TEST_JWT_KEY,
   })
 
   try {
@@ -194,8 +193,7 @@ test('the inner credential never appears in a relayed response', async () => {  
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
   const dir = makeTempDir()
   const { store } = makeStore(dir)
-  const { token, tokenHash } = createDeviceToken()
-  store.addDevice({ id: 'dev_1', name: 'phone', tokenHash })
+  const { token } = pairDevice(store, { id: 'dev_1', name: 'phone' })
 
   const gateway = await startGateway({
     ctx: {
@@ -207,6 +205,7 @@ test('the inner credential never appears in a relayed response', async () => {  
     port: 0,
     host: '127.0.0.1',
     cookieName: DEVICE_COOKIE_NAME,
+    jwtKey: TEST_JWT_KEY,
   })
 
   try {
@@ -269,8 +268,7 @@ test('a request with a body is not replayed after a re-mint, so no truncated upl
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
   const dir = makeTempDir()
   const { store } = makeStore(dir)
-  const { token, tokenHash } = createDeviceToken()
-  store.addDevice({ id: 'dev_1', name: 'phone', tokenHash })
+  const { token } = pairDevice(store, { id: 'dev_1', name: 'phone' })
 
   const gateway = await startGateway({
     ctx: {
@@ -282,6 +280,7 @@ test('a request with a body is not replayed after a re-mint, so no truncated upl
     port: 0,
     host: '127.0.0.1',
     cookieName: DEVICE_COOKIE_NAME,
+    jwtKey: TEST_JWT_KEY,
   })
 
   const payload = '{"message":"a body that must arrive exactly once"}'
@@ -346,8 +345,7 @@ test('the head timeout does not sever a stream that then goes quiet', async () =
   await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve))
   const dir = makeTempDir()
   const { store } = makeStore(dir)
-  const { token, tokenHash } = createDeviceToken()
-  store.addDevice({ id: 'dev_1', name: 'phone', tokenHash })
+  const { token } = pairDevice(store, { id: 'dev_1', name: 'phone' })
 
   const gateway = await startGateway({
     ctx: {
@@ -359,6 +357,7 @@ test('the head timeout does not sever a stream that then goes quiet', async () =
     port: 0,
     host: '127.0.0.1',
     cookieName: DEVICE_COOKIE_NAME,
+    jwtKey: TEST_JWT_KEY,
     upstreamTimeoutMs: 50,
   })
 

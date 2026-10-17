@@ -32,17 +32,16 @@ export const PAIRING_CODE_LENGTH = 8
 /** RFC 4648 base32 alphabet, upper-case, no padding. Codes are read out loud and typed by hand. */
 export const PAIRING_CODE_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567'
 
-/** Bytes of entropy behind a device token. 32 bytes = 256 bits. */
-export const DEVICE_TOKEN_BYTES = 32
-
 /**
  * The only accepted shape of a persisted `tokenHash`: lower-case hex sha256,
  * exactly 64 characters (`design.md` §5 — "不存明文令牌").
  *
- * Shared by `tokens.js` (will it authenticate?) and `store.js` (may it be
- * persisted/loaded at all?). One definition, because two regexes drifting apart
- * is how a store starts accepting a credential-shaped value the verifier would
- * treat as a token.
+ * LEGACY FIELD. The device credential is a signed JWT now
+ * (`research/jwt-device-credential.md`), so no new row carries a `tokenHash` and
+ * nothing authenticates against one. `store.js` still validates the field when an
+ * OLD `devices.json` has one, so the load path cannot quietly admit a value that
+ * is not a digest — `version: 1` keeps parsing byte-for-byte as before, and a
+ * hand-edited file is still refused rather than half-understood.
  *
  * Deliberately flag-free: `/g` would carry `lastIndex` across `.test()` calls
  * and make consecutive checks alternate for no reason.
@@ -63,8 +62,25 @@ export const DEVICE_ID_PREFIX = 'dev_'
  * (`research/official-connection-fence.md` §2.2). A device cookie sharing that
  * prefix would be indistinguishable from inner credential material at exactly
  * the hop where the two must never be confused.
+ *
+ * The value is a signed JWT (`research/jwt-device-credential.md` §3.2), so the
+ * name says so. The old `dsh-rc-device` name is NOT accepted any more: a second
+ * accepted cookie name would be a second code path through the one authorization
+ * decision, and the whole point of `gateway/auth.js` is that there is exactly one.
+ * Existing paired devices must re-pair — documented in the README.
  */
-export const DEVICE_COOKIE_NAME = 'dsh-rc-device'
+export const DEVICE_COOKIE_NAME = 'dsh-rc-jwt'
+
+/**
+ * The cookie name used before the JWT switch, exported for exactly one purpose:
+ * the README and the tests need to name what is no longer accepted, and a bare
+ * string literal at those call sites is how two spellings start to drift.
+ *
+ * The gateway does NOT read it. An old device presenting one is simply
+ * unauthenticated, which is the honest answer — the credential it holds cannot be
+ * verified and must not be silently translated into a new one.
+ */
+export const LEGACY_DEVICE_COOKIE_NAME = 'dsh-rc-device'
 
 /** Lifetime of the device cookie: 30 days, matching the official browser session. */
 export const DEVICE_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
@@ -200,4 +216,75 @@ export const AUDIT_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000
  * `webserver.register({ kind: 'prefix', … })` before any fallback.
  */
 export const ADMIN_API_PREFIX = '/remote-control/api'
+
+/**
+ * The pairing bootstrap path, served on the GATEWAY port (`gateway/pairing-route.js`).
+ *
+ * Shared with `api.js` — which puts it in the QR payload's `pairPath` — because the
+ * link the panel builds and the route that serves it must be the same string. A
+ * duplicated literal is how a QR code ends up pointing at a 404, which is exactly
+ * the defect this constant closes: `api.js` advertised `/remote-control/pair` for
+ * two stages while nothing served it.
+ *
+ * On the gateway and NOT under {@link ADMIN_API_PREFIX}, because a device being
+ * paired has no credential yet: it cannot reach a loopback-only API, and the
+ * gateway is the only listener a phone can talk to.
+ */
+export const PAIRING_ROUTE_PATH = '/remote-control/pair'
+
+/* ------------------------------------------------------------------ *
+ * Device credential: a signed JWT (`research/jwt-device-credential.md`)
+ * ------------------------------------------------------------------ */
+
+/**
+ * `iss` claim. Fixed and checked on every verification: a JWT signed with this
+ * key but minted for another audience must not be accepted here.
+ */
+export const JWT_ISSUER = 'dsh-remote-control'
+
+/** `aud` claim. The one audience this credential is valid for. */
+export const JWT_AUDIENCE = 'dsh-gateway'
+
+/**
+ * The ONLY accepted `alg`. A verifier that reads the algorithm out of the token
+ * is the classic JWT algorithm-confusion hole — `alg: none` is the trivial case,
+ * and HS256-verified-with-an-RSA-public-key is the one that actually ships. The
+ * header's `alg` is compared against this constant and nothing else.
+ */
+export const JWT_ALGORITHM = 'HS256'
+
+/**
+ * Clock-skew allowance when comparing `exp` / `nbf`, in seconds.
+ *
+ * A phone whose clock is a minute fast would otherwise be refused a token it
+ * just received — and the symptom ("paired, then 401") points at the credential
+ * rather than at the clock. The allowance is one-sided in effect: it can only
+ * make a token live slightly longer than `exp` says, never let a long-expired
+ * one through, because 60 s is far below the 30-day lifetime.
+ */
+export const JWT_CLOCK_SKEW_SECONDS = 60
+
+/** Leaf name of the HS256 signing key inside the runtime directory. */
+export const JWT_KEY_FILE_NAME = 'jwt-key'
+
+/**
+ * Bytes of entropy behind the signing key. 32 bytes = 256 bits, which is exactly
+ * what HS256 needs: the HMAC block size is 64 bytes, so any key shorter than
+ * that is padded to it anyway, and a shorter secret would give less than the
+ * algorithm's full strength.
+ */
+export const JWT_KEY_BYTES = 32
+
+/** POSIX mode for the signing key file. A no-op on Windows, like `DEVICES_FILE_MODE`. */
+export const JWT_KEY_FILE_MODE = 0o600
+
+/**
+ * Longest JWT the verifier will look at.
+ *
+ * A device credential is under 400 bytes. The bound exists so a hostile cookie
+ * cannot make verification expensive: splitting a megabyte on `.` and hashing its
+ * segments is work an unauthenticated caller would otherwise choose for us. It is
+ * generous enough that adding a claim later cannot trip it by accident.
+ */
+export const JWT_MAX_LENGTH = 2_048
 

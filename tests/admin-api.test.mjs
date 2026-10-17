@@ -33,9 +33,8 @@ import { classify } from '../src/host/classify.js'
 import { ADMIN_API_PREFIX, DEVICE_COOKIE_NAME } from '../src/host/constants.js'
 import { createPairingStore } from '../src/host/pairing.js'
 import { createStore } from '../src/host/store.js'
-import { createDeviceToken } from '../src/host/tokens.js'
 import { startGateway } from '../src/host/gateway/server.js'
-import { cleanupDir, makeTempDir } from './helpers.mjs'
+import { TEST_JWT_KEY, cleanupDir, makeTempDir, pairDevice } from './helpers.mjs'
 
 /** Fixed clock: 2026-10-17T03:04:43.000Z. */
 const AT = Date.UTC(2026, 9, 17, 3, 4, 43)
@@ -85,9 +84,7 @@ function makeRuntime(spec = {}) {
 
   let token
   if (spec.withDevice !== false) {
-    const minted = createDeviceToken()
-    token = minted.token
-    store.addDevice({ id: 'dev_1', name: 'iPhone · Safari', tokenHash: minted.tokenHash })
+    token = pairDevice(store, { id: 'dev_1', name: 'iPhone · Safari' }).token
   }
 
   return { dir, clock, store, audit, pairing, token }
@@ -478,6 +475,7 @@ test('the gateway refuses the admin prefix outright, so a paired device cannot r
     port: 0,
     host: '127.0.0.1',
     cookieName: DEVICE_COOKIE_NAME,
+    jwtKey: TEST_JWT_KEY,
     audit: runtime.audit,
     now: () => runtime.clock.now,
   })
@@ -534,6 +532,7 @@ test('the gateway refuses the admin prefix before authorization, for the same an
     port: 0,
     host: '127.0.0.1',
     cookieName: DEVICE_COOKIE_NAME,
+    jwtKey: TEST_JWT_KEY,
   })
   started.push(async () => {
     await gateway.close()
@@ -693,9 +692,10 @@ test('a malformed device id is refused before it reaches the store', async () =>
  * The device list never leaks the verifier
  * ------------------------------------------------------------------ */
 
-test('the device list omits tokenHash and every other internal field', async () => {
-  /* `tokenHash` is not the token, but it IS what `verifyToken` compares, so a
-     page holding it can brute-force a candidate token offline. */
+test('the device list omits every credential field and every other internal one', async () => {
+  /* The panel gets the ROW. What it must never get is anything that could be used
+     as, or turned into, a credential: no JWT, no `tokenHash` verifier (a page
+     holding one can brute-force a candidate offline), and not the raw document. */
   const runtime = makeRuntime()
   const host = await startAdminHost({ runtime })
   try {
@@ -704,9 +704,10 @@ test('the device list omits tokenHash and every other internal field', async () 
       path: `${ADMIN_API_PREFIX}/devices`,
       headers: { host: loopbackHost(host.port) },
     })
-    const stored = runtime.store.listDevices()[0]
-    assert.ok(!res.body.includes(stored.tokenHash), 'the digest is not in the response')
+    assert.ok(!res.body.includes(runtime.token), 'the device JWT is not in the response')
+    assert.ok(!/eyJ[A-Za-z0-9_-]{6,}\./.test(res.body), 'and no JWT-shaped value of any kind')
     assert.ok(!res.body.includes('tokenHash'))
+    assert.ok(!res.body.includes('capabilities'), 'reserved internal fields stay internal')
     const device = JSON.parse(res.body).data.devices[0]
     assert.deepEqual(
       Object.keys(device).sort(),

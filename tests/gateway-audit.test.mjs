@@ -18,9 +18,8 @@ import { createAudit, dayKeyOf } from '../src/host/audit.js'
 import { DEVICE_COOKIE_NAME } from '../src/host/constants.js'
 import { createPairingStore } from '../src/host/pairing.js'
 import { createStore } from '../src/host/store.js'
-import { createDeviceToken } from '../src/host/tokens.js'
 import { startGateway } from '../src/host/gateway/server.js'
-import { cleanupDir, makeTempDir } from './helpers.mjs'
+import { TEST_JWT_KEY, cleanupDir, makeTempDir, pairDevice } from './helpers.mjs'
 
 /** Fixed clock: 2026-10-17T03:04:43.000Z. */
 const AT = Date.UTC(2026, 9, 17, 3, 4, 43)
@@ -48,8 +47,7 @@ async function makeGateway(spec = {}) {
   const clock = { now: AT }
   const store = createStore({ baseDir: dir, now: () => clock.now })
   const audit = createAudit({ baseDir: dir, now: () => clock.now })
-  const minted = createDeviceToken()
-  store.addDevice({ id: 'dev_1', name: 'iPhone · Safari', tokenHash: minted.tokenHash, ua: 'test' })
+  const { token } = pairDevice(store, { id: 'dev_1', name: 'iPhone · Safari', ua: 'test' })
 
   /** Every request the upstream saw: the audit must not change what is forwarded. */
   const upstreamSaw = []
@@ -71,6 +69,7 @@ async function makeGateway(spec = {}) {
     port: 0,
     host: '127.0.0.1',
     cookieName: DEVICE_COOKIE_NAME,
+    jwtKey: TEST_JWT_KEY,
     now: () => clock.now,
     audit: spec.withAudit === false ? undefined : audit,
   })
@@ -82,7 +81,7 @@ async function makeGateway(spec = {}) {
   }
   started.push(stop)
 
-  return { gateway, store, audit, clock, dir, token: minted.token, upstreamSaw, stop }
+  return { gateway, store, audit, clock, dir, token: token, upstreamSaw, stop }
 }
 
 /** Read the day's audit file as parsed lines. */
@@ -319,8 +318,7 @@ test('an audit writer that throws cannot break a request', async () => {
   const dir = makeTempDir()
   const clock = { now: AT }
   const store = createStore({ baseDir: dir, now: () => clock.now })
-  const minted = createDeviceToken()
-  store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: minted.tokenHash })
+  const { token } = pairDevice(store, { id: 'dev_1', name: 'phone' })
 
   const upstream = createServer((req, res) => {
     req.resume()
@@ -335,6 +333,7 @@ test('an audit writer that throws cannot break a request', async () => {
     port: 0,
     host: '127.0.0.1',
     cookieName: DEVICE_COOKIE_NAME,
+    jwtKey: TEST_JWT_KEY,
     audit: {
       record: () => { throw new Error('writer is broken') },
     },
@@ -351,7 +350,7 @@ test('an audit writer that throws cannot break a request', async () => {
     path: '/api/session/prompt',
     headers: {
       host: lanHost(gateway.port),
-      cookie: `${DEVICE_COOKIE_NAME}=${minted.token}`,
+      cookie: `${DEVICE_COOKIE_NAME}=${token}`,
       'sec-fetch-site': 'same-origin',
     },
     body: '{}',

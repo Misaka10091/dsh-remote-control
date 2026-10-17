@@ -136,9 +136,11 @@ function escapeHtml(value) {
  * self-contained: no assets, no external requests, nothing that could be
  * mistaken for the DSH UI.
  *
- * Stage 5 replaces this body with a redirect to the pairing page; until that
- * page exists, redirecting to it would hand the user a 404, so the 401 carries
- * the instruction inline instead.
+ * It deliberately does NOT redirect to the pairing page. A redirect would move an
+ * unauthenticated caller onto a route it has no business being pushed to — the
+ * pairing page is reached from the QR link's own fragment or not at all
+ * (`pairing-route.js`), and a 401 that silently becomes a pairing page reads as
+ * "something went wrong" instead of "this device is not paired".
  *
  * @param {import('node:http').ServerResponse} res
  * @param {number} status
@@ -172,6 +174,67 @@ export function sendHtml(res, status, code, message, extraHeaders = undefined) {
 }
 
 /**
+ * Send a complete HTML document, with per-caller headers.
+ *
+ * Unlike {@link sendHtml} this carries no error code and takes the caller's own
+ * headers, because the one caller is the pairing page (`pairing-route.js`), which
+ * ships a fixed document and needs `Content-Security-Policy` / `X-Frame-Options`
+ * that an error page does not. The shared rule is unchanged: the head goes through
+ * {@link begin}, so it can never be written twice.
+ *
+ * @param {import('node:http').ServerResponse} res
+ * @param {number} status
+ * @param {string} html The complete document.
+ * @param {Record<string, string>} [extraHeaders]
+ * @returns {boolean} whether anything was written.
+ */
+export function sendDocument(res, status, html, extraHeaders = undefined) {
+  const body = Buffer.from(typeof html === 'string' ? html : '', 'utf8')
+  const headers = {
+    'content-type': 'text/html; charset=utf-8',
+    'content-length': String(body.length),
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+  }
+  if (extraHeaders !== undefined) Object.assign(headers, extraHeaders)
+  const opened = begin(res, status, headers)
+  if (!opened) return false
+  res.end(body)
+  return true
+}
+
+/**
+ * Send a redirect.
+ *
+ * `303` is the one that means "your POST succeeded; GET this instead", which is
+ * exactly the pairing success transition: the browser must follow it as a GET, with
+ * the `Set-Cookie` from this response already stored, so the page it lands on is
+ * authenticated by the cookie this very response handed out.
+ *
+ * An empty body is deliberate: a `303` has nothing to say, and a body would be a
+ * second place for a message to leak from.
+ *
+ * @param {import('node:http').ServerResponse} res
+ * @param {number} status
+ * @param {string} location Same-origin path only; never an absolute URL.
+ * @param {Record<string, string>} [extraHeaders]
+ * @returns {boolean} whether anything was written.
+ */
+export function sendRedirect(res, status, location, extraHeaders = undefined) {
+  const headers = {
+    location,
+    'content-length': '0',
+    'cache-control': 'no-store',
+    'x-content-type-options': 'nosniff',
+  }
+  if (extraHeaders !== undefined) Object.assign(headers, extraHeaders)
+  const opened = begin(res, status, headers)
+  if (!opened) return false
+  res.end()
+  return true
+}
+
+/**
  * Whether a request is a browser navigation that should get HTML rather than JSON.
  *
  * Judged from `Accept` alone: a navigation asks for HTML, a `fetch()` asks for
@@ -188,7 +251,13 @@ export function wantsHtml(req) {
 }
 
 /**
- * `Set-Cookie` value for a device token.
+ * `Set-Cookie` value for a device credential.
+ *
+ * `value` is a signed JWT (`research/jwt-device-credential.md`). A JWS compact
+ * serialization is `header.payload.signature` in base64url — letters, digits, `-`,
+ * `_` and two `.` — so it is cookie-safe with no escaping. The value is NOT
+ * sanitized here: `tokens.js` is the only thing that produces one, and a sanitizer
+ * on this side would be a second place for the format to be defined.
  *
  * Attributes follow `design.md` §3.2: `HttpOnly; SameSite=Lax; Path=/`.
  * **No `Secure`** — the LAN transport is plain HTTP, and a `Secure` cookie is
@@ -197,7 +266,7 @@ export function wantsHtml(req) {
  * an oversight.
  *
  * @param {string} name
- * @param {string} value Clear device token.
+ * @param {string} value Signed device JWT.
  * @param {number} maxAgeSeconds
  * @returns {string}
  */

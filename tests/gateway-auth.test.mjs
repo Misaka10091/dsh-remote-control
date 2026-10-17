@@ -19,7 +19,6 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
 import { DEVICE_COOKIE_NAME } from '../src/host/constants.js'
-import { createDeviceToken } from '../src/host/tokens.js'
 import {
   DECISION,
   authorize,
@@ -31,7 +30,14 @@ import {
   readCookie,
   statusFor,
 } from '../src/host/gateway/auth.js'
-import { cleanupDir, makeStore, makeTempDir } from './helpers.mjs'
+import {
+  TEST_JWT_KEY,
+  cleanupDir,
+  deviceJwt,
+  makeStore,
+  makeTempDir,
+  pairDevice,
+} from './helpers.mjs'
 
 /**
  * Build a request stub.
@@ -45,12 +51,11 @@ function request({ method = 'GET', headers = {}, remoteAddress = '192.168.1.7' }
   return { method, headers, socket: { remoteAddress } }
 }
 
-/** A device table in a temp dir, with one paired device. Returns its clear token too. */
+/** A device table in a temp dir, with one paired device. Returns its JWT too. */
 function withDevice(fn) {
   const dir = makeTempDir()
   const { store, clock } = makeStore(dir)
-  const { token, tokenHash } = createDeviceToken()
-  store.addDevice({ id: 'dev_1', name: 'iPhone · Safari', tokenHash, ua: 'UA/1' })
+  const { token } = pairDevice(store, { id: 'dev_1', name: 'iPhone · Safari', ua: 'UA/1' })
   try {
     return fn({ store, clock, token, dir })
   } finally {
@@ -61,6 +66,29 @@ function withDevice(fn) {
 /** The `Cookie` header a paired device would send. */
 function deviceCookie(token) {
   return `${DEVICE_COOKIE_NAME}=${token}`
+}
+
+/**
+ * `authorize` with the shared test key and no revocations.
+ *
+ * Every call site in this suite goes through here rather than through the raw
+ * function, so a suite that forgot the key could not silently "pass" by having
+ * every token fail verification for the wrong reason.
+ *
+ * The key is defaulted with `in` on the argument object rather than by a parameter
+ * default, so a test can deliberately pass `key: undefined` and get a refusal
+ * instead of the shared key.
+ */
+function decide(input) {
+  const key = 'key' in input ? input.key : TEST_JWT_KEY
+  return authorize({
+    req: input.req,
+    store: input.store,
+    cookieName: DEVICE_COOKIE_NAME,
+    key,
+    isRevoked: input.isRevoked,
+    upgrade: input.upgrade === true,
+  })
 }
 
 /* ------------------------------------------------------------------ *
@@ -141,10 +169,8 @@ test('isLoopback requires a loopback socket AND a loopback Host', () => {
 test('a loopback request is allowed with no cookie at all', () => {
   /* `prd.md`: 本机回环访问全程不需要配对. */
   withDevice(({ store }) => {
-    const verdict = authorize({
-      req: request({ remoteAddress: '127.0.0.1', headers: { host: '127.0.0.1:3090' } }),
+    const verdict = decide({ req: request({ remoteAddress: '127.0.0.1', headers: { host: '127.0.0.1:3090' } }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.ALLOW)
     assert.equal(verdict.device, null, 'the loopback exemption carries no device')
@@ -154,13 +180,11 @@ test('a loopback request is allowed with no cookie at all', () => {
 
 test('a loopback request is allowed even with a garbage cookie', () => {
   withDevice(({ store }) => {
-    const verdict = authorize({
-      req: request({
+    const verdict = decide({ req: request({
         remoteAddress: '127.0.0.1',
         headers: { host: '127.0.0.1:3090', cookie: `${DEVICE_COOKIE_NAME}=nonsense` },
       }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.ALLOW)
   })
@@ -173,10 +197,8 @@ test('a loopback socket with a NON-loopback Host is treated as remote (DNS rebin
      `isLoopbackSocket` it would hand that request the local exemption and skip
      authentication entirely. */
   withDevice(({ store }) => {
-    const verdict = authorize({
-      req: request({ remoteAddress: '127.0.0.1', headers: { host: 'rebind.evil.example:3090' } }),
+    const verdict = decide({ req: request({ remoteAddress: '127.0.0.1', headers: { host: 'rebind.evil.example:3090' } }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.UNAUTHENTICATED)
     assert.equal(verdict.loopback, false)
@@ -202,8 +224,7 @@ test('a loopback socket with a NON-loopback Host is treated as remote (DNS rebin
 
 test('a cross-site write over a loopback socket is refused, not laundered', () => {
   withDevice(({ store }) => {
-    const verdict = authorize({
-      req: request({
+    const verdict = decide({ req: request({
         method: 'POST',
         remoteAddress: '127.0.0.1',
         headers: {
@@ -214,7 +235,6 @@ test('a cross-site write over a loopback socket is refused, not laundered', () =
         },
       }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.FORBIDDEN, 'a cross-site write must never be laundered by the exemption')
     assert.equal(verdict.reason, 'cross-site')
@@ -227,8 +247,7 @@ test('a cross-site form POST without Sec-Fetch-Site is refused over a loopback s
   /* The shape an older browser sends for a cross-site form post: an Origin, no
      Sec-Fetch-Site, and a content type no preflight is required for. */
   withDevice(({ store }) => {
-    const verdict = authorize({
-      req: request({
+    const verdict = decide({ req: request({
         method: 'POST',
         remoteAddress: '127.0.0.1',
         headers: {
@@ -238,7 +257,6 @@ test('a cross-site form POST without Sec-Fetch-Site is refused over a loopback s
         },
       }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.FORBIDDEN)
     assert.equal(verdict.reason, 'cross-origin')
@@ -250,14 +268,12 @@ test('an unmarked local write is refused, but a local browser write still passes
      CSRF shape); a local write a real browser makes carries `Sec-Fetch-Site:
      same-origin` or a matching `Origin`, and both pass. */
   withDevice(({ store }) => {
-    const unmarked = authorize({
-      req: request({
+    const unmarked = decide({ req: request({
         method: 'POST',
         remoteAddress: '127.0.0.1',
         headers: { host: '127.0.0.1:3090' },
       }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(unmarked.decision, DECISION.FORBIDDEN)
     assert.equal(unmarked.reason, 'no-origin')
@@ -266,10 +282,8 @@ test('an unmarked local write is refused, but a local browser write still passes
       { host: '127.0.0.1:3090', 'sec-fetch-site': 'same-origin' },
       { host: '127.0.0.1:3090', origin: 'http://127.0.0.1:3090' },
     ]) {
-      const allowed = authorize({
-        req: request({ method: 'POST', remoteAddress: '127.0.0.1', headers }),
+      const allowed = decide({ req: request({ method: 'POST', remoteAddress: '127.0.0.1', headers }),
         store,
-        cookieName: DEVICE_COOKIE_NAME,
       })
       assert.equal(allowed.decision, DECISION.ALLOW, `${JSON.stringify(headers)} must still work locally`)
       assert.equal(allowed.device, null, 'and it still needs no device')
@@ -287,10 +301,8 @@ test('a local READ is never asked for an origin, even a cross-site one', () => {
       { host: 'localhost:3090' },
       { host: '127.0.0.1:3090', origin: 'http://127.0.0.1:3090' },
     ]) {
-      const verdict = authorize({
-        req: request({ remoteAddress: '127.0.0.1', headers }),
+      const verdict = decide({ req: request({ remoteAddress: '127.0.0.1', headers }),
         store,
-        cookieName: DEVICE_COOKIE_NAME,
       })
       assert.equal(verdict.decision, DECISION.ALLOW, `${JSON.stringify(headers)} must be allowed`)
       assert.equal(verdict.device, null)
@@ -302,10 +314,8 @@ test('a remote socket with a loopback Host is treated as remote', () => {
   /* The mirror case: a device rewriting its Host header must not earn the
      exemption either. */
   withDevice(({ store }) => {
-    const verdict = authorize({
-      req: request({ remoteAddress: '192.168.1.7', headers: { host: '127.0.0.1:3090' } }),
+    const verdict = decide({ req: request({ remoteAddress: '192.168.1.7', headers: { host: '127.0.0.1:3090' } }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.UNAUTHENTICATED)
   })
@@ -317,11 +327,7 @@ test('a remote socket with a loopback Host is treated as remote', () => {
 
 test('a remote request with no cookie is 401', () => {
   withDevice(({ store }) => {
-    const verdict = authorize({
-      req: request({ headers: { host: '192.168.1.7:3090' } }),
-      store,
-      cookieName: DEVICE_COOKIE_NAME,
-    })
+    const verdict = decide({ req: request({ headers: { host: '192.168.1.7:3090' } }), store })
     assert.equal(verdict.decision, DECISION.UNAUTHENTICATED)
     assert.equal(verdict.reason, 'no-cookie')
     assert.equal(statusFor(verdict.decision), 401)
@@ -331,10 +337,8 @@ test('a remote request with no cookie is 401', () => {
 
 test('a remote request with an unknown cookie is 401', () => {
   withDevice(({ store }) => {
-    const verdict = authorize({
-      req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie('not-a-real-token') } }),
+    const verdict = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie('not-a-real-token') } }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.UNAUTHENTICATED)
     assert.equal(verdict.reason, 'unknown-token')
@@ -349,13 +353,11 @@ test('a forged Origin is 403 even with a perfectly valid cookie', () => {
   /* The whole point: holding a real credential must not let a foreign page drive
      the gateway on the device's behalf. */
   withDevice(({ store, token }) => {
-    const verdict = authorize({
-      req: request({
+    const verdict = decide({ req: request({
         method: 'POST',
         headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token), origin: 'https://evil.example' },
       }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.FORBIDDEN)
     assert.equal(verdict.reason, 'cross-origin')
@@ -366,8 +368,7 @@ test('a forged Origin is 403 even with a perfectly valid cookie', () => {
 
 test('a cross-site write with a valid cookie is 403', () => {
   withDevice(({ store, token }) => {
-    const verdict = authorize({
-      req: request({
+    const verdict = decide({ req: request({
         method: 'POST',
         headers: {
           host: '192.168.1.7:3090',
@@ -376,7 +377,6 @@ test('a cross-site write with a valid cookie is 403', () => {
         },
       }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.FORBIDDEN)
     assert.equal(verdict.reason, 'cross-site')
@@ -385,13 +385,11 @@ test('a cross-site write with a valid cookie is 403', () => {
 
 test('a write with no Origin and no Sec-Fetch-Site is 403 even with a valid cookie', () => {
   withDevice(({ store, token }) => {
-    const verdict = authorize({
-      req: request({
+    const verdict = decide({ req: request({
         method: 'POST',
         headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) },
       }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.FORBIDDEN)
     assert.equal(verdict.reason, 'no-origin')
@@ -406,13 +404,11 @@ test('the origin fence runs BEFORE the revocation check', () => {
      send them to the device panel instead of the network. */
   withDevice(({ store, token }) => {
     store.revokeDevice('dev_1')
-    const verdict = authorize({
-      req: request({
+    const verdict = decide({ req: request({
         method: 'POST',
         headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token), origin: 'https://evil.example' },
       }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.FORBIDDEN)
   })
@@ -424,8 +420,7 @@ test('the origin fence runs BEFORE the revocation check', () => {
 
 test('a valid device cookie on a same-origin write passes', () => {
   withDevice(({ store, token }) => {
-    const verdict = authorize({
-      req: request({
+    const verdict = decide({ req: request({
         method: 'POST',
         headers: {
           host: '192.168.1.7:3090',
@@ -434,7 +429,6 @@ test('a valid device cookie on a same-origin write passes', () => {
         },
       }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.ALLOW)
     assert.equal(verdict.device.id, 'dev_1')
@@ -446,10 +440,8 @@ test('a valid device cookie on a same-origin write passes', () => {
 test('a valid cookie on a plain read passes with no Origin at all', () => {
   /* The stage-2 `curl` acceptance step: `curl -H 'Cookie: …' http://lan:3090/`. */
   withDevice(({ store, token }) => {
-    const verdict = authorize({
-      req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
+    const verdict = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.ALLOW)
   })
@@ -458,10 +450,8 @@ test('a valid cookie on a plain read passes with no Origin at all', () => {
 test('a revoked device is 401, not 403, and the reason is identifiable', () => {
   withDevice(({ store, token }) => {
     store.revokeDevice('dev_1')
-    const verdict = authorize({
-      req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
+    const verdict = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.REVOKED)
     assert.equal(verdict.reason, 'revoked')
@@ -477,10 +467,8 @@ test('a revoked device on a write with no Origin is forbidden, not revoked', () 
      into the wrong order later. */
   withDevice(({ store, token }) => {
     store.revokeDevice('dev_1')
-    const verdict = authorize({
-      req: request({ method: 'DELETE', headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
+    const verdict = decide({ req: request({ method: 'DELETE', headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(verdict.decision, DECISION.FORBIDDEN)
   })
@@ -491,19 +479,15 @@ test('revocation takes effect on the very next request', () => {
      table is read per request — so this is really an assertion that no cache was
      introduced. */
   withDevice(({ store, token }) => {
-    const before = authorize({
-      req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
+    const before = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(before.decision, DECISION.ALLOW)
 
     store.revokeDevice('dev_1')
 
-    const after = authorize({
-      req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
+    const after = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
       store,
-      cookieName: DEVICE_COOKIE_NAME,
     })
     assert.equal(after.decision, DECISION.REVOKED)
   })
@@ -511,23 +495,188 @@ test('revocation takes effect on the very next request', () => {
 
 test('one device token does not authenticate a different device', () => {
   withDevice(({ store, token }) => {
-    const other = createDeviceToken()
-    store.addDevice({ id: 'dev_2', name: 'tablet', tokenHash: other.tokenHash })
+    /* The second device gets its OWN signed token. What is being asserted is that a
+       token's authority is its `sub`, so presenting device A's credential never
+       resolves to device B — the whole point of a claim-backed credential. */
+    const other = pairDevice(store, { id: 'dev_2', name: 'tablet' })
+
+    const both = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(other.token) } }), store })
+    assert.equal(both.decision, DECISION.ALLOW)
+    assert.equal(both.device.id, 'dev_2', 'each token names its own device')
 
     store.revokeDevice('dev_2')
-    const verdict = authorize({
-      req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
-      store,
-      cookieName: DEVICE_COOKIE_NAME,
-    })
+    const verdict = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }), store })
     assert.equal(verdict.decision, DECISION.ALLOW, 'the first device is unaffected by a sibling revocation')
 
-    const wrong = authorize({
-      req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(`${other.token}x`) } }),
-      store,
-      cookieName: DEVICE_COOKIE_NAME,
-    })
+    /* A token whose signature was mangled is not a credential for anybody. */
+    const wrong = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(`${other.token}x`) } }), store })
     assert.equal(wrong.decision, DECISION.UNAUTHENTICATED)
+  })
+})
+
+/* ------------------------------------------------------------------ *
+ * The credential is a JWT: verification, revocation, and the name source
+ * ------------------------------------------------------------------ */
+
+test('a token signed by a different key is 401', () => {
+  /* The signature is what makes the cookie a credential. A well-formed JWT with a
+     plausible `sub` — which is what an attacker can write — must not authenticate. */
+  withDevice(({ store }) => {
+    const forged = deviceJwt('dev_1', { key: Buffer.alloc(32, 0x11) })
+    const verdict = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(forged) } }), store })
+    assert.equal(verdict.decision, DECISION.UNAUTHENTICATED)
+    assert.equal(verdict.reason, 'unknown-token')
+  })
+})
+
+test('an expired token is 401 even with a perfect signature', () => {
+  withDevice(({ store }) => {
+    const stale = deviceJwt('dev_1', { exp: Math.floor(Date.now() / 1000) - 3600 })
+    const verdict = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(stale) } }), store })
+    assert.equal(verdict.decision, DECISION.UNAUTHENTICATED)
+  })
+})
+
+test('a token for a device that does not exist is 401, not a 500', () => {
+  /* The signature is good, so verification succeeds — and then the `sub` names no
+     row. This is the case an operator creates by deleting a row from devices.json
+     by hand, and it must stop working on the very next request rather than being
+     turned into a phantom device. */
+  withDevice(({ store }) => {
+    const orphan = deviceJwt('dev_deleted')
+    const verdict = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(orphan) } }), store })
+    assert.equal(verdict.decision, DECISION.UNAUTHENTICATED)
+    assert.equal(verdict.reason, 'unknown-device')
+    assert.equal(statusFor(verdict.decision), 401)
+  })
+})
+
+test('a revoked `sub` is 401 on the very next request with the SAME still-valid JWT', () => {
+  /* `prd.md` constraint 5, and the entire reason the design is "JWT + a server-side
+     revocation table" rather than a pure stateless token: the JWT here is NOT
+     edited and NOT expired — its signature still verifies — and only the
+     in-memory set says no. A stateless design could not pass this test. */
+  withDevice(({ store, token }) => {
+    const revoked = new Set()
+
+    const before = decide({
+      req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
+      store,
+      isRevoked: (id) => revoked.has(id),
+    })
+    assert.equal(before.decision, DECISION.ALLOW)
+
+    /* What `gateway.revokeDevice` does: write the store AND the set. */
+    store.revokeDevice('dev_1')
+    revoked.add('dev_1')
+
+    const after = decide({
+      req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
+      store,
+      isRevoked: (id) => revoked.has(id),
+    })
+    assert.equal(after.decision, DECISION.REVOKED)
+    assert.equal(after.device, null, 'a revoked device is never handed to the caller')
+    assert.equal(codeFor(after.decision, after.reason), 'gateway/device-revoked')
+  })
+})
+
+test('the revocation set alone is enough, without the store being written', () => {
+  /* The Set is consulted before the row, so a revoke whose store write failed
+     still refuses the credential. Half a revocation must never mean "still works":
+     the store write is the durable half and the Set is the immediate half, and the
+     immediate half is the one a live request hits. */
+  withDevice(({ store, token }) => {
+    const verdict = decide({
+      req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
+      store,
+      isRevoked: () => true,
+    })
+    assert.equal(verdict.decision, DECISION.REVOKED)
+  })
+})
+
+test('a revoked device whose row was deleted still gets 401 with the cookie cleared', () => {
+  /* The Set is checked before the row, so "revoked" survives a hand-deleted record.
+     Answering "unknown" instead would drop the cookie deletion — the signal that
+     tells the user their device was revoked rather than never paired. */
+  withDevice(({ store, token }) => {
+    const verdict = decide({
+      req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
+      store,
+      isRevoked: (id) => id === 'dev_1',
+    })
+    assert.equal(verdict.decision, DECISION.REVOKED)
+  })
+})
+
+test('the device name comes from the STORE, never from the token', () => {
+  /* A JWT is a snapshot: it carries whatever the name was at pairing time. If the
+     gateway trusted `claims.name`, a device the user renamed in the panel would keep
+     announcing its old label in the audit trail and the log until it re-paired.
+     `design.md` §3.2 / the research note both require the store as the source. */
+  withDevice(({ store }) => {
+    const renamedInPanel = store.renameDevice('dev_1', '客厅 iPad')
+    assert.equal(renamedInPanel.name, '客厅 iPad')
+
+    /* A token whose `name` claim is stale — and wrong — but is otherwise valid. */
+    const staleClaim = deviceJwt('dev_1', { name: 'iPhone · Safari' })
+    const verdict = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(staleClaim) } }), store })
+
+    assert.equal(verdict.decision, DECISION.ALLOW)
+    assert.equal(verdict.device.name, '客厅 iPad', 'the store wins over the claim')
+    assert.notEqual(verdict.device.name, 'iPhone · Safari', 'the stale claim must not be displayed')
+  })
+})
+
+test('a credential in the OLD cookie name is refused', () => {
+  /* `research/jwt-device-credential.md` §3.5 offers a transition window; this build
+     deliberately does not take it. A second accepted cookie name would be a second
+     code path through the one authorization decision, and the old name carries a
+     value (`sha256` digest verifier) this verifier cannot check anyway. Old devices
+     must re-pair — documented in the README. */
+  withDevice(({ store, token }) => {
+    const oldName = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: `dsh-rc-device=${token}` } }), store })
+    assert.equal(oldName.decision, DECISION.UNAUTHENTICATED)
+    assert.equal(oldName.reason, 'no-cookie')
+  })
+})
+
+test('no token at all, an empty token and a garbage token are all one 401', () => {
+  /* One reason for every credential failure: telling a caller which check it failed
+     would confirm whether a device id exists and which half of a guess was right. */
+  withDevice(({ store }) => {
+    for (const cookie of [undefined, `${DEVICE_COOKIE_NAME}=`, `${DEVICE_COOKIE_NAME}=%20`, `${DEVICE_COOKIE_NAME}=a.b.c`]) {
+      const verdict = decide({
+        req: request({ headers: { host: '192.168.1.7:3090', ...(cookie === undefined ? {} : { cookie }) } }),
+        store,
+      })
+      assert.equal(verdict.decision, DECISION.UNAUTHENTICATED, String(cookie))
+      assert.equal(codeFor(verdict.decision, verdict.reason), 'gateway/unauthenticated', String(cookie))
+    }
+  })
+})
+
+test('a request with no key configured cannot authenticate anybody', () => {
+  /* Fail closed. A gateway that lost its signing key must refuse every remote
+     request, not skip verification — the `undefined` key makes `verifyDeviceToken`
+     answer undefined, which is the 401 arm. */
+  withDevice(({ store, token }) => {
+    const verdict = decide({
+      req: request({ headers: { host: '192.168.1.7:3090', cookie: deviceCookie(token) } }),
+      store,
+      key: undefined,
+    })
+    assert.equal(verdict.decision, DECISION.UNAUTHENTICATED)
+  })
+})
+
+test('the loopback exemption still needs no credential at all, JWT or otherwise', () => {
+  /* The JWT switch must not have made local access depend on a cookie. */
+  withDevice(({ store }) => {
+    const verdict = decide({ req: request({ remoteAddress: '127.0.0.1', headers: { host: '127.0.0.1:3090' } }), store })
+    assert.equal(verdict.decision, DECISION.ALLOW)
+    assert.equal(verdict.device, null)
   })
 })
 

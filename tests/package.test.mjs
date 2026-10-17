@@ -195,12 +195,20 @@ test('the gateway modules exist and are all packaged', () => {
     'src/host/gateway/proxy.js',
     'src/host/gateway/wsproxy.js',
     'src/host/gateway/activity.js',
+    'src/host/gateway/pairing-route.js',
     'src/host/gateway/wire.js',
   ]
   for (const relative of gatewayModules) {
     assert.ok(existsSync(path.join(repoRoot, relative)), `missing gateway module: ${relative}`)
     assert.ok(pkg.files.includes(relative), `${relative} must be listed in files`)
   }
+})
+
+test('the signing-key module exists and is packaged', () => {
+  /* `jwt-key.js` is required at gateway start, so a package without it installs a
+     plugin that cannot bind a listener at all. */
+  assert.ok(existsSync(path.join(repoRoot, 'src/host/jwt-key.js')))
+  assert.ok(pkg.files.includes('src/host/jwt-key.js'), 'src/host/jwt-key.js must be listed in files')
 })
 
 test('every host source is syntax-checked by check:syntax', () => {
@@ -239,10 +247,36 @@ test('the gateway never logs or transmits inner credential material', () => {
   assert.match(innerAuth, /startsWith\(COOKIE_PREFIX\)/, 'outbound client cookies must be filtered')
 })
 
-test('the host half stores no plaintext token field', () => {
+test('the host half stores no plaintext credential field', () => {
+  /* The store deals in rows, not credentials: the device's token is a JWT that the
+     device holds, and nothing about it is persisted
+     (`research/jwt-device-credential.md` §3.6). A `token:` field would be a clear
+     token at rest. */
   const source = readFileSync(path.join(repoRoot, 'src/host/store.js'), 'utf8')
-  assert.ok(!/\btoken\s*:/.test(source), 'the store must only deal in tokenHash')
-  assert.ok(/tokenHash/.test(source))
+  assert.ok(!/\btoken\s*:/.test(source), 'the store must never carry a clear token')
+  /* `tokenHash` survives only as the legacy read path, so the reference is expected
+     and its presence is not a regression. */
+  assert.ok(/tokenHash/.test(source), 'the legacy tokenHash read path is documented')
+
+  /* The key module must never log or echo the key it manages. */
+  const keySource = readFileSync(path.join(repoRoot, 'src/host/jwt-key.js'), 'utf8')
+  assert.ok(!/console\./.test(keySource), 'the key module must not print')
+})
+
+test('the JWT credential is hand-rolled, with no third-party JWT library', () => {
+  /* Zero runtime dependencies is a design decision, and `jsonwebtoken` / `jose`
+     would be the obvious way to break it. It is also the safer answer here: both
+     libraries have shipped algorithm-confusion bugs, and the surface this package
+     needs is one HMAC over two base64url segments. */
+  for (const relative of hostSources()) {
+    const source = readFileSync(path.join(repoRoot, relative), 'utf8')
+    assert.ok(!/from\s+['"]jsonwebtoken['"]/.test(source), `${relative} must not import jsonwebtoken`)
+    assert.ok(!/from\s+['"]jose['"]/.test(source), `${relative} must not import jose`)
+    assert.ok(!/from\s+['"]jws['"]/.test(source), `${relative} must not import jws`)
+  }
+  const tokens = readFileSync(path.join(repoRoot, 'src/host/tokens.js'), 'utf8')
+  assert.match(tokens, /from 'node:crypto'/, 'the JWT is built on node:crypto')
+  assert.match(tokens, /createHmac\('sha256'/, 'HS256 is the only signature it computes')
 })
 
 test('the client half is one __ModuleLoader__ entry with no top-level import/export', () => {

@@ -17,10 +17,9 @@ import { after, test } from 'node:test'
 import { request as httpRequest, createServer } from 'node:http'
 
 import { DEVICE_COOKIE_NAME } from '../src/host/constants.js'
-import { createDeviceToken } from '../src/host/tokens.js'
 import { startGateway } from '../src/host/gateway/server.js'
 import { createInnerAuth } from '../src/host/gateway/inner-auth.js'
-import { cleanupDir, makeStore, makeTempDir } from './helpers.mjs'
+import { TEST_JWT_KEY, cleanupDir, makeStore, makeTempDir, pairDevice } from './helpers.mjs'
 
 /* ------------------------------------------------------------------ *
  * Harness
@@ -156,9 +155,7 @@ async function startGatewayUnderTest(spec) {
   const { store, clock } = makeStore(dir)
   let token
   if (spec.withDevice !== false) {
-    const minted = createDeviceToken()
-    token = minted.token
-    store.addDevice({ id: 'dev_1', name: 'iPhone · Safari', tokenHash: minted.tokenHash })
+    token = pairDevice(store, { id: 'dev_1', name: 'iPhone · Safari' }).token
   }
 
   /* A `ctx` stub with the only two members `startGateway` uses: `effect` (so the
@@ -185,6 +182,7 @@ async function startGatewayUnderTest(spec) {
     port: 0,
     host: '127.0.0.1',
     cookieName: DEVICE_COOKIE_NAME,
+    jwtKey: TEST_JWT_KEY,
     now: () => clock.now,
     activityIntervalMs: spec.activityIntervalMs,
     logger: spec.logger,
@@ -319,6 +317,7 @@ test('a port already in use rejects the start instead of silently not listening'
         port: heldPort,
         host: '127.0.0.1',
         cookieName: DEVICE_COOKIE_NAME,
+        jwtKey: TEST_JWT_KEY,
       }),
       (error) => error.code === 'EADDRINUSE',
     )
@@ -868,8 +867,7 @@ test('a client that disconnects before the upstream answers does not pin the ups
 
   const dir = makeTempDir()
   const { store } = makeStore(dir)
-  const minted = createDeviceToken()
-  store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: minted.tokenHash })
+  const { token } = pairDevice(store, { id: 'dev_1', name: 'phone' })
 
   const gateway = await startGateway({
     ctx: { get: () => ({ authenticatedUrl: (base) => `${base}?token=L` }), effect: () => () => {} },
@@ -878,6 +876,7 @@ test('a client that disconnects before the upstream answers does not pin the ups
     port: 0,
     host: '127.0.0.1',
     cookieName: DEVICE_COOKIE_NAME,
+    jwtKey: TEST_JWT_KEY,
     /* Long on purpose: if the disconnect is not noticed, the assertion below fails
        on a still-open socket rather than on a timeout. */
     upstreamTimeoutMs: 30_000,

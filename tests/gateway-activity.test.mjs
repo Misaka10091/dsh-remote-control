@@ -12,7 +12,6 @@ import { test } from 'node:test'
 import { readFileSync } from 'node:fs'
 
 import { createActivityTracker } from '../src/host/gateway/activity.js'
-import { createDeviceToken } from '../src/host/tokens.js'
 import { cleanupDir, makeStore, makeTempDir } from './helpers.mjs'
 
 /** A `touch` that counts calls instead of writing. */
@@ -223,7 +222,7 @@ test('N rapid requests through the tracker cause far fewer than N devices.json w
   const dir = makeTempDir()
   try {
     const { store, clock } = makeStore(dir)
-    store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: createDeviceToken().tokenHash })
+    store.addDevice({ id: 'dev_1', name: 'phone' })
 
     let writes = 0
     const touch = (id) => {

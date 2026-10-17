@@ -5,6 +5,13 @@
  * the real `~/.dsh`. The atomic-write and corruption cases are the ones that
  * matter: a half-written `devices.json` would invalidate every paired device at
  * once, and a corrupt file silently treated as empty is a security-relevant lie.
+ *
+ * The credential is a signed JWT since `research/jwt-device-credential.md`, so a
+ * row is keyed by `id` (which is the token's `sub`) and no longer carries a
+ * `tokenHash`. The tests that used to assert "only the digest is stored" now assert
+ * something stronger and simpler: **nothing credential-shaped is stored at all**.
+ * The `tokenHash` cases are kept because `version: 1` must still parse an old file
+ * the same way, and a malformed one must still be refused rather than half-read.
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
@@ -14,7 +21,7 @@ import path from 'node:path'
 
 import { DEVICES_FILE_MODE, DEVICES_FILE_NAME, DEVICES_VERSION, DEFAULT_GATEWAY_PORT } from '../src/host/constants.js'
 import { createStore, defaultBaseDir } from '../src/host/store.js'
-import { createDeviceToken } from '../src/host/tokens.js'
+import { hashToken } from '../src/host/tokens.js'
 import { makeStore, makeTempDir, cleanupDir } from './helpers.mjs'
 
 /** Assert a thrown error carries the documented stable `code`. */
@@ -59,18 +66,18 @@ test('addDevice persists the documented device shape, in field order, including 
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
-    const { tokenHash } = createDeviceToken()
 
-    const record = store.addDevice({ id: 'dev_1', name: 'iPhone · Safari', tokenHash, ua: 'UA/1' })
+    const record = store.addDevice({ id: 'dev_1', name: 'iPhone · Safari', ua: 'UA/1' })
     const onDisk = JSON.parse(readFileSync(store.devicesPath, 'utf8'))
     const [stored] = onDisk.devices
 
+    /* Field order as documented. `tokenHash` is absent on purpose: the credential is
+       a JWT and nothing about it is persisted, so a fresh row has no verifier. */
     assert.deepEqual(Object.keys(stored), [
-      'id', 'name', 'tokenHash', 'ua', 'createdAt', 'lastSeenAt', 'revokedAt', 'capabilities',
+      'id', 'name', 'ua', 'createdAt', 'lastSeenAt', 'revokedAt', 'capabilities',
     ])
     assert.equal(stored.id, 'dev_1')
     assert.equal(stored.name, 'iPhone · Safari')
-    assert.equal(stored.tokenHash, tokenHash)
     assert.equal(stored.ua, 'UA/1')
     assert.equal(stored.createdAt, '2026-10-17T03:04:43.000Z')
     assert.equal(stored.lastSeenAt, '2026-10-17T03:04:43.000Z')
@@ -84,16 +91,24 @@ test('addDevice persists the documented device shape, in field order, including 
   }
 })
 
-test('the clear device token never reaches the store', () => {
+test('the store writes no credential, digest or JWT material', () => {
+  /* Stronger than the old "only the digest" assertion. The device credential is a
+     JWT held by the device; the store's job is the ROW. An `id` and a `name` are all
+     either of them needs, and a `tokenHash` here would be a second verifier nobody
+     reads — `research/jwt-device-credential.md` §3.6 drops it.
+   *
+   * Asserted file-wide, because "the field I remembered" is not the same as "the
+   * file": a JWT could land in `name` or `ua` just as easily. */
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
-    const { token, tokenHash } = createDeviceToken()
-    store.addDevice({ id: 'dev_1', name: 'phone', tokenHash })
+    store.addDevice({ id: 'dev_1', name: 'phone', ua: 'UA/1' })
 
     const raw = readFileSync(store.devicesPath, 'utf8')
-    assert.ok(!raw.includes(token), 'the persisted document must not contain the clear token')
-    assert.ok(raw.includes(tokenHash), 'the hash is what is persisted')
+    assert.ok(!raw.includes('tokenHash'), 'no verifier is persisted')
+    assert.ok(!/eyJ[A-Za-z0-9_-]{6,}\./.test(raw), 'no JWT anywhere in the document')
+    assert.ok(!raw.includes(hashToken('anything')), 'and no digest of one')
+    assert.ok(!/dsh-rc-jwt/.test(raw), 'not even the cookie name')
   } finally {
     cleanupDir(dir)
   }
@@ -103,7 +118,7 @@ test('a write leaves no temp files behind', () => {
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
-    store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: createDeviceToken().tokenHash })
+    store.addDevice({ id: 'dev_1', name: 'phone' })
 
     const leftovers = readdirSync(dir).filter((entry) => entry.endsWith('.tmp'))
     assert.deepEqual(leftovers, [])
@@ -117,15 +132,14 @@ test('a completed atomic write is readable again and survives a reload', () => {
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
-    const { tokenHash } = createDeviceToken()
-    store.addDevice({ id: 'dev_1', name: 'phone', tokenHash })
+    store.addDevice({ id: 'dev_1', name: 'phone' })
 
     /* A second store over the same directory sees the same device — the file,
        not in-memory state, is the source of truth. */
     const reopened = createStore({ baseDir: dir })
     const devices = reopened.listDevices()
     assert.equal(devices.length, 1)
-    assert.equal(devices[0].tokenHash, tokenHash)
+    assert.equal(devices[0].id, 'dev_1')
   } finally {
     cleanupDir(dir)
   }
@@ -135,7 +149,7 @@ test('the document is written with a newline at EOF and valid JSON', () => {
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
-    store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: createDeviceToken().tokenHash })
+    store.addDevice({ id: 'dev_1', name: 'phone', ua: '' })
 
     const raw = readFileSync(store.devicesPath, 'utf8')
     assert.ok(raw.endsWith('\n'))
@@ -154,7 +168,7 @@ test('devices.json is created with mode 0600', () => {
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
-    store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: createDeviceToken().tokenHash })
+    store.addDevice({ id: 'dev_1', name: 'phone', ua: '' })
 
     if (process.platform === 'win32') {
       /* The Windows permission model has no 0600; the call must be a no-op rather
@@ -180,7 +194,7 @@ test('applying the file mode never makes a successful write fail', () => {
       assert.doesNotThrow(() => store.addDevice({
         id: `dev_${index}`,
         name: `phone ${index}`,
-        tokenHash: createDeviceToken().tokenHash,
+        ua: '',
       }))
     }
     assert.equal(store.listDevices().length, 5)
@@ -217,7 +231,9 @@ test('a structurally wrong document raises store/corrupt', () => {
   }
 })
 
-test('a device record missing id or tokenHash raises store/corrupt', () => {
+test('a device record without an id raises store/corrupt', () => {
+  /* `id` is the row key AND the JWT `sub`, so a row without one can never be
+     authenticated — accepting it would leave an unusable row in the table. */
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
@@ -225,7 +241,7 @@ test('a device record missing id or tokenHash raises store/corrupt', () => {
     writeFileSync(store.devicesPath, JSON.stringify({ version: 1, devices: [{ tokenHash: 'a'.repeat(64) }] }))
     assertCode(() => store.read(), 'store/corrupt')
 
-    writeFileSync(store.devicesPath, JSON.stringify({ version: 1, devices: [{ id: 'dev_1' }] }))
+    writeFileSync(store.devicesPath, JSON.stringify({ version: 1, devices: [{}] }))
     assertCode(() => store.read(), 'store/corrupt')
 
     writeFileSync(store.devicesPath, JSON.stringify({ version: 1, devices: ['nope'] }))
@@ -235,15 +251,60 @@ test('a device record missing id or tokenHash raises store/corrupt', () => {
   }
 })
 
+test('a version-1 row with NO tokenHash still loads, because the field is legacy', () => {
+  /* The JWT switch removed the verifier. `version: 1` files written by this build
+     have no `tokenHash`, so requiring one would make every newly written file
+     unreadable — the "forward-compatible additions only" rule inverted. */
+  const dir = makeTempDir()
+  try {
+    const { store } = makeStore(dir)
+    writeFileSync(store.devicesPath, JSON.stringify({
+      version: 1,
+      devices: [{ id: 'dev_1', name: 'phone', createdAt: '2026-01-01T00:00:00.000Z' }],
+      settings: { enabled: false, port: 3090 },
+    }))
+
+    const devices = store.listDevices()
+    assert.equal(devices.length, 1)
+    assert.equal(devices[0].id, 'dev_1')
+    assert.equal(devices[0].tokenHash, undefined, 'and no verifier is invented for it')
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('an old row WITH a tokenHash still loads, and is projected unchanged', () => {
+  /* The migration story is "no automatic migration" (`research/jwt-device-credential.md`
+     §3.6): old rows keep their hash, keep parsing, and simply cannot authenticate
+     any more because nothing compares a hash to a JWT. Reading them must not fail,
+     or an upgrade would brick the store instead of merely un-pairing devices. */
+  const dir = makeTempDir()
+  try {
+    const { store } = makeStore(dir)
+    const tokenHash = 'b'.repeat(64)
+    writeFileSync(store.devicesPath, JSON.stringify({
+      version: 1,
+      devices: [{ id: 'dev_1', name: 'old phone', tokenHash }],
+    }))
+
+    const [device] = store.listDevices()
+    assert.equal(device.id, 'dev_1')
+    assert.equal(device.name, 'old phone')
+    assert.equal(device.tokenHash, tokenHash, 'the legacy field is preserved, not dropped on read')
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
 test('a device tokenHash that is not a sha256 digest is store/corrupt', () => {
-  /* The store is the boundary that keeps a credential from being persisted as
-     if it were a hash. `tokens.js` refuses to authenticate a malformed hash, so
-     admitting one here would leave a permanently unusable device row. */
+  /* Present-but-malformed is still refused. Absent is fine (see above); a value of
+     the wrong shape is damage, and reading it as a device would mean the store is
+     silently swallowing a corrupt row. */
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
 
-    for (const malformed of ['hunter2', 'A'.repeat(43), 'A'.repeat(64), 'a'.repeat(63), 'a'.repeat(65), '']) {
+    for (const malformed of ['hunter2', 'A'.repeat(43), 'A'.repeat(64), 'a'.repeat(63), 'a'.repeat(65)]) {
       writeFileSync(store.devicesPath, JSON.stringify({ version: 1, devices: [{ id: 'dev_1', tokenHash: malformed }] }))
       assertCode(() => store.read(), 'store/corrupt')
     }
@@ -309,7 +370,7 @@ test('a partial write does not destroy the previous document', () => {
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
-    store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: createDeviceToken().tokenHash })
+    store.addDevice({ id: 'dev_1', name: 'phone', ua: '' })
     const before = readFileSync(store.devicesPath, 'utf8')
 
     /* Simulate a writer that dies mid-flight: the temp file exists, the target
@@ -327,10 +388,10 @@ test('duplicate device ids are refused', () => {
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
-    store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: createDeviceToken().tokenHash })
+    store.addDevice({ id: 'dev_1', name: 'phone', ua: '' })
 
     assertCode(
-      () => store.addDevice({ id: 'dev_1', name: 'other', tokenHash: createDeviceToken().tokenHash }),
+      () => store.addDevice({ id: 'dev_1', name: 'other', ua: '' }),
       'store/duplicate-device',
     )
   } finally {
@@ -338,15 +399,31 @@ test('duplicate device ids are refused', () => {
   }
 })
 
-test('a device record without id or tokenHash is refused', () => {
+test('a device record without an id is refused', () => {
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
     /* A caller-side record fault is `store/invalid-device`; only a fault in the
        document read off disk is `store/corrupt`. */
-    assertCode(() => store.addDevice({ name: 'phone', tokenHash: createDeviceToken().tokenHash }), 'store/invalid-device')
-    assertCode(() => store.addDevice({ id: 'dev_1' }), 'store/invalid-device')
+    assertCode(() => store.addDevice({ name: 'phone', ua: '' }), 'store/invalid-device')
+    assertCode(() => store.addDevice({ id: '' }), 'store/invalid-device')
+    assertCode(() => store.addDevice({ id: 42 }), 'store/invalid-device')
     assertCode(() => store.addDevice(null), 'store/invalid-device')
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('addDevice accepts a record with no tokenHash, because the credential is a JWT', () => {
+  /* The JWT-era shape. Requiring a hash here would make the pairing route — which
+     has none to give — unable to create a device at all. */
+  const dir = makeTempDir()
+  try {
+    const { store } = makeStore(dir)
+    const record = store.addDevice({ id: 'dev_1' })
+    assert.equal(record.id, 'dev_1')
+    assert.equal(record.tokenHash, undefined)
+    assert.equal(store.listDevices().length, 1)
   } finally {
     cleanupDir(dir)
   }
@@ -356,7 +433,7 @@ test('revokeDevice stamps revokedAt once and is idempotent', () => {
   const dir = makeTempDir()
   try {
     const { store, clock } = makeStore(dir)
-    store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: createDeviceToken().tokenHash })
+    store.addDevice({ id: 'dev_1', name: 'phone', ua: '' })
 
     clock.now += 5_000
     const first = store.revokeDevice('dev_1')
@@ -372,38 +449,51 @@ test('revokeDevice stamps revokedAt once and is idempotent', () => {
   }
 })
 
-test('findActiveDeviceByTokenHash ignores revoked devices', () => {
+test('findDeviceById returns revoked rows too, so the verdict stays the caller’s', () => {
+  /* The JWT `sub` lookup (`research/jwt-device-credential.md` §3.5). Revocation is
+     NOT filtered here on purpose: `auth.js` must tell "revoked" apart from "unknown"
+     — one gets a 401 with a cookie deletion, the other a plain 401 — and a lookup
+     that dropped revoked rows would collapse the two into one indistinguishable
+     answer.
+   *
+   * The revoked set lives in the gateway, not in this module, so this is also the
+   * assertion that the split is real: the store answers "here is the row", the
+   * gateway answers "and it is dead". */
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
-    const { tokenHash } = createDeviceToken()
-    store.addDevice({ id: 'dev_1', name: 'phone', tokenHash })
+    store.addDevice({ id: 'dev_1', name: 'phone', ua: '' })
 
-    assert.equal(store.findActiveDeviceByTokenHash(tokenHash).id, 'dev_1')
-    assert.equal(store.findActiveDeviceByTokenHash('c'.repeat(64)), null)
-    assert.equal(store.findActiveDeviceByTokenHash(''), null)
-    assert.equal(store.findActiveDeviceByTokenHash(undefined), null)
+    assert.equal(store.findDeviceById('dev_1').id, 'dev_1')
+    assert.equal(store.findDeviceById('dev_nope'), null)
+    assert.equal(store.findDeviceById(''), null)
+    assert.equal(store.findDeviceById(undefined), null)
 
     store.revokeDevice('dev_1')
-    assert.equal(store.findActiveDeviceByTokenHash(tokenHash), null, 'a revoked device is not active')
-    assert.equal(store.listDevices().length, 1, 'but it stays in the table for the panel and the audit')
+    const revoked = store.findDeviceById('dev_1')
+    assert.ok(revoked !== null, 'a revoked device is still found')
+    assert.equal(revoked.revokedAt, '2026-10-17T03:04:43.000Z', 'with the fact that it is revoked')
+    assert.equal(store.listDevices().length, 1, 'and it stays in the table for the panel and the audit')
   } finally {
     cleanupDir(dir)
   }
 })
 
-test('findActiveDeviceByTokenHash is exact: no prefix, case or truncation match', () => {
+test('findDeviceById is exact: no prefix, case or truncation match', () => {
+  /* Near-miss ids must not resolve. A tolerant lookup is how `dev_1` becomes
+     `dev_10`, and the credential's `sub` is the only authorization input. */
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
-    const { tokenHash } = createDeviceToken()
-    store.addDevice({ id: 'dev_1', name: 'phone', tokenHash })
+    store.addDevice({ id: 'dev_1', name: 'phone', ua: '' })
+    store.addDevice({ id: 'dev_10', name: 'tablet', ua: '' })
 
-    assert.equal(store.findActiveDeviceByTokenHash(tokenHash.slice(0, 63)), null, 'a prefix must not match')
-    assert.equal(store.findActiveDeviceByTokenHash(`${tokenHash}0`), null, 'an extension must not match')
-    assert.equal(store.findActiveDeviceByTokenHash(tokenHash.toUpperCase()), null, 'digests are lower-case hex')
-    /* A non-digest is not a token hash and must never be looked up as one. */
-    assert.equal(store.findActiveDeviceByTokenHash('hunter2'), null)
+    assert.equal(store.findDeviceById('dev_1').name, 'phone')
+    assert.equal(store.findDeviceById('dev_10').name, 'tablet')
+    assert.equal(store.findDeviceById('dev_'), null, 'a prefix must not match')
+    assert.equal(store.findDeviceById('dev_100'), null, 'an extension must not match')
+    assert.equal(store.findDeviceById('DEV_1'), null, 'ids are case-sensitive')
+    assert.equal(store.findDeviceById(' hunter2'), null)
   } finally {
     cleanupDir(dir)
   }
@@ -413,7 +503,7 @@ test('touchDevice and renameDevice update one device and persist', () => {
   const dir = makeTempDir()
   try {
     const { store, clock } = makeStore(dir)
-    store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: createDeviceToken().tokenHash })
+    store.addDevice({ id: 'dev_1', name: 'phone', ua: '' })
 
     clock.now += 60_000
     const touched = store.touchDevice('dev_1')
@@ -464,7 +554,7 @@ test('the store creates its base directory recursively', () => {
   try {
     const baseDir = path.join(dir, 'a', 'b', 'c')
     const store = createStore({ baseDir })
-    store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: createDeviceToken().tokenHash })
+    store.addDevice({ id: 'dev_1', name: 'phone', ua: '' })
     assert.ok(existsSync(path.join(baseDir, DEVICES_FILE_NAME)))
   } finally {
     cleanupDir(dir)
@@ -480,7 +570,7 @@ test('a store whose base directory is an existing file fails with store/write-fa
     /* Point the base at a path that cannot become a directory. */
     const store = createStore({ baseDir: path.join(blocker, 'inner', 'deeper') })
     assertCode(
-      () => store.addDevice({ id: 'dev_1', name: 'p', tokenHash: createDeviceToken().tokenHash }),
+      () => store.addDevice({ id: 'dev_1', name: 'p', ua: '' }),
       'store/write-failed',
     )
   } finally {

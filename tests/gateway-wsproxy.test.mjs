@@ -33,9 +33,8 @@ import { createServer as createHttpServer, request as httpRequest } from 'node:h
 import { connect } from 'node:net'
 
 import { DEVICE_COOKIE_NAME } from '../src/host/constants.js'
-import { createDeviceToken } from '../src/host/tokens.js'
 import { startGateway } from '../src/host/gateway/server.js'
-import { cleanupDir, makeStore, makeTempDir } from './helpers.mjs'
+import { TEST_JWT_KEY, cleanupDir, makeStore, makeTempDir, pairDevice } from './helpers.mjs'
 
 /* ------------------------------------------------------------------ *
  * Harness
@@ -228,9 +227,7 @@ async function startGatewayUnderTest(spec) {
   const { store, clock } = makeStore(dir)
   let token
   if (spec.withDevice !== false) {
-    const minted = createDeviceToken()
-    token = minted.token
-    store.addDevice({ id: 'dev_1', name: 'iPhone · Safari', tokenHash: minted.tokenHash })
+    token = pairDevice(store, { id: 'dev_1', name: 'iPhone · Safari' }).token
   }
 
   const disposers = []
@@ -250,6 +247,7 @@ async function startGatewayUnderTest(spec) {
     port: 0,
     host: '127.0.0.1',
     cookieName: DEVICE_COOKIE_NAME,
+    jwtKey: TEST_JWT_KEY,
     now: () => clock.now,
     logger: spec.logger,
     upgradeHeadTimeoutMs: spec.upgradeHeadTimeoutMs,
@@ -944,10 +942,8 @@ test('revoking one device does not touch another device’s socket', async () =>
   const upstream = await startUpstream()
   const dir = makeTempDir()
   const { store, clock } = makeStore(dir)
-  const first = createDeviceToken()
-  const second = createDeviceToken()
-  store.addDevice({ id: 'dev_1', name: 'phone', tokenHash: first.tokenHash })
-  store.addDevice({ id: 'dev_2', name: 'tablet', tokenHash: second.tokenHash })
+  const first = pairDevice(store, { id: 'dev_1', name: 'phone' })
+  const second = pairDevice(store, { id: 'dev_2', name: 'tablet' })
 
   const gateway = await startGateway({
     ctx: {
@@ -959,6 +955,7 @@ test('revoking one device does not touch another device’s socket', async () =>
     port: 0,
     host: '127.0.0.1',
     cookieName: DEVICE_COOKIE_NAME,
+    jwtKey: TEST_JWT_KEY,
     now: () => clock.now,
   })
   started.push(async () => { await gateway.close(); cleanupDir(dir) })

@@ -12,12 +12,13 @@
  *     temp file in the SAME directory, `fsync` it, then `rename` — rename is
  *     atomic within a filesystem, so a reader sees either the old document or the
  *     new one, never a partial one.
- *   - MODE 0600. The file holds every device's token hash: a hash is not a
- *     credential, but the device list is still not other users' business. The
- *     mode is applied at creation time (not afterwards) so the file is never
- *     briefly readable. On Windows the permission model has no 0600, `chmod` only
- *     toggles the read-only bit, so the call is a guarded no-op — it MUST NOT
- *     throw, or the plugin would refuse to start on the primary dev platform.
+ *   - MODE 0600. The file holds the device table: which devices are paired, what
+ *     they are called, when they were last seen. That is not other users'
+ *     business. The mode is applied at creation time (not afterwards) so the file
+ *     is never briefly readable. On Windows the permission model has no 0600,
+ *     `chmod` only toggles the read-only bit, so the call is a guarded no-op — it
+ *     MUST NOT throw, or the plugin would refuse to start on the primary dev
+ *     platform.
  *   - CORRUPTION IS AN ERROR. A file that exists but does not parse raises
  *     `store/corrupt` instead of being treated as an empty table. "Silently empty"
  *     would look identical to "all devices unpaired", which is a security-relevant
@@ -50,7 +51,6 @@ import {
   RUNTIME_DIR_NAME,
   TOKEN_HASH_PATTERN,
 } from './constants.js'
-import { sameTokenHash } from './tokens.js'
 
 /** Build an Error carrying a stable `code` (see `.trellis/spec/backend/error-handling.md`). */
 function storeError(code, message) {
@@ -93,10 +93,18 @@ function asRecordedTime(value) {
  * rewriting the document shape. Rebuilding the object (rather than spreading the
  * parsed one) also drops unknown keys a hand-edit may have left behind.
  *
- * `tokenHash` must be a sha256 hex digest. A value of any other shape is a
- * corrupt record, not a device: `tokens.js` refuses to authenticate against one,
- * so accepting it here would leave an unrevokable, unusable row in the table
- * (`error-handling.md` — do not silently swallow store damage).
+ * `tokenHash` is LEGACY (`research/jwt-device-credential.md` §3.6). The credential
+ * is a signed JWT now, so no new row carries a hash and nothing authenticates
+ * against one. The field is still READ when an old `devices.json` has it, and still
+ * VALIDATED as a sha256 hex digest when present, so `version: 1` parses exactly as
+ * it did before and a hand-edited file is refused rather than half-understood. What
+ * changed is only that a row may now omit it: a fresh document has no hash to
+ * store, and requiring one would make `addDevice` impossible to call.
+ *
+ * `id` remains mandatory. It is the row key AND the JWT `sub`, so a device without
+ * one is a device that can never be authenticated — accepting it would leave an
+ * unusable row in the table (`error-handling.md` — do not silently swallow store
+ * damage).
  *
  * `code` is the error raised for a bad record. Reading from disk raises
  * `store/corrupt`; `addDevice` being handed a malformed record raises
@@ -118,17 +126,21 @@ function normalizeDevice(stored, code = 'store/corrupt') {
     throw storeError(errorCode, 'device record is not an object')
   }
   const id = typeof stored.id === 'string' ? stored.id : ''
-  const tokenHash = typeof stored.tokenHash === 'string' ? stored.tokenHash : ''
-  if (id === '' || tokenHash === '') {
-    throw storeError(errorCode, 'device record is missing id or tokenHash')
+  if (id === '') {
+    throw storeError(errorCode, 'device record is missing id')
   }
-  if (!TOKEN_HASH_PATTERN.test(tokenHash)) {
+  const tokenHash = typeof stored.tokenHash === 'string' ? stored.tokenHash : ''
+  /* Present-but-malformed is refused; absent is fine (a JWT-era row has none). */
+  if (tokenHash !== '' && !TOKEN_HASH_PATTERN.test(tokenHash)) {
     throw storeError(errorCode, 'device record tokenHash is not a sha256 hex digest')
   }
   return {
     id,
     name: typeof stored.name === 'string' ? stored.name : '',
-    tokenHash,
+    /* Omitted from the object entirely when there is nothing to say, so a fresh
+       `devices.json` does not carry `"tokenHash": ""` forever. Field order for an
+       old document is preserved because the spread below keeps it. */
+    ...(tokenHash === '' ? {} : { tokenHash }),
     ua: typeof stored.ua === 'string' ? stored.ua : '',
     createdAt: asRecordedTime(stored.createdAt),
     lastSeenAt: asRecordedTime(stored.lastSeenAt),
@@ -346,32 +358,47 @@ function buildStore(baseDir, now) {
   }
 
   /**
-   * Find a live (not revoked) device by its `tokenHash`. Linear scan: the table is small by design.
+   * Find a device by its id, revoked or not. Linear scan: the table is small by design.
    *
-   * The comparison goes through `sameTokenHash` (`timingSafeEqual` on the decoded
-   * digests), not `===`. A plain string compare here would early-exit on the
-   * first differing character, so the auth check would be constant-time inside
-   * `tokens.js` and timing-variable in the one place it actually runs.
+   * This is the lookup the gateway performs after verifying a JWT, using the token's
+   * `sub` (`research/jwt-device-credential.md` §3.5). Two things follow from that,
+   * and both are deliberate:
+   *
+   *   - **It returns revoked rows.** The verdict is the caller's: a revoked device
+   *     must be told apart from an unknown one (`auth.js` answers 401 with a cookie
+   *     deletion for the first and a plain 401 for the second), and a lookup that
+   *     filtered them out would collapse the two.
+   *   - **It does not compare a credential.** The signature comparison already ran
+   *     in `tokens.js`, in constant time over digested buffers. An id is not a
+   *     secret — it is a `dev_…` row key that a paired device sees in its own audit
+   *     trail — so a plain `===` here compares nothing an attacker could use to
+   *     narrow a search.
+   *
+   * A non-string or empty id returns null rather than scanning: it cannot match a
+   * record, and every real id comes from a verified claim.
+   *
+   * @param {unknown} id
+   * @returns {ReturnType<typeof normalizeDevice> | null}
    */
-  function findActiveDeviceByTokenHash(tokenHash) {
-    if (typeof tokenHash !== 'string' || tokenHash === '') return null
-    const match = read().devices.find((device) => sameTokenHash(device.tokenHash, tokenHash))
-    if (match === undefined || match.revokedAt !== null) return null
-    return match
+  function findDeviceById(id) {
+    if (typeof id !== 'string' || id === '') return null
+    const match = read().devices.find((device) => device.id === id)
+    return match === undefined ? null : match
   }
 
   /**
    * Append a device record and persist it.
    *
-   * `id`, `name`, `tokenHash` and `ua` all come from the caller: the store mints
-   * no randomness, and the token is hashed before it ever reaches this module —
-   * no clear token can be persisted here even by mistake.
+   * `id`, `name` and `ua` all come from the caller: the store mints no randomness.
+   * `tokenHash` is accepted only so an old test or an old caller keeps working; the
+   * pairing route no longer passes one, because the credential it hands out is a
+   * JWT and there is nothing to hash (`research/jwt-device-credential.md` §3.6).
    *
    * A malformed record raises `store/invalid-device`, NOT `store/corrupt`: the
    * file on disk is fine, the caller is not, and the error code is what tells the
    * two apart in a log.
    *
-   * @param {{ id: string, name?: string, tokenHash: string, ua?: string }} device
+   * @param {{ id: string, name?: string, tokenHash?: string, ua?: string }} device
    */
   function addDevice(device) {
     if (device === null || typeof device !== 'object') {
@@ -435,7 +462,7 @@ function buildStore(baseDir, now) {
     getSettings,
     updateSettings,
     listDevices,
-    findActiveDeviceByTokenHash,
+    findDeviceById,
     addDevice,
     revokeDevice,
     touchDevice,

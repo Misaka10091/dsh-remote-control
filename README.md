@@ -3,15 +3,16 @@
 Pairing-gated remote access for `dsh web`: open the **same** session from a phone
 or another computer on your LAN, with a device panel and a local audit trail.
 
-> **Status: stages 0–2 of 6.** The package skeleton, the device store, pairing codes,
-> device tokens and the **HTTP gateway** (listener, auth, Origin fence, inner
-> credential, reverse proxy) are implemented and tested. The WebSocket upgrade proxy,
-> the management API, the audit writer and the panel are not written yet — see
-> [Roadmap](#roadmap).
+> **Status: stages 0–5 of 6.** Every host-side piece is implemented and tested: the
+> device store, pairing codes, signed device **JWT**s, the **HTTP gateway** (listener, auth,
+> Origin fence, inner credential, reverse proxy), the **WebSocket upgrade proxy**,
+> the **management API** with the audit trail, and the **pairing flow** on the
+> gateway port (`GET`/`POST /remote-control/pair`) that actually redeems a code.
 >
-> A started gateway forwards **HTTP only** in this build. The live stream rides
-> `/api/remote.mux`, a WebSocket upgrade that stage 3 adds, so a browser that
-> connects today can load and read but its streaming channel will not establish.
+> Stage 6 (real-device verification — phone → scan → open the session → send a
+> message → receive the stream → stop) is the remaining work, and it needs hardware
+> this test suite cannot provide. Everything below is verified over a real gateway
+> on an OS-assigned port; see [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -29,6 +30,74 @@ This plugin takes a different route:
   remote access enabled is identical to a plain `dsh web`.
 - The gateway is a plain authenticating reverse proxy. It does not understand DSH
   internals, so a DSH upgrade does not break it.
+
+## Pairing a device
+
+1. Open the device panel (sidebar, bottom) and choose **Add device**. The host
+   mints an 8-character base32 code with a 120-second lifetime.
+2. Scan the QR — or open the link it encodes. The link is
+   `http://<lan-ip>:<port>/remote-control/pair#<pairId>:<code>`: the pair lives in
+   the **fragment**, which a browser never sends to a server, so the code cannot
+   land in an access log.
+3. The gateway serves a small self-contained page that reads the fragment
+   client-side and POSTs `{ pairId, code }` back to the same path.
+4. On success the gateway **signs a JWT** (HS256) carrying `iss`/`sub`/`aud`/`iat`/
+   `exp`/`jti`/`name`, answers `303` to `/` with `Set-Cookie: dsh-rc-jwt=…;
+   Max-Age=2592000; Path=/; HttpOnly; SameSite=Lax`, and records a `pair` audit
+   event. The token's `sub` is the device id, which is what the gateway looks up.
+5. A wrong code is refused and recorded as `pair_failed`. An expired or
+   already-used code is refused **without** a `pair_failed` line — that is normal
+   behaviour, and a signal a user learns to ignore is a signal that stops working.
+
+The code is never logged, never audited and never written to disk. Without a
+fragment the page shows a manual entry field for the `<pairId>:<code>` pair.
+
+> **Upgrading from an earlier build: every paired device must re-pair.**
+>
+> The device credential used to be an opaque 32-byte random string verified against
+> `sha256` hashes in `devices.json`. It is now a signed JWT, and the cookie is
+> `dsh-rc-jwt` instead of `dsh-rc-device`. The old cookie name is **not** accepted:
+> a second accepted cookie name would be a second code path through the one
+> authorization decision, and the value it holds is not something the JWT verifier
+> can check anyway. There is deliberately **no automatic migration** — exchanging
+> an old hash for a new JWT would be a trust chain nobody designed
+> (`research/jwt-device-credential.md` §3.6). Open the panel and pair each device
+> again; the device table itself keeps its rows, names and history.
+
+## How the credential works
+
+```
+pair:   one-time code  →  POST /remote-control/pair  →  signed JWT in an HttpOnly cookie
+auth:   verify JWT (HS256, iss, aud, exp)  →  look up `sub` in the device table  →  check the revoked set
+```
+
+An **OAuth-shaped** flow: a short-lived single-use code is exchanged for a bearer
+credential that carries the claims the gateway needs. Two pieces make it work, and
+neither is optional:
+
+| Piece | What it answers | Where |
+|---|---|---|
+| Signed JWT | "which device is this, without scanning a hash table?" | `src/host/tokens.js` |
+| Server-side revoked set | "has it been revoked *since* it was signed?" | `src/host/gateway/server.js` |
+
+A **purely stateless** JWT cannot satisfy constraint 5 (吊销必须即时生效): once
+signed, a token is valid until `exp`, and nothing but a server-side list can end it
+early. So the JWT carries `sub` and the gateway keeps a `Set` of revoked ids,
+seeded from `devices.json` at start and updated by `gateway.revokeDevice`. The
+per-request cost is one `Set` lookup — **not** a disk read.
+
+Three details are load-bearing:
+
+- **HS256 only, and the header is compared rather than trusted.** Reading `alg` out
+  of the token and obliging is the classic algorithm-confusion hole. `alg: none`,
+  `HS512`, `RS256` and a lower-case spelling are all refused, before any HMAC is
+  computed. Tests in `tests/tokens.test.mjs` pin each of them.
+- **The name is read from the store, never from the token.** A JWT is a snapshot:
+  a device renamed in the panel would otherwise keep announcing its old label until
+  it re-paired.
+- **Nothing sensitive is in the payload.** A JWT is signed, not encrypted, so
+  `devices.json` is the only place the device's state lives. No inner credential,
+  no token hash, no pairing code, no address.
 
 ## Install
 
@@ -81,6 +150,34 @@ hidden because they decide whether the plugin is appropriate for you.
    code; 20 wrong codes per minute block a source address, independently, so
    rotating the pairing id does not reset the budget. Neither limit makes a
    leaked-then-guessed code impossible — it makes a futile search loud and slow.
+9. **The pairing route is reachable without a cookie, by construction.** A device
+   being paired has no credential yet, so `GET`/`POST /remote-control/pair` are the
+   only paths not gated by the request pipeline below. They are still origin-fenced,
+   still refused while the switch is off, and still bounded by the same brute-force
+   budget — and they never reach the proxy, never mint a device without a valid
+   code, and never touch DSH. The exemption waives the credential and nothing else.
+10. **The device cookie carries no `Secure` attribute.** The LAN transport is plain
+   HTTP; a `Secure` cookie would simply never be sent back, so pairing would appear
+   to succeed and then fail on the next request. It is `HttpOnly; SameSite=Lax`,
+   which is the strongest combination that works over plain HTTP.
+11. **A leaked JWT is that device's full authority until it expires or is revoked.**
+   The token is a bearer credential: anyone who copies the cookie gets the same
+   access, from anywhere on the LAN, with no second factor. It lives 30 days, so
+   the panel's **revoke** button is the way to end it early — and revocation is
+   immediate (see the pipeline below), because the gateway holds a server-side
+   revoked set rather than trusting the token alone.
+12. **The signing key is on disk, and that is the trust anchor.** `jwt-key` in
+   `~/.dsh/remote-control` holds 32 raw bytes at mode `0600`. Anyone who can read
+   that file can mint a device credential for any `sub` — a forged token needs no
+   pairing code. This is the same trust level as "the local account is
+   compromised": the device table and the audit trail sit in that directory too,
+   and a local attacker who can read one can rewrite the others. The key is
+   persisted deliberately — an in-memory key would work perfectly until the next
+   restart and then silently invalidate every paired device.
+13. **A corrupt or unreadable key file refuses to start remote access.** It is not
+   regenerated. Regenerating would invalidate every device *and* hand the decision
+   to whoever damaged the file. Delete it by hand if you intend to un-pair
+   everything.
 
 ## Request pipeline
 
@@ -88,15 +185,24 @@ Every request to the gateway port passes these in order, in exactly one place
 (`src/host/gateway/auth.js`):
 
 ```
-1. loopback socket AND loopback Host?  -> allow (no cookie needed)
-2. valid device cookie?                -> continue;  else 401
+0. /remote-control/pair?                    -> pairing-route.js (no credential yet)
+1. loopback socket AND loopback Host?       -> allow (no cookie needed)
+2. dsh-rc-jwt verifies?  (HS256/iss/aud/exp) -> continue;  else 401
 3. Origin fence:
-     Sec-Fetch-Site: cross-site        -> 403 (always)
-     write with Origin, mismatch Host  -> 403
+     Sec-Fetch-Site: cross-site             -> 403 (always)
+     write with Origin, mismatch Host       -> 403
      write, no Origin, same-origin/same-site declared -> allow
-     write, no Origin, no Sec-Fetch-Site -> 403
-4. device not revoked?                 -> allow;  else 401 + clear the cookie
+     write, no Origin, no Sec-Fetch-Site    -> 403
+4. sub revoked?                             -> 401 + clear the cookie
+   sub unknown to the table?                -> 401
+   otherwise                                -> allow, device name read from the store
 ```
+
+Step 0 is the pairing bootstrap (`gateway/pairing-route.js`) and is the only path
+that runs before step 1 — see security boundary note 9. It is matched exactly
+(`/remote-control/pair` and its trailing-slash spelling, never a prefix), runs the
+same origin fence for its `POST`, re-reads `settings.enabled` per request, and
+answers from process memory without forwarding anything upstream.
 
 Writes are everything except `GET` / `HEAD` / `OPTIONS`. The fourth arm is the
 CSRF rule `design.md` §3.2 asks for; the third exists because not every
@@ -123,24 +229,33 @@ src/
 ├── index.js              # host entry: Cordis plugin (name / inject / apply)
 ├── client.js             # client entry: window.__ModuleLoader__.load wrapper
 └── host/
-    ├── constants.js      # on-disk layout, data-model version, TTLs, file mode
+    ├── constants.js      # on-disk layout, data-model version, TTLs, JWT claims, file mode
     ├── store.js          # devices.json read/write, atomic write, 0600
     ├── pairing.js        # 8-char base32 codes, 120s TTL, one-time redemption, lockout
-    ├── tokens.js         # 32-byte token, sha256 at rest, constant-time compare
+    ├── tokens.js         # device credential: HS256 JWT sign/verify, hand-rolled
+    ├── jwt-key.js        # loads/creates the 32-byte HS256 key, 0600, loud on damage
+    ├── loopback.js       # the loopback predicate shared by both transports
+    ├── origin.js         # Origin / Sec-Fetch-Site fence, four arms + upgrade fence
+    ├── audit.js          # JSONL audit writer, retention sweep, export
+    ├── classify.js       # path + method -> audit event
+    ├── api.js            # /remote-control/api/*, loopback only
     └── gateway/
         ├── server.js     # own http.Server, ctx.effect cleanup, status mapping
-        ├── auth.js       # the single authorization decision (loopback/cookie/origin/revoke)
-        ├── origin.js     # Origin / Sec-Fetch-Site fence, four arms
+        ├── auth.js       # the single authorization decision (loopback/JWT/origin/revoke)
+        ├── origin.js     # re-export of ../origin.js, kept for the public shape
         ├── inner-auth.js # redeem + cache the upstream dsh-auth-* cookie
         ├── proxy.js      # HTTP reverse proxy: A/B/C rewrites, SSE passthrough
+        ├── wsproxy.js    # WebSocket upgrade passthrough, no `ws`
+        ├── pairing-route.js # GET/POST /remote-control/pair, the redeem half
         ├── activity.js   # throttled lastSeenAt persistence
         └── wire.js       # response writers, cookie serialization
 locale/                   # zh / en dictionaries
 tests/                    # node --test
 ```
 
-Domain modules (`store`, `pairing`, `tokens`) never import `gateway/*`: they must
-stay usable from the loopback-only management API and testable without HTTP.
+Domain modules (`store`, `pairing`, `tokens`, `jwt-key`, `audit`, `loopback`, `origin`) never
+import `gateway/*`: they must stay usable from the loopback-only management API and
+testable without HTTP.
 
 ## Notes from measurement
 
@@ -159,6 +274,7 @@ Two costs were measured rather than guessed, and both shaped the design:
 | Data | Location | Notes |
 |---|---|---|
 | Devices and settings | `~/.dsh/remote-control/devices.json` | mode `0600`, atomic write |
+| JWT signing key | `~/.dsh/remote-control/jwt-key` | 32 raw bytes, mode `0600`, generated on first use |
 | Audit trail (stage 4) | `~/.dsh/remote-control/audit-YYYY-MM-DD.jsonl` | UTC days, 30-day retention |
 
 ```jsonc
@@ -166,31 +282,35 @@ Two costs were measured rather than guessed, and both shaped the design:
   "version": 1,
   "devices": [
     {
-      "id": "dev_xxx",
+      "id": "dev_xxx",            // this IS the JWT sub; the row key
       "name": "iPhone · Safari",
-      "tokenHash": "<sha256>",   // the clear token is never stored
       "ua": "...",
       "createdAt": "2026-10-17T...",
       "lastSeenAt": "2026-10-17T...",
       "revokedAt": null,
-      "capabilities": null       // reserved for a future capability allowlist
+      "capabilities": null        // reserved for a future capability allowlist
     }
   ],
   "settings": { "enabled": false, "port": 3090 }
 }
 ```
 
-A device token is shown to the device exactly once, in the pairing response. Only
-its sha256 is persisted. Comparison hashes the presented token, then runs
-`crypto.timingSafeEqual` over both digests — so a wrong-length token fails cleanly
-instead of throwing, and no comparison leaks a length.
+**No credential is persisted.** The device holds the token; the file holds the row.
+That is a stronger property than "only the digest is stored", and it is the point of
+moving to a JWT: the token's authority comes from its signature, so there is
+nothing in the file for an attacker to verify guesses against.
 
-The stored side is validated before it is compared or persisted: a `tokenHash`
-that is not a 64-character lower-case hex digest is a **hard error**
-(`store/corrupt` on load, `store/invalid-device` from `addDevice`). This is not
-pedantry — if a malformed value were folded through the hash like a token, then
-presenting that same literal string would authenticate against it, so a hand-edited
-`devices.json` would turn its own contents into a credential.
+`tokenHash` may still appear in a file written by an **earlier build**. It is read,
+validated and preserved so `version: 1` parses exactly as before — omitting it from
+the shape above is about what this build *writes*, not what it can *read*. Anything
+with a `tokenHash` cannot authenticate any more, because nothing compares a hash to
+a JWT.
+
+The one comparison that must stay constant-time is the signature check, and it does:
+both operands are sha256-digested first, so `crypto.timingSafeEqual` always sees
+32-byte buffers. A raw comparison would throw on a length mismatch, turning a
+rejected credential into a 500 — a distinguishable signal on an unauthenticated
+request.
 
 A `devices.json` that exists but does not parse is a **hard error**
 (`store/corrupt`), not an empty device table — treating it as empty would look
@@ -223,12 +343,13 @@ by advancing a number rather than sleeping.
 ## Roadmap
 
 - [x] **0** Package skeleton, manifest, bundle patch, one-line load
-- [x] **1** Device store, pairing codes, device tokens
+- [x] **1** Device store, pairing codes, device tokens (now signed JWTs)
 - [x] **2** Gateway HTTP: listener, auth, Origin check, inner credential, proxy
   (+ pairing-code lockout, + `lastSeenAt` throttling)
-- [ ] **3** Gateway WebSocket: upgrade auth, `/api/remote.mux` passthrough
-- [ ] **4** Management API (`/remote-control/api/*`, loopback only) and audit
-- [ ] **5** Client panel: enable switch, port, QR pairing, device list, revoke
+- [x] **3** Gateway WebSocket: upgrade auth, `/api/remote.mux` passthrough
+- [x] **4** Management API (`/remote-control/api/*`, loopback only) and audit
+- [x] **5** Client panel: enable switch, port, QR pairing, device list, revoke
+  (+ the pairing route that redeems the code — `gateway/pairing-route.js`)
 - [ ] **6** Real-device verification and documentation
 
 ## License

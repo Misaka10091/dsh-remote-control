@@ -47,6 +47,20 @@
  * use the read arms). No second decision path exists, which is the property
  * `quality-guidelines.md` §8 demands.
  *
+ * ## The pairing bootstrap is the one route authorize() does not gate
+ *
+ * A device being paired has no cookie by definition, so `authorize()` cannot stand
+ * in front of `/remote-control/pair` — the exemption is unavoidable. It is also the
+ * exact shape of the two defects this project already paid for (the stage-2 loopback
+ * exemption and the stage-3 read arms), so it is confined to one module
+ * (`pairing-route.js`) and one path, and the reasoning is written there. The short
+ * version: those defects were holes because the gateway INJECTS the inner
+ * credential and STRIPS `Origin` on its way upstream, so an exempted request arrived
+ * at DSH as an authenticated write. The pairing routes never reach `proxy.js` at
+ * all — they answer from process memory — so the exemption waives the credential
+ * and nothing else, the origin fence still runs in full, and `settings.enabled` is
+ * re-read per request so a switched-off gateway mints nothing.
+ *
  * ## The admin API is refused here, and that refusal is load-bearing
  *
  * `prd.md` R4: pairing grants session access, not administration. The admin API
@@ -65,6 +79,19 @@
  * defence-in-depth extra. `ADMIN_API_PREFIX` is a constant shared with `api.js`,
  * so the two cannot disagree about what is being refused.
  *
+ * ## Revocation is a Set, not a disk read (`prd.md` constraint 5)
+ *
+ * The credential is a signed JWT (`research/jwt-device-credential.md`), which
+ * cannot be un-signed — a stateless token is valid until `exp` by construction.
+ * So this module keeps the other half: a `Set` of revoked device ids, seeded from
+ * the store at start and updated by {@link revokeDevice}. The per-request cost is
+ * one Set lookup against the verified token's `sub`, and a revocation is visible
+ * on the very next request — no TTL, no cache to invalidate, no window.
+ *
+ * The set exists only in this process and is rebuilt from `devices.json` on every
+ * start (`revokedAt !== null` is the durable record), so a restart cannot resurrect
+ * a revoked device.
+ *
  * ## Audit (`prd.md` R5)
  *
  * Every admitted request is classified by `classify.js` (path prefix + method —
@@ -76,8 +103,14 @@
  */
 import { createServer } from 'node:http'
 
-import { ACTIVITY_PERSIST_INTERVAL_MS, ADMIN_API_PREFIX, GATEWAY_BIND_HOST } from '../constants.js'
+import {
+  ACTIVITY_PERSIST_INTERVAL_MS,
+  ADMIN_API_PREFIX,
+  DEVICE_COOKIE_MAX_AGE_SECONDS,
+  GATEWAY_BIND_HOST,
+} from '../constants.js'
 import { classify, classifyUpgrade } from '../classify.js'
+import { loadOrCreateJwtKey } from '../jwt-key.js'
 import { createActivityTracker } from './activity.js'
 import {
   DECISION,
@@ -89,6 +122,7 @@ import {
   statusFor,
 } from './auth.js'
 import { createInnerAuth } from './inner-auth.js'
+import { createPairingRoute, isPairingPath } from './pairing-route.js'
 import { createProxy } from './proxy.js'
 import { clearDeviceCookie, emit, sendError, sendHtml, wantsHtml } from './wire.js'
 import { createUpgradeProxy, refuseUpgrade } from './wsproxy.js'
@@ -118,6 +152,9 @@ export function upstreamFor(officialPort) {
  * @param {number} options.port Port to bind; 0 asks the OS for one (used by tests).
  * @param {string} [options.host] Bind address; defaults to all interfaces.
  * @param {string} options.cookieName Device cookie name.
+ * @param {Buffer} [options.jwtKey] JWT signing key. Omitted = loaded from
+ *   `options.baseDir` (or the store's own `baseDir`, which is where it belongs).
+ * @param {string} [options.baseDir] Runtime directory holding `jwt-key`.
  * @param {() => number} [options.now] Clock, injectable for tests.
  * @param {typeof globalThis.fetch} [options.fetchImpl] Injectable for tests.
  * @param {number} [options.activityIntervalMs] Persist throttle; injectable for tests.
@@ -126,6 +163,8 @@ export function upstreamFor(officialPort) {
  * @param {number} [options.upgradeHeadTimeoutMs] Bound on the wait for an upstream `101`.
  * @param {number} [options.upgradeLingerMs] Grace for a clean upstream WebSocket close.
  * @param {object} [options.audit] Audit writer (`audit.js`). Omitted = nothing is recorded.
+ * @param {object} [options.pairing] Pairing store (`pairing.js`). Omitted = the pairing routes answer 503.
+ * @param {(size: number) => Buffer} [options.random] Random-byte source for device ids and JWTs; injectable for tests.
  * @param {object} [options.logger]
  * @returns {Promise<{
  *   server: import('node:http').Server,
@@ -135,6 +174,9 @@ export function upstreamFor(officialPort) {
  *   innerAuth: ReturnType<typeof createInnerAuth>,
  *   activity: ReturnType<typeof createActivityTracker>,
  *   upgradeProxy: ReturnType<typeof createUpgradeProxy>,
+ *   pairingRoute: ReturnType<typeof createPairingRoute>,
+ *   jwtKey: Buffer,
+ *   isRevoked: (deviceId: string) => boolean,
  *   revokeDevice: (deviceId: string) => { device: object | null, closedSockets: number },
  *   close: () => Promise<void>,
  * }>}
@@ -152,6 +194,40 @@ export async function startGateway(options) {
      `recordSafely` below keeps the call site unconditional, so a future event
      cannot be forgotten just because the writer might be absent. */
   const audit = options.audit !== null && typeof options.audit === 'object' ? options.audit : null
+
+  /* The signing key. Loaded here, at START, and deliberately not caught: a key file
+     that exists but cannot be used must refuse to enable remote access
+     (`research/jwt-device-credential.md` §3.3). Falling back to an in-memory key
+     would work perfectly until the next restart and then silently invalidate every
+     paired device — the exact failure the file exists to prevent.
+     An injected key wins, so a test can sign tokens for a gateway it is about to
+     start without writing a key file first. */
+  const jwtKey = Buffer.isBuffer(options.jwtKey)
+    ? options.jwtKey
+    : loadOrCreateJwtKey({
+      baseDir: typeof options.baseDir === 'string' && options.baseDir !== '' ? options.baseDir : store.baseDir,
+      random: options.random,
+    })
+
+  /**
+   * Revoked device ids, in memory (`prd.md` constraint 5).
+   *
+   * Seeded from the store so a restart cannot resurrect a revoked device, and kept
+   * per-process because that is exactly the lifetime a JWT outlives: a token signed
+   * before the revocation is still signature-valid, and this Set is what makes it
+   * stop working. Rebuilt on the next start from `revokedAt`, which is the durable
+   * record — the Set is a cache of the answer, never the answer itself.
+   */
+  const revokedIds = new Set()
+  for (const device of store.listDevices()) {
+    if (device.revokedAt !== null) revokedIds.add(device.id)
+  }
+
+  /** Whether a device id is revoked. One Set lookup; the hot path's only membership test. */
+  function isRevoked(deviceId) {
+    return typeof deviceId === 'string' && revokedIds.has(deviceId)
+  }
+
 
   /**
    * Record one audit event, or nothing at all.
@@ -219,6 +295,25 @@ export async function startGateway(options) {
     lingerMs: options.upgradeLingerMs,
   })
 
+  /* Stage 6: the pairing bootstrap. Needs the pairing store (in-memory, from
+     `index.js`), the signing key (so it can mint the JWT) and the SAME
+     `recordSafely` funnel every other event uses, so a broken audit writer cannot
+     turn a successful pairing into a 500 — the device would then hold a cookie it
+     was never told about. */
+  const pairingRoute = createPairingRoute({
+    store,
+    pairing: options.pairing,
+    cookieName,
+    jwtKey,
+    record: recordSafely,
+    logger,
+    random: options.random,
+    now,
+    maxAgeSeconds: Number.isInteger(options.maxAgeSeconds) && options.maxAgeSeconds > 0
+      ? options.maxAgeSeconds
+      : DEVICE_COOKIE_MAX_AGE_SECONDS,
+  })
+
   /**
    * Answer one WebSocket upgrade handshake.
    *
@@ -240,7 +335,7 @@ export async function startGateway(options) {
     const peer = peerAddress(socket)
     let verdict
     try {
-      verdict = authorize({ req, store, cookieName, upgrade: true })
+      verdict = authorize({ req, store, cookieName, key: jwtKey, isRevoked, now, upgrade: true })
     } catch (error) {
       /* Store damage (`store/corrupt`) surfaces here, exactly as on the HTTP path.
          An upgrade has no response body, so the socket is destroyed. */
@@ -323,9 +418,20 @@ export async function startGateway(options) {
       return
     }
 
+    /* The pairing bootstrap (`design.md` §3.1, `pairing-route.js`). Dispatched
+       BEFORE `authorize` because a device being paired has no cookie yet — see the
+       module note for why that exemption is safe here and was not safe in stage 2.
+       `return` unconditionally: every pairing request is answered by that module,
+       so nothing on this path can fall through to the proxy and be laundered into
+       an authenticated upstream request. */
+    if (isPairingPath(req?.url) === true) {
+      pairingRoute.handle(req, res)
+      return
+    }
+
     let verdict
     try {
-      verdict = authorize({ req, store, cookieName })
+      verdict = authorize({ req, store, cookieName, key: jwtKey, isRevoked, now })
     } catch (error) {
       /* Store damage (`store/corrupt`) surfaces here. Answering 500 rather than
          letting it escape keeps the response diagnosable; the plugin already
@@ -510,11 +616,26 @@ export async function startGateway(options) {
   /**
    * Revoke a device and close its live connections.
    *
-   * This is the "即时生效" requirement of `prd.md` constraint 5, and it has two
-   * halves that cannot be separated: the store marks the device so the NEXT
-   * request is refused, and every upgraded socket it currently holds is destroyed
-   * so the CURRENT session stops streaming. Doing only the first leaves a revoked
-   * phone watching the session and able to send, indefinitely.
+   * This is the "即时生效" requirement of `prd.md` constraint 5, and it has THREE
+   * halves that cannot be separated:
+   *
+   *   1. the store marks the device, so the panel and the audit agree and a
+   *      restart rebuilds the answer;
+   *   2. the in-memory `Set` gains the id, so the NEXT request is refused without
+   *      a disk read — and, crucially, so a JWT that is still signature-valid and
+   *      still inside its `exp` stops working;
+   *   3. every upgraded socket the device holds is destroyed, so the CURRENT
+   *      session stops streaming.
+   *
+   * Doing only the first leaves a revoked phone watching the session and able to
+   * send, indefinitely. That is exactly what a stateless JWT would have made
+   * permanent, which is why the Set is not an optimisation: it is what makes the
+   * JWT design legal under constraint 5.
+   *
+   * The Set is updated even when `store.revokeDevice` returns null (an unknown id):
+   * adding an id that names nothing is harmless, and the alternative — returning
+   * early — would let a row deleted by hand survive as a usable credential for a
+   * device that a previous revoke had already killed.
    *
    * `store.revokeDevice` is idempotent, so closing sockets on an already-revoked
    * device is harmless and is still done: a socket could in principle have been
@@ -532,6 +653,9 @@ export async function startGateway(options) {
       /* a failed flush must not abort a revocation */
     }
     const device = store.revokeDevice(deviceId)
+    /* Before the socket sweep, so a request landing between the two calls already
+       meets the Set. */
+    if (typeof deviceId === 'string' && deviceId !== '') revokedIds.add(deviceId)
     const closedSockets = upgradeProxy.sockets.closeDevice(deviceId)
     if (closedSockets > 0) {
       emit(
@@ -567,6 +691,9 @@ export async function startGateway(options) {
     innerAuth,
     activity,
     upgradeProxy,
+    pairingRoute,
+    jwtKey,
+    isRevoked,
     revokeDevice,
     close,
   }

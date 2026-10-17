@@ -16,15 +16,32 @@
  *      for the reason spelled out under "Why loopback is not exempt from the
  *      origin fence" below — the exemption waives the credential, never the
  *      origin proof.
- *   2. **Device cookie → else 401.** The credential. Everything below exists for
- *      a request that has already proven it holds one.
+ *   2. **Device JWT → else 401.** The credential. The cookie holds a signed JWT
+ *      (`research/jwt-device-credential.md`); this step verifies the signature,
+ *      the issuer, the audience and the expiry. Nothing below is reached for a
+ *      request that has not proven it holds one.
  *   3. **Origin fence → else 403.** Checked only after the credential, so a
  *      cross-site request without a cookie learns nothing about which check it
  *      failed; and checked before the revocation lookup, because a forged
  *      cross-site write should be refused regardless of the device's state.
- *   4. **Not revoked → allow; revoked → 401 + clear the cookie.** Revocation is
- *      checked LAST so that a client holding a perfectly valid cookie is told
- *      exactly the truth: the credential is no longer accepted.
+ *   4. **Known and not revoked → allow; otherwise 401 (+ clear the cookie when
+ *      revoked).** The token's `sub` is looked up in the device table for the
+ *      device's CURRENT name, and in the in-memory revocation set for its state.
+ *
+ * ## Why the JWT alone is not enough
+ *
+ * A stateless JWT cannot be revoked before `exp`, which `prd.md` constraint 5
+ * forbids: 吊销必须即时生效. So step 4 consults a `Set` of revoked subjects that
+ * `gateway.revokeDevice` maintains. The per-request cost is one Set lookup, not a
+ * disk read — the device table read at step 4 is the price of the *name*, which
+ * must come from the store because a JWT is a snapshot and a renamed device would
+ * otherwise keep announcing its old name.
+ *
+ * A verified JWT whose `sub` names no row is `unauthenticated`: the signature is
+ * good, but signing authority for a device that no longer exists must not be
+ * turned into access. That case is reachable in practice — an operator who deletes
+ * a row from `devices.json` by hand expects the device to stop working, and it
+ * does, on the very next request.
  *
  * ## Why loopback is not exempt from the origin fence
  *
@@ -76,7 +93,7 @@
  * `activity.js`, which the caller invokes after a successful decision — keeping
  * this function pure enough to reason about in isolation.
  */
-import { hashToken, sameTokenHash } from '../tokens.js'
+import { verifyDeviceToken } from '../tokens.js'
 import {
   headerValue,
   isLoopback,
@@ -98,10 +115,11 @@ export { isLoopback, isLoopbackHostname, isLoopbackSocket, peerAddress }
  * Pull a named cookie out of a `Cookie` header.
  *
  * Deliberately not a general RFC 6265 parser. The only cookies consulted are the
- * one device cookie (whose name this package chose, and whose value is
- * base64url) and the inner-credential prefix filter; both are handled correctly
- * by splitting on `;` and trimming. A full parser would be more code with more
- * edge cases and no additional safety here.
+ * one device cookie (whose name this package chose, and whose value is a JWT —
+ * base64url segments and dots, none of which is `;`) and the inner-credential
+ * prefix filter; both are handled correctly by splitting on `;` and trimming. A
+ * full parser would be more code with more edge cases and no additional safety
+ * here.
  *
  * @param {string | undefined} header
  * @param {string} name Exact cookie name.
@@ -123,7 +141,11 @@ export function readCookie(header, name) {
 export const DECISION = {
   /** Admitted. `device` is null for the loopback exemption. */
   ALLOW: 'allow',
-  /** No (or unusable) device cookie — 401. */
+  /**
+   * No device cookie, or one that did not verify, or a verified token whose `sub`
+   * names no row — 401. The three are deliberately one outcome: telling a caller
+   * which of them it hit would confirm whether a device id exists.
+   */
   UNAUTHENTICATED: 'unauthenticated',
   /** Origin fence refused — 403. */
   FORBIDDEN: 'forbidden',
@@ -156,10 +178,19 @@ function fenceFor(req, upgrade) {
  * responses" rule in one place and makes the decision unit-testable without an
  * HTTP server.
  *
+ * `isRevoked` is a predicate over the in-memory revocation set rather than the
+ * store itself (`quality-guidelines.md` §18 — one semantic action, one entry
+ * point). The set is populated from the store at startup and updated by
+ * `gateway.revokeDevice`, so a revocation lands on the NEXT request with no disk
+ * read on the hot path.
+ *
  * @param {object} input
  * @param {import('node:http').IncomingMessage} input.req
  * @param {ReturnType<typeof import('../store.js').createStore>} input.store Device table.
  * @param {string} input.cookieName Name of the device cookie.
+ * @param {Buffer | undefined} input.key JWT signing key (`jwt-key.js`).
+ * @param {(deviceId: string) => boolean} [input.isRevoked] Revocation predicate. Absent = nothing is revoked.
+ * @param {() => number} [input.now] Clock in epoch milliseconds; injectable for tests.
  * @param {boolean} [input.upgrade] Whether this is a WebSocket upgrade handshake.
  * @returns {{
  *   decision: string,
@@ -168,7 +199,7 @@ function fenceFor(req, upgrade) {
  *   reason: string | null,
  * }}
  */
-export function authorize({ req, store, cookieName, upgrade = false }) {
+export function authorize({ req, store, cookieName, key, isRevoked, now, upgrade = false }) {
   const loopback = isLoopback(req)
 
   /* 1. Local access needs no credential (`prd.md` R3, acceptance "本机回环访问全程
@@ -192,19 +223,23 @@ export function authorize({ req, store, cookieName, upgrade = false }) {
     return { decision: DECISION.ALLOW, device: null, loopback: true, reason: null }
   }
 
-  /* 2. The device credential. */
+  /* 2. The device credential: parse and verify the JWT.
+        `verifyDeviceToken` answers `undefined` for every hostile input — a
+        malformed string, `alg: none`, a tampered payload, a wrong key, an expired
+        token, a foreign issuer or audience — so there is exactly ONE failure arm
+        here and no exception can escape into the request listener. */
   const presented = readCookie(headerValue(req, 'cookie'), cookieName)
   if (presented === undefined) {
     return { decision: DECISION.UNAUTHENTICATED, device: null, loopback: false, reason: 'no-cookie' }
   }
 
-  /* Step 2's only work: hash the presented value. */
-  const tokenHash = hashToken(presented)
-
-  /* The scan compares digests in constant time inside the store. A revoked device
-     is NOT returned by it, so the revoked case needs its own lookup below — see
-     the note there for why the two lookups are not redundant. */
-  const active = store.findActiveDeviceByTokenHash(tokenHash)
+  const claims = verifyDeviceToken(presented, key, now === undefined ? {} : { now })
+  if (claims === undefined) {
+    /* A single `unknown-token` reason for every verification failure on purpose:
+       distinguishing "expired" from "bad signature" would tell an attacker which
+       half of their guess was right. */
+    return { decision: DECISION.UNAUTHENTICATED, device: null, loopback: false, reason: 'unknown-token' }
+  }
 
   /* 3. Origin fence (`design.md` §3.2 step 3, `origin.js` for the four arms).
         Runs before revocation is reported: a forged cross-site write is refused
@@ -215,25 +250,41 @@ export function authorize({ req, store, cookieName, upgrade = false }) {
     return { decision: DECISION.FORBIDDEN, device: null, loopback: false, reason: origin.reason }
   }
 
-  /* 4. Revocation. `findActiveDeviceByTokenHash` filters revoked rows out, so a
-        null result means either "no such device" or "revoked device" and the two
-        must be told apart: an unpaired caller gets 401 with no cookie action, a
-        revoked one gets 401 AND a cookie deletion. Re-scanning only when the
-        first lookup missed keeps the common path at one pass over the table, and
-        the re-scan is only reached by a caller who already holds a real token. */
-  if (active === null) {
-    const known = store.listDevices().find(
-      (device) => device.revokedAt !== null && sameTokenHash(device.tokenHash, tokenHash),
-    )
-    if (known !== undefined) {
-      return { decision: DECISION.REVOKED, device: null, loopback: false, reason: 'revoked' }
+  /* 4. Revocation, then existence.
+
+        The Set lookup is the "即时生效" half (`prd.md` constraint 5):
+        `gateway.revokeDevice` writes the store AND this set, so the very next
+        request carrying the SAME still-signature-valid JWT is refused here, before
+        any row is read.
+
+        The revoked arm is answered first so a revoked device still gets the cookie
+        deletion even if its row was afterwards deleted by hand — an operator's
+        revoke is meant to be final, and losing the row must not downgrade the
+        verdict from "revoked, clear the cookie" to "never paired". */
+  const revoked = typeof isRevoked === 'function' && isRevoked(claims.sub) === true
+
+  const device = store.findDeviceById(claims.sub)
+  if (device === null) {
+    return {
+      decision: revoked === true ? DECISION.REVOKED : DECISION.UNAUTHENTICATED,
+      device: null,
+      loopback: false,
+      reason: revoked === true ? 'revoked' : 'unknown-device',
     }
-    return { decision: DECISION.UNAUTHENTICATED, device: null, loopback: false, reason: 'unknown-token' }
+  }
+  if (revoked === true || device.revokedAt !== null) {
+    return { decision: DECISION.REVOKED, device: null, loopback: false, reason: 'revoked' }
   }
 
+  /* The name comes from the STORE, never from `claims.name`. The claim is a
+     snapshot taken at pairing time, so a device the user renamed in the panel
+     would otherwise keep announcing the old label in the audit trail and the log
+     until it happened to re-pair. `design.md` §3.2 and
+     `research/jwt-device-credential.md` §3.2 both require this for exactly that
+     reason. */
   return {
     decision: DECISION.ALLOW,
-    device: { id: active.id, name: active.name, revokedAt: active.revokedAt },
+    device: { id: device.id, name: device.name, revokedAt: device.revokedAt },
     loopback: false,
     reason: null,
   }
@@ -263,6 +314,12 @@ export function statusFor(decision) {
 /**
  * Stable error code for a decision, for the response body and the log line.
  *
+ * `gateway/malformed-token` used to exist for a token that was not even the right
+ * shape. It is gone rather than kept as a defensive arm: `authorize` now collapses
+ * every verification failure into one reason, so no code path could produce it,
+ * and `quality-guidelines.md` §22 requires every row of a mapping to be reachable
+ * — an unreachable branch is a branch nobody tests.
+ *
  * @param {string} decision
  * @param {string | null} reason
  * @returns {string}
@@ -272,9 +329,7 @@ export function codeFor(decision, reason) {
   if (decision === DECISION.FORBIDDEN) {
     return reason === 'cross-site' || reason === 'cross-origin' ? 'gateway/cross-origin' : 'gateway/untrusted-origin'
   }
-  if (decision === DECISION.UNAUTHENTICATED) {
-    return reason === 'malformed-token' ? 'gateway/malformed-token' : 'gateway/unauthenticated'
-  }
+  if (decision === DECISION.UNAUTHENTICATED) return 'gateway/unauthenticated'
   return 'gateway/denied'
 }
 

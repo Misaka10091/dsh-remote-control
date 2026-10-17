@@ -318,6 +318,18 @@ export function apply(ctx, config = {}) {
     port: bindPort,
     host: bindHost,
     cookieName: DEVICE_COOKIE_NAME,
+    /* The JWT signing key (`research/jwt-device-credential.md` §3.3). Left to the
+       gateway to load, pointed at the SAME directory the store resolved, and
+       deliberately not caught: an unreadable or corrupt key file must refuse to
+       enable remote access rather than silently minting a fresh in-memory key that
+       invalidates every paired device at the next restart. */
+    baseDir: runtime.store.baseDir,
+    /* The pairing store is the OTHER half of `design.md` §3.1: `api.js` mints a
+       code on the loopback admin API, and the gateway's `/remote-control/pair`
+       routes redeem it. Both must see the SAME in-memory table, or the code the
+       panel shows can never be spent — which is exactly the state this plugin was
+       in until the pairing routes landed. */
+    pairing: runtime.pairing,
     /* The audit writer, wired LAST so an audit failure can never be mistaken for
        an authorization failure: `server.js` records through `recordSafely`,
        which swallows its own writer's problems. */

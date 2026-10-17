@@ -53,7 +53,7 @@
  * connection reset. `headersSent` is checked before every head, so a late
  * failure destroys the response instead of throwing `ERR_HTTP_HEADERS_SENT`.
  */
-import { ADMIN_API_PREFIX, DEVICE_ID_PREFIX } from './constants.js'
+import { ADMIN_API_PREFIX, DEVICE_ID_PREFIX, PAIRING_ROUTE_PATH } from './constants.js'
 import { dayKeyOf } from './audit.js'
 import { headerValue, isLoopback } from './loopback.js'
 import { checkOrigin } from './origin.js'
@@ -538,7 +538,11 @@ export function startAdminApi(options) {
     /* The QR carries the pair in the FRAGMENT, so the code is never sent to the
        server as part of a navigation and never lands in an access log
        (`design.md` §3.1 step 3). `host` is left for the panel: only it knows
-       which LAN address this machine is reachable on. */
+       which LAN address this machine is reachable on.
+       `pairPath` comes from `constants.js` and is served by
+       `gateway/pairing-route.js` — the panel and the route share one definition, so
+       the link cannot point at a path nothing answers (which is what it did while
+       the redeem half was missing). */
     const fragment = `${pair.pairId}:${pair.code}`
     return {
       status: 200,
@@ -548,7 +552,7 @@ export function startAdminApi(options) {
         expiresAt: new Date(pair.expiresAt).toISOString(),
         ttlMs: pair.expiresAt - pair.createdAt,
         port,
-        pairPath: '/remote-control/pair',
+        pairPath: PAIRING_ROUTE_PATH,
         fragment,
       },
     }
