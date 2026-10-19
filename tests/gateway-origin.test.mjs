@@ -163,6 +163,51 @@ test('a write with no Origin and no Sec-Fetch-Site is rejected', () => {
   assert.equal(verdict.reason, 'no-origin')
 })
 
+/* ------------------------------------------------------------------ *
+ * Referer fallback: real same-origin writes that carry neither marker
+ * ------------------------------------------------------------------ */
+
+test('a same-origin write with no Origin and no Sec-Fetch-Site but a same-origin Referer passes', () => {
+  /* Measured against the running GUI: the device panel's Save and Generate-code
+     buttons issue `POST /remote-control/api/settings` with no `Origin` and no
+     `Sec-Fetch-Site`. Before this arm existed the panel answered 403
+     `admin/cross-origin` and both buttons failed — the feature looked broken
+     while the fence was "working". */
+  const verdict = checkOrigin(request('POST', {
+    host: '127.0.0.1:19387',
+    referer: 'http://127.0.0.1:19387/',
+  }))
+  assert.equal(verdict.ok, true)
+})
+
+test('a cross-site Referer is rejected, so the fallback cannot be borrowed by an attacker', () => {
+  /* A page on evil.example cannot produce a same-origin Referer: the browser owns
+     that header and fills it with the ATTACKER's origin. */
+  const verdict = checkOrigin(request('POST', {
+    host: '127.0.0.1:19387',
+    referer: 'http://evil.example/attack.html',
+  }))
+  assert.equal(verdict.ok, false)
+  assert.equal(verdict.reason, 'cross-origin')
+})
+
+test('Sec-Fetch-Site: cross-site still wins even when the Referer happens to match', () => {
+  /* Arm 1 runs before the fallback and must not be bypassed by a header a proxy
+     or an unusual client could echo back. */
+  const verdict = checkOrigin(request('POST', {
+    host: '127.0.0.1:19387',
+    'sec-fetch-site': 'cross-site',
+    referer: 'http://127.0.0.1:19387/',
+  }))
+  assert.equal(verdict.ok, false)
+  assert.equal(verdict.reason, 'cross-site')
+})
+
+test('an unparsable Referer does not become a pass', () => {
+  const verdict = checkOrigin(request('POST', { host: '127.0.0.1:19387', referer: 'not a url' }))
+  assert.equal(verdict.ok, false)
+})
+
 test('a bare curl POST with no headers at all is rejected', () => {
   const verdict = checkOrigin(request('POST', {}))
   assert.equal(verdict.ok, false)

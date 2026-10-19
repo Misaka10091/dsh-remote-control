@@ -175,8 +175,35 @@ export function checkOrigin(req) {
   /* Arm 3. */
   if (typeof site === 'string' && SAME_SITE_VALUES.has(site.toLowerCase())) return { ok: true }
 
-  /* Arm 4. No Origin, no (usable) Sec-Fetch-Site: nothing proves the origin. */
-  return { ok: false, reason: 'no-origin', detail: 'write request carries neither Origin nor a same-site Sec-Fetch-Site' }
+  /* Arm 4. No Origin, no (usable) Sec-Fetch-Site. Before refusing, consult
+     `Referer`: a same-origin page that issues a write without either marker is
+     real traffic, and the panel does exactly that (measured against the running
+     GUI: `POST /remote-control/api/settings` with no `Origin` and no
+     `Sec-Fetch-Site` was answered 403 `admin/cross-origin`, so pressing Save or
+     Generate-code in the panel failed).
+
+     This does not widen the CSRF surface, because a cross-site write cannot
+     produce a matching `Referer`:
+       - page JavaScript cannot set `Referer`; the browser owns it;
+       - a cross-site page's `Referer` names the ATTACKER's origin, so it fails
+         the same-origin comparison below;
+       - such a request also carries `Origin` (arm 2 rejects it) and usually
+         `Sec-Fetch-Site: cross-site` (arm 1 rejects it);
+       - under `Referrer-Policy: no-referrer` the header is simply absent and we
+         still fall through to the refusal below;
+       - a non-browser client could forge `Referer`, but it can forge every
+         header — and it does not hold the device cookie that makes CSRF
+         interesting. */
+  const referer = headerOf(req, 'referer')
+  if (referer !== undefined) {
+    const refererAuthority = authorityOf(referer)
+    const hostAuthority = authorityOf(`http://${host ?? ''}`)
+    if (refererAuthority !== undefined && refererAuthority === hostAuthority) return { ok: true }
+    return { ok: false, reason: 'cross-origin', detail: 'Referer does not match Host' }
+  }
+
+  /* Arm 5. Nothing at all proves the origin. */
+  return { ok: false, reason: 'no-origin', detail: 'write request carries neither Origin, a same-site Sec-Fetch-Site, nor a same-origin Referer' }
 }
 
 /**
