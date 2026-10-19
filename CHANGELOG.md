@@ -4,6 +4,39 @@ All notable changes to this project are documented here.
 
 Format: `## vX.Y.Z — YYYY-MM-DD`.
 
+## v0.1.1 — 2026-10-19
+
+### Fixed
+
+- **The panel's writes were refused inside the dsh DESKTOP app.** The desktop app
+  serves the GUI from the custom origin `dsh-app://app` and forwards every
+  non-static request to the loopback Host from its Electron main process, which
+  deletes `host`, `origin`, `cookie` and `sec-fetch-site` before the request is
+  made. Every admin write therefore arrived with no origin proof, and the origin
+  fence answered `403 admin/cross-origin`: the panel loaded its state (reads are
+  not fenced) but 保存 / 启用远程接入 / 配对 all failed with 「请求来源被拒绝」.
+  Every admin call now carries a panel marker header
+  (`x-dsh-remote-control-panel`, the one thing that forwarder passes through), and
+  the admin API's fence accepts it through the new `checkAdminOrigin` entry —
+  **only when `Origin` is absent**, so a browser-shaped request is still judged by
+  the existing four arms and a cross-site page still cannot set the header without
+  a CORS preflight this API never approves. The gateway keeps the stricter
+  `checkOrigin` unchanged: it is LAN-reachable and answers preflights through the
+  proxy, so the marker must never widen it.
+
+### Verified
+
+- `checkAdminOrigin` is covered by unit tests (each arm, the marker never
+  outvoting a present `Origin` or `Sec-Fetch-Site`, and the assertion that
+  `gateway/origin.js` does **not** re-export it) and by end-to-end tests over a
+  real socket: the forwarded desktop shape answers `200` with the marker, `403`
+  without it, `403` on a wrong value, and `403` when a cross-site `Origin` is
+  present. A separate test asserts the API answers no CORS preflight, which is
+  what makes the marker unforgeable by a page.
+- Measured against a running desktop install: `POST /remote-control/api/settings`
+  with `Referer: dsh-app://app/`, no `Origin` and no `Sec-Fetch-Site` answered
+  `403 admin/cross-origin` before this change and `200` after it.
+
 ## v0.1.0 — 2026-10-17
 
 First release. A pairing-gated remote-access channel for `dsh web`: open the same

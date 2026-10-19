@@ -15,6 +15,12 @@
  *
  * Read `../origin.js` for the four read arms, the five upgrade arms, and the
  * measured reasons each one is shaped the way it is.
+ *
+ * `checkAdminOrigin` is deliberately NOT re-exported here. It is the same fence
+ * plus an arm that accepts the panel's own marker header, which exists only
+ * because the dsh desktop app strips `Origin` from the requests it forwards to
+ * the loopback port. This listener is reachable from a LAN page and answers
+ * preflights through the proxy, so that arm must never widen it.
  */
 export {
   authorityOf,

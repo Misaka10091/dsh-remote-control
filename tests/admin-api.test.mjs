@@ -439,6 +439,154 @@ test('a same-origin write from the local page is allowed, so the panel works', a
   }
 })
 
+test('a write forwarded by the dsh desktop shell is admitted by the panel marker', async () => {
+  /* Measured on the running desktop app: it serves the GUI from `dsh-app://app`
+     and forwards every non-static request to this loopback port from the Electron
+     main process, deleting `host`, `origin`, `cookie` and `sec-fetch-site` and
+     re-adding only its own Host cookie. So a desktop-issued save arrived with NO
+     origin proof at all, answered `403 admin/cross-origin`: the panel could read
+     (the read arm asks for nothing) but every write — 保存, 启用远程接入 — failed.
+     The panel's marker header is the only proof the shell passes through, and
+     `checkAdminOrigin` accepts it exactly when `Origin` is absent. */
+  const runtime = makeRuntime()
+  const host = await startAdminHost({ runtime })
+  try {
+    const shellWrite = await send({
+      port: host.port,
+      method: 'POST',
+      path: `${ADMIN_API_PREFIX}/devices/dev_1/revoke`,
+      headers: {
+        host: loopbackHost(host.port),
+        referer: 'dsh-app://app/',
+        cookie: 'dsh-auth-example=1',
+        'x-dsh-remote-control-panel': 'panel',
+      },
+      body: '',
+    })
+    assert.equal(shellWrite.status, 200, shellWrite.body)
+    assert.notEqual(runtime.store.listDevices()[0].revokedAt, null, 'the desktop save took effect')
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('the desktop shape WITHOUT the marker is still refused, so the arm is not a blanket hole', async () => {
+  /* The marker is what is accepted, not the absence of Origin. A local script that
+     simply omits every header stays refused, exactly as before this fix. */
+  const runtime = makeRuntime()
+  const host = await startAdminHost({ runtime })
+  try {
+    const unmarked = await send({
+      port: host.port,
+      method: 'POST',
+      path: `${ADMIN_API_PREFIX}/devices/dev_1/revoke`,
+      headers: {
+        host: loopbackHost(host.port),
+        referer: 'dsh-app://app/',
+        cookie: 'dsh-auth-example=1',
+      },
+      body: '',
+    })
+    assert.equal(unmarked.status, 403)
+    assert.equal(JSON.parse(unmarked.body).error.code, 'admin/cross-origin')
+    assert.equal(runtime.store.listDevices()[0].revokedAt, null)
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('the marker never outvotes a present Origin or a cross-site declaration', async () => {
+  /* Arm 2 of the base fence and arm 1 of the whole fence both beat the marker: a
+     browser-originated request always carries `Origin`, so the marker can only ever
+     substitute for a MISSING one. Without this, the arm would be a way around the
+     cross-origin comparison. */
+  const runtime = makeRuntime()
+  const host = await startAdminHost({ runtime })
+  try {
+    const foreignOrigin = await send({
+      port: host.port,
+      method: 'POST',
+      path: `${ADMIN_API_PREFIX}/devices/dev_1/revoke`,
+      headers: {
+        host: loopbackHost(host.port),
+        origin: 'https://evil.example',
+        'x-dsh-remote-control-panel': 'panel',
+      },
+      body: '',
+    })
+    assert.equal(foreignOrigin.status, 403)
+    assert.equal(JSON.parse(foreignOrigin.body).error.code, 'admin/cross-origin')
+
+    const crossSite = await send({
+      port: host.port,
+      method: 'POST',
+      path: `${ADMIN_API_PREFIX}/devices/dev_1/revoke`,
+      headers: {
+        host: loopbackHost(host.port),
+        'sec-fetch-site': 'cross-site',
+        'x-dsh-remote-control-panel': 'panel',
+      },
+      body: '',
+    })
+    assert.equal(crossSite.status, 403)
+    assert.equal(JSON.parse(crossSite.body).error.code, 'admin/cross-origin')
+
+    assert.equal(runtime.store.listDevices()[0].revokedAt, null, 'nothing was revoked')
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('a wrong marker value is not a pass', async () => {
+  const runtime = makeRuntime()
+  const host = await startAdminHost({ runtime })
+  try {
+    const wrongValue = await send({
+      port: host.port,
+      method: 'POST',
+      path: `${ADMIN_API_PREFIX}/devices/dev_1/revoke`,
+      headers: { host: loopbackHost(host.port), 'x-dsh-remote-control-panel': 'yes' },
+      body: '',
+    })
+    assert.equal(wrongValue.status, 403)
+    assert.equal(JSON.parse(wrongValue.body).error.code, 'admin/cross-origin')
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('the API answers no CORS preflight, which is why the marker cannot be forged by a page', async () => {
+  /* The marker is only proof because a cross-site page cannot add a request header:
+     doing so forces a preflight, and this API must never approve one. If this test
+     ever fails, the marker arm stops being a defence and becomes a hole. */
+  const runtime = makeRuntime()
+  const host = await startAdminHost({ runtime })
+  try {
+    const preflight = await send({
+      port: host.port,
+      method: 'OPTIONS',
+      path: `${ADMIN_API_PREFIX}/devices/dev_1/revoke`,
+      headers: {
+        host: loopbackHost(host.port),
+        origin: 'https://evil.example',
+        'access-control-request-method': 'POST',
+        'access-control-request-headers': 'x-dsh-remote-control-panel',
+      },
+    })
+    assert.equal(preflight.headers['access-control-allow-origin'], undefined)
+    assert.equal(preflight.headers['access-control-allow-headers'], undefined)
+    assert.equal(preflight.headers['access-control-allow-credentials'], undefined)
+    assert.ok(preflight.status >= 400, `refused, got ${String(preflight.status)}`)
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
 test('the guard reports both arms independently, for a unit-level assertion', async () => {
   const runtime = makeRuntime()
   const host = await startAdminHost({ runtime })

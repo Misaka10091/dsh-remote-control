@@ -290,6 +290,43 @@ export const AUDIT_CURSOR_SEPARATOR = '.'
 export const ADMIN_API_PREFIX = '/remote-control/api'
 
 /**
+ * Request header the panel's own client stamps on every admin API call.
+ *
+ * ## Why the fence needs a marker at all
+ *
+ * The dsh DESKTOP app (`dsh-app://app`) does not let the renderer talk to the
+ * loopback Host directly: it registers a privileged custom scheme and forwards
+ * every non-static request to the Host itself, with `host`, `origin`,
+ * `cookie` and `sec-fetch-site` DELETED (measured in the shipped Electron main
+ * bundle; the shell re-adds its own Host cookie). So an admin write issued from
+ * the desktop panel arrives with no `Origin` and no `Sec-Fetch-Site` — the exact
+ * shape `origin.js` arm 4 refuses — and `POST /remote-control/api/settings`
+ * answered `403 admin/cross-origin` there while the same click worked in a
+ * browser. Reads were unaffected (the read arm asks for nothing), which is why
+ * the panel looked alive but could not save.
+ *
+ * The shell is not ours to change, so the proof has to travel in the one place
+ * the shell passes through untouched: an ordinary request header, stamped by the
+ * panel client in `src/client.js` (the literal is duplicated there, because the
+ * browser half has no `import`; `tests/client.test.mjs` asserts the two agree).
+ *
+ * ## Why a header is proof enough
+ *
+ * A cross-site page cannot set it: a custom request header makes the request
+ * non-simple, so the browser sends a CORS preflight first, and this API answers
+ * no preflight with an `access-control-allow-*` header (see `sendJson` in
+ * `api.js`) — the preflight fails and the real request is never sent. It is the
+ * same double-submit style defence every framework uses for CSRF, and it is
+ * STRICTLY narrower than deleting arm 4: `checkAdminOrigin` accepts the marker
+ * only when `Origin` is absent entirely, so a browser-shaped request (which
+ * always carries `Origin`) is still judged by arms 1-4 unchanged.
+ */
+export const PANEL_MARKER_HEADER = 'x-dsh-remote-control-panel'
+
+/** Value {@link PANEL_MARKER_HEADER} must carry. Mirrored in `src/client.js`. */
+export const PANEL_MARKER_VALUE = 'panel'
+
+/**
  * The pairing bootstrap path, served on the GATEWAY port (`gateway/pairing-route.js`).
  *
  * Shared with `api.js` — which puts it in the QR payload's `pairPath` — because the

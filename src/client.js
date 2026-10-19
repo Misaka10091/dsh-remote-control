@@ -32,6 +32,20 @@
  * resolved against `document.baseURI`, so a deployment under a sub-path still
  * reaches the API instead of 404-ing at the origin root.
  *
+ * ## The dsh desktop app, and the marker header
+ *
+ * The desktop app is the one host where that 403 was WRONG rather than by design.
+ * It serves this GUI from the custom origin `dsh-app://app` and forwards every
+ * non-static request to the loopback port from the Electron main process, which
+ * deletes `host`, `origin`, `cookie` and `sec-fetch-site` on the way (measured in
+ * the shipped main bundle). A write issued from the panel there therefore carried
+ * no origin proof at all and was refused — the panel loaded its state (reads are
+ * not fenced) and then failed every save with 「请求来源被拒绝」. Every admin call
+ * now carries {@link PANEL_MARKER_HEADER}, which the shell passes through
+ * untouched and a cross-site page cannot add without a preflight the API never
+ * approves; `src/host/origin.js#checkAdminOrigin` accepts it only when `Origin` is
+ * absent, so nothing about the browser path changes.
+ *
  * ## Every side effect is owned by an effect
  *
  * The poll timer, the pairing countdown, the `keydown` listener and the
@@ -135,6 +149,29 @@ window.__ModuleLoader__.load({
      * GUI is served from the origin root, and would 404 silently under a sub-path.
      */
     const API_BASE = 'remote-control/api'
+
+    /**
+     * Marker header sent on every admin API request.
+     *
+     * Duplicated from `src/host/constants.js` on purpose: this half has no
+     * `import`, and the host copy is the one the fence reads. The two must be the
+     * same literal — `tests/client.test.mjs` asserts that — because a mismatch is
+     * silent in one direction only: a stale client still passes in a browser
+     * (where `Origin` matches `Host`) and fails EXCLUSIVELY in the dsh desktop
+     * app, which is the case this header exists for.
+     *
+     * Why it exists at all: the desktop app serves the GUI from `dsh-app://app`
+     * and forwards every non-static request to the loopback Host with `Origin`
+     * and `Sec-Fetch-Site` deleted, so a desktop-issued write carries no origin
+     * proof and the fence refused it (`403 admin/cross-origin` — the panel could
+     * read but never save). A cross-site page cannot add this header without a
+     * CORS preflight the API never approves, which is what makes it usable as the
+     * proof instead of an unconditional hole.
+     */
+    const PANEL_MARKER_HEADER = 'x-dsh-remote-control-panel'
+
+    /** Value {@link PANEL_MARKER_HEADER} must carry; the host compares it exactly. */
+    const PANEL_MARKER_VALUE = 'panel'
 
     /** Id of the injected stylesheet, so a reloaded copy does not add a second one. */
     const STYLE_ID = '@misaka10091/dsh-remote-control/client.css'
@@ -2238,7 +2275,7 @@ window.__ModuleLoader__.load({
            and keeps a future cookie-gated route working unchanged. */
         credentials: 'same-origin',
         cache: 'no-store',
-        headers: { accept: 'application/json' },
+        headers: { accept: 'application/json', [PANEL_MARKER_HEADER]: PANEL_MARKER_VALUE },
         signal,
       }
       if (body !== undefined) {
@@ -3301,6 +3338,9 @@ window.__ModuleLoader__.load({
             method: 'GET',
             credentials: 'same-origin',
             cache: 'no-store',
+            /* The same marker every other admin call carries: a GET passes the
+               fence without it, but one code path is one place to get it right. */
+            headers: { [PANEL_MARKER_HEADER]: PANEL_MARKER_VALUE },
           })
           if (response.ok !== true) {
             throw apiError(classifyFailure(response.status, null, false), response.status, null, 'export refused')
@@ -4227,6 +4267,8 @@ window.__ModuleLoader__.load({
         SEAT,
         SEAT_ID,
         API_BASE,
+        PANEL_MARKER_HEADER,
+        PANEL_MARKER_VALUE,
         TITLE_ID,
         FAILURE_KINDS,
         TABS,

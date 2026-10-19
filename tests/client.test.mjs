@@ -39,6 +39,8 @@ import {
 } from '../src/host/addresses.js'
 import {
   ADDRESS_TEXT_MAX as HOST_ADDRESS_TEXT_MAX,
+  PANEL_MARKER_HEADER as HOST_PANEL_MARKER_HEADER,
+  PANEL_MARKER_VALUE as HOST_PANEL_MARKER_VALUE,
   PUBLIC_ADDRESS_MAX as HOST_PUBLIC_ADDRESS_MAX,
   PUBLIC_LABEL_MAX as HOST_PUBLIC_LABEL_MAX,
 } from '../src/host/constants.js'
@@ -907,6 +909,27 @@ test('the client copies the host limits exactly, not approximately', () => {
   assert.equal(number('PUBLIC_ADDRESS_MAX'), HOST_PUBLIC_ADDRESS_MAX)
   assert.equal(number('PUBLIC_LABEL_MAX'), HOST_PUBLIC_LABEL_MAX)
   assert.equal(number('ADDRESS_TEXT_MAX'), HOST_ADDRESS_TEXT_MAX)
+})
+
+test('the panel marker header is one literal, and every admin call carries it', () => {
+  /* The marker is the only origin proof a DESKTOP-issued write can carry: the dsh
+     desktop app forwards the panel's requests from its main process with `Origin`
+     and `Sec-Fetch-Site` deleted (`src/host/origin.js#checkAdminOrigin`), so a save
+     that omits the header answers `403 admin/cross-origin` there while the very
+     same click works in a browser. That asymmetry is why a silent mismatch between
+     the two halves is worth an assertion: in a browser the header is never
+     consulted, so a divergence would look like a healthy build.
+
+     Compared against the host constants rather than against literals, so renaming
+     the header stays a two-line change. */
+  const { internals } = loadClientBundle().bundle
+  assert.equal(internals.PANEL_MARKER_HEADER, HOST_PANEL_MARKER_HEADER)
+  assert.equal(internals.PANEL_MARKER_VALUE, HOST_PANEL_MARKER_VALUE)
+
+  /* Both request paths — the JSON transport and the audit export — must stamp it.
+     Checked against the source because there is no DOM here to run a fetch. */
+  const stamped = clientSource.split('[PANEL_MARKER_HEADER]: PANEL_MARKER_VALUE').length - 1
+  assert.equal(stamped, 2, 'requestJson and the audit export both send the marker')
 })
 
 test('both copies of effectiveAddress resolve the same matrix', () => {

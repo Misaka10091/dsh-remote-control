@@ -34,8 +34,10 @@
  * supply the proof the caller lacks? It does not — there is no credential being
  * injected and no header being stripped — so the fence is the only thing that
  * distinguishes a same-origin click from a cross-site one, and it must run.
- * It is the HTTP fence (`checkOrigin`, four arms), not the upgrade fence: this
- * API has no upgrade route.
+ * It is {@link checkAdminOrigin}: the four-arm HTTP fence plus the panel-marker
+ * arm the dsh desktop app's forwarding shell needs (`constants.js` —
+ * `PANEL_MARKER_HEADER`, and `origin.js` for the measured reason), and not the
+ * upgrade fence, because this API has no upgrade route.
  *
  * ## No `gateway/*` import
  *
@@ -63,7 +65,7 @@ import {
   parseAuditLimit,
 } from './audit.js'
 import { isLoopback } from './loopback.js'
-import { checkOrigin } from './origin.js'
+import { checkAdminOrigin } from './origin.js'
 
 /** Largest JSON body the admin API accepts. Every documented request is a few dozen bytes. */
 const MAX_BODY_BYTES = 64 * 1024
@@ -372,8 +374,12 @@ export function startAdminApi(options) {
     }
     /* Layer 2b: the fence, on every method and for the loopback arm as well
        (`quality-guidelines.md` §8 — an exemption waives only what it names, and
-       this arm waives nothing: it is an admission rule, not an exemption). */
-    const fence = checkOrigin(req)
+       this arm waives nothing: it is an admission rule, not an exemption).
+       `checkAdminOrigin` and not `checkOrigin`: the desktop app's forwarding shell
+       strips `Origin`/`Sec-Fetch-Site`, so the panel's own marker header is the
+       only proof a desktop-issued write can carry. The gateway keeps the stricter
+       entry — see the note in `gateway/origin.js`. */
+    const fence = checkAdminOrigin(req)
     if (!fence.ok) {
       return {
         ok: false,

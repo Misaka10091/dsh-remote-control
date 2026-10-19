@@ -59,9 +59,12 @@
  * treating it as a read is both correct and the only way a cross-origin preflight
  * can be handled without a special case elsewhere.
  *
- * ## Two entries, because a WebSocket upgrade is a GET with a worse failure mode
+ * ## Three entries, because three callers cannot present the same proof
  *
  * {@link checkOrigin} is the HTTP fence and keeps the four arms above unchanged.
+ * {@link checkAdminOrigin} is the same fence plus one extra arm for the admin API,
+ * because the dsh DESKTOP app strips `Origin` and `Sec-Fetch-Site` before its
+ * forwarder reaches the loopback port (see `constants.js#PANEL_MARKER_HEADER`).
  * {@link checkUpgradeOrigin} is a **separate, stricter** fence for upgrade
  * requests: a browser opens a WebSocket with no CORS preflight at all and is not
  * obliged to send `Sec-Fetch-Site`, so a live `Origin` with no `Sec-Fetch-Site` —
@@ -70,6 +73,8 @@
  * path an `Origin`, when present, must match `Host`; the HTTP path is deliberately
  * not changed, because there a foreign `Origin` on a GET is what CORS is for.
  */
+
+import { PANEL_MARKER_HEADER, PANEL_MARKER_VALUE } from './constants.js'
 
 /** Methods a request may use without proving its origin. */
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS'])
@@ -204,6 +209,64 @@ export function checkOrigin(req) {
 
   /* Arm 5. Nothing at all proves the origin. */
   return { ok: false, reason: 'no-origin', detail: 'write request carries neither Origin, a same-site Sec-Fetch-Site, nor a same-origin Referer' }
+}
+
+/**
+ * Decide whether an **admin API** request passes the origin fence.
+ *
+ * Identical to {@link checkOrigin} except for one extra arm, and the reason is a
+ * measured one rather than a theory: the dsh DESKTOP app serves the GUI from the
+ * custom origin `dsh-app://app` and proxies every non-static request to the
+ * loopback Host from the Electron main process, where it **deletes `host`,
+ * `origin`, `cookie` and `sec-fetch-site`** and re-adds only its own Host cookie.
+ * A write issued by the panel inside the desktop app therefore arrives with no
+ * `Origin` and no `Sec-Fetch-Site` — arm 4's shape — and every save answered
+ * `403 admin/cross-origin` while reads (which the read arm never fences) worked.
+ * Measured against a running GUI: `POST /remote-control/api/settings` with
+ * `Referer: dsh-app://app/` and no `Origin` → 403 `admin/cross-origin`, and the
+ * same request with `Origin: http://127.0.0.1:19387` → 200.
+ *
+ * The extra arm accepts {@link PANEL_MARKER_HEADER} when it carries
+ * {@link PANEL_MARKER_VALUE}, but **only when `Origin` is absent entirely**:
+ *
+ * | # | admin request | verdict |
+ * |---|---|---|
+ * | 1 | `Sec-Fetch-Site: cross-site` | reject — arm 1 of the base fence runs first and cannot be outvoted |
+ * | 2 | `Origin` present | base fence decides; the marker is never consulted |
+ * | 3 | no `Origin`, marker header matches | allow — the panel client stamped it, and a cross-site page cannot (it would need a preflight this API never approves) |
+ * | 4 | no `Origin`, no marker | base fence decides, i.e. same-site `Sec-Fetch-Site`/`Referer` or refusal |
+ *
+ * Arm 2 is what keeps this narrower than deleting arm 4: a browser-originated
+ * request always carries `Origin`, so a cross-site page is judged by the Origin
+ * comparison even if some future deployment ever answered its preflight. The
+ * marker only ever substitutes for a *missing* `Origin`, which is exactly the
+ * shape only a non-browser forwarder (the desktop shell) can produce.
+ *
+ * Deliberately NOT exported through `gateway/origin.js`: the gateway is reachable
+ * from a LAN page and answers CORS preflights through the proxy, so the marker
+ * arm must never widen the fence there. Only `api.js` — loopback-only, and the
+ * one surface a paired device can never reach — calls this.
+ *
+ * Pure: reads the request, returns a verdict, never writes and never throws.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {{ ok: true } | { ok: false, reason: string, detail: string }}
+ */
+export function checkAdminOrigin(req) {
+  const verdict = checkOrigin(req)
+  if (verdict.ok) return verdict
+
+  /* Arm 1 of the base fence is unforgeable and is never outvoted by a header a
+     client can set. Kept explicit so a future edit cannot reorder it by accident. */
+  if (verdict.reason === 'cross-site') return verdict
+
+  /* A browser-originated write always carries `Origin`; when one is present the
+     base fence has already compared it with `Host` and its refusal stands. */
+  if (headerOf(req, 'origin') !== undefined) return verdict
+
+  if (headerOf(req, PANEL_MARKER_HEADER) !== PANEL_MARKER_VALUE) return verdict
+
+  return { ok: true }
 }
 
 /**

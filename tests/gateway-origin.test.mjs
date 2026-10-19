@@ -20,6 +20,9 @@ import {
   checkOrigin,
   isWriteMethod,
 } from '../src/host/gateway/origin.js'
+import * as gatewayFence from '../src/host/gateway/origin.js'
+import { checkAdminOrigin } from '../src/host/origin.js'
+import { PANEL_MARKER_HEADER, PANEL_MARKER_VALUE } from '../src/host/constants.js'
 
 /**
  * A request-shaped object carrying only the headers the fence reads.
@@ -257,4 +260,78 @@ test('a request with no headers object at all does not throw', () => {
   assert.doesNotThrow(() => checkOrigin({ method: 'GET' }))
   assert.equal(checkOrigin({ method: 'GET' }).ok, true)
   assert.equal(checkOrigin({ method: 'POST' }).ok, false)
+})
+
+/* ------------------------------------------------------------------ *
+ * The admin API entry: one extra arm, for the dsh desktop app
+ * ------------------------------------------------------------------ */
+
+test('the desktop shell write is admitted by the panel marker, and only by it', () => {
+  /* Measured shape of a write forwarded by the dsh desktop app: the Electron main
+     process deletes `origin`, `sec-fetch-site`, `host` and `cookie`, so the
+     request reaches the loopback port with no origin proof — arm 4's shape. The
+     panel's own marker is what it can still carry. */
+  const shellWrite = {
+    host: '127.0.0.1:19387',
+    referer: 'dsh-app://app/',
+    cookie: 'dsh-auth-example=1',
+    [PANEL_MARKER_HEADER]: PANEL_MARKER_VALUE,
+  }
+  assert.equal(checkAdminOrigin(request('POST', shellWrite)).ok, true)
+  assert.equal(checkAdminOrigin(request('POST', { ...shellWrite, [PANEL_MARKER_HEADER]: 'yes' })).ok, false)
+  assert.equal(checkAdminOrigin(request('POST', { host: '127.0.0.1:19387', referer: 'dsh-app://app/' })).ok, false)
+  /* The Referer alone is NOT a pass: `dsh-app://` names a non-HTTP authority that
+     can never equal the loopback Host, and treating a foreign Referer as a pass
+     would reopen exactly what the Referer arm closes. */
+  assert.equal(checkAdminOrigin(request('POST', { host: '127.0.0.1:19387', referer: 'dsh-app://app/' })).reason, 'cross-origin')
+})
+
+test('the marker is ignored whenever an Origin is present, and by a cross-site declaration', () => {
+  /* Arm 2 of the base fence still decides a browser-shaped request: a cross-site
+     page always sends `Origin`, so the marker can never be a way around it. */
+  const withMarker = (headers) => request('POST', { [PANEL_MARKER_HEADER]: PANEL_MARKER_VALUE, ...headers })
+
+  assert.equal(checkAdminOrigin(withMarker({ host: '127.0.0.1:19387', origin: 'https://evil.example' })).ok, false)
+  assert.equal(checkAdminOrigin(withMarker({ host: '127.0.0.1:19387', origin: 'https://evil.example' })).reason, 'cross-origin')
+  assert.equal(checkAdminOrigin(withMarker({ host: '127.0.0.1:19387', 'sec-fetch-site': 'cross-site' })).ok, false)
+  assert.equal(checkAdminOrigin(withMarker({ host: '127.0.0.1:19387', 'sec-fetch-site': 'cross-site' })).reason, 'cross-site')
+  /* And a same-origin browser write is still admitted by arm 2, marker or not. */
+  assert.equal(checkAdminOrigin(request('POST', { host: '127.0.0.1:19387', origin: 'http://127.0.0.1:19387' })).ok, true)
+  assert.equal(checkAdminOrigin(withMarker({ host: '127.0.0.1:19387', origin: 'http://127.0.0.1:19387' })).ok, true)
+})
+
+test('the admin entry differs from the gateway fence ONLY by the marker arm', () => {
+  /* The gateway is reachable from a LAN page and answers preflights through the
+     proxy, so the marker must never widen it. This is the assertion that keeps the
+     two entries from drifting into one. */
+  const shellWrite = request('POST', {
+    host: '127.0.0.1:19387',
+    referer: 'dsh-app://app/',
+    [PANEL_MARKER_HEADER]: PANEL_MARKER_VALUE,
+  })
+  assert.equal(checkOrigin(shellWrite).ok, false, 'the gateway fence ignores the marker')
+  assert.equal(checkAdminOrigin(shellWrite).ok, true, 'the admin fence accepts it')
+
+  /* Every other shape agrees between the two entries. */
+  for (const headers of [
+    { host: 'lan:3090', origin: 'http://lan:3090' },
+    { host: 'lan:3090', origin: 'http://evil.example' },
+    { host: 'lan:3090', 'sec-fetch-site': 'same-origin' },
+    { host: 'lan:3090', 'sec-fetch-site': 'cross-site' },
+    { host: 'lan:3090' },
+    { host: '127.0.0.1:19387', referer: 'http://127.0.0.1:19387/' },
+  ]) {
+    assert.deepEqual(
+      checkAdminOrigin(request('POST', headers)),
+      checkOrigin(request('POST', headers)),
+      `same verdict for ${JSON.stringify(headers)}`,
+    )
+  }
+})
+
+test('gateway/origin.js does not re-export the admin entry', () => {
+  /* `gateway/auth.js` imports the module namespace, so an accidental re-export
+     would silently widen the LAN-facing fence. */
+  assert.equal(typeof gatewayFence.checkOrigin, 'function')
+  assert.equal(gatewayFence.checkAdminOrigin, undefined)
 })

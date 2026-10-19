@@ -1,6 +1,6 @@
 {
   "name": "@misaka10091/dsh-remote-control",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Pairing-gated remote access for the dsh web GUI: a self-hosted reverse-proxy gateway, a device panel and a local audit trail, with no relay and no third-party service. | DeepSeek Harness 远程控制插件：配对鉴权网关、设备管理面板与本地审计，官方 dsh web 端口保持仅回环。",
   "type": "module",
   "author": {
