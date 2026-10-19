@@ -263,11 +263,20 @@
 > 测试 396 → 422（+26）。
 
 ## 阶段 6：验证与文档
-- [ ] 真机验证：手机扫码 → 打开会话 → 发消息 → 收流式 → 停止
-- [x] `npm test` / `npm run check:syntax` / `npm pack --dry-run` 三条全绿（421 tests）
-- [ ] README（中英）补 `pairing-route.js` 与配对流程的中文对照
-- [ ] CHANGELOG 首条记录
-- [x] `npm pack --dry-run` 产物完整（`src/host/gateway/pairing-route.js` 已列入 `files`）
+- [ ] **真机验证：手机打开配对链接 → 打开会话 → 发消息 → 收流式 → 停止**
+      **未完成。需要真实手机硬件，本会话无法提供。** 这是唯一剩余的验收项，README、
+      CHANGELOG、`docs/RELEASING.md` 三处都已如实标注为未验证，不得声称已完成。
+      具体未验证的子项：
+      - 真实移动端 Safari/Chrome 是否会在跟随 303 之前应用 `Set-Cookie`
+      - 配对页内联脚本在真机上的行为（`fetch(..., {redirect:'manual'})` 是否返回
+        `opaqueredirect`；代码已防御性同时接受 `redirected === true` 与状态 303）
+      - 真实局域网下的整条链路
+- [x] `npm test` / `npm run check:syntax` / `npm pack --dry-run` 三条全绿（479 tests）
+- [ ] README 中文对照（**未做**：README 目前只有英文。功能不受影响，属于文档完善项，
+      不与验收标准挂钩）
+- [x] CHANGELOG 首条记录（`## v0.1.0 — 2026-10-17`，含已知限制）
+- [x] `npm pack --dry-run` 产物完整（30 个文件，含 `pairing-route.js` 与 `CHANGELOG.md`）
+- [x] `docs/RELEASING.md`：版本双写一致性、`dsh --version` 实测核对 engines、三道验证门
 
 ## 验证命令
 
