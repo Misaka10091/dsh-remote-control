@@ -1,0 +1,26 @@
+name: ci
+
+# Every push to main and every pull request runs the same three gates a release
+# runs, so a tag push is never the first time the suite is executed. No secrets:
+# nothing here needs a credential.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Check entry syntax
+        run: npm run check:syntax
+      - name: Run tests
+        run: npm test
+      - name: Check package contents
+        run: npm pack --dry-run

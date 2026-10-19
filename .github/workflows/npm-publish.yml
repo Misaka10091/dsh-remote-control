@@ -1,0 +1,113 @@
+name: npm-publish
+
+# Publishing credentials come from GitHub OIDC (npm Trusted Publisher) only. This
+# file deliberately references no repository secret at all: `id-token: write` is
+# the single source of authority, and npm binds the resulting provenance to this
+# repository, this workflow filename and the ref checked out below.
+on:
+  push:
+    tags:
+      - 'v[0-9]*.[0-9]*.[0-9]*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag, e.g. v0.1.1'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# Keyed by tag, and never cancelled: a retry of the same tag must be allowed to
+# finish rather than interrupt the run it is meant to resume.
+concurrency:
+  group: npm-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      id-token: write
+      contents: write
+    env:
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      # Always the commit the tag points at, never the branch the run was started
+      # from: the release must ship the code the tag names.
+      - uses: actions/checkout@v6
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Use npm with Trusted Publisher support
+        run: npm install --global npm@11
+      - name: Validate release tag and prepare notes
+        id: release
+        run: node scripts/prepare-release.mjs "$RELEASE_TAG" "$RUNNER_TEMP/release"
+      - name: Check entry syntax
+        run: npm run check:syntax
+      - name: Test package
+        run: npm test
+      - name: Check package contents
+        run: npm pack --dry-run
+      - name: Pack release artifact
+        id: pack
+        shell: bash
+        run: |
+          npm pack --pack-destination "$RUNNER_TEMP/release" --json > "$RUNNER_TEMP/release/pack.json"
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          import path from 'node:path';
+          const [pack] = JSON.parse(fs.readFileSync(path.join(process.env.RUNNER_TEMP, 'release/pack.json'), 'utf8'));
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `tarball=${path.join(process.env.RUNNER_TEMP, 'release', pack.filename)}\n`);
+          NODE
+      - name: Publish package through npm Trusted Publisher
+        env:
+          PACKAGE_SPEC: ${{ steps.release.outputs.package }}@${{ steps.release.outputs.version }}
+          DIST_TAG: ${{ steps.release.outputs.dist_tag }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+        shell: bash
+        run: |
+          # A retry can resume after npm succeeds but GitHub Release creation fails,
+          # so the version is compared rather than assumed absent.
+          if npm view "$PACKAGE_SPEC" dist.integrity --json > "$RUNNER_TEMP/release/published-integrity.json" 2> "$RUNNER_TEMP/release/npm-view-error.log"; then
+            node --input-type=module <<'NODE'
+          import assert from 'node:assert/strict';
+          import fs from 'node:fs';
+          import path from 'node:path';
+          const dir = path.join(process.env.RUNNER_TEMP, 'release');
+          const [pack] = JSON.parse(fs.readFileSync(path.join(dir, 'pack.json'), 'utf8'));
+          const published = JSON.parse(fs.readFileSync(path.join(dir, 'published-integrity.json'), 'utf8'));
+          assert.equal(published, pack.integrity, 'This npm version exists with different content; bump the version instead.');
+          console.log('The identical package is already published; continuing to GitHub Release.');
+          NODE
+          elif grep -q 'E404' "$RUNNER_TEMP/release/npm-view-error.log"; then
+            npm publish "$TARBALL" --access public --tag "$DIST_TAG"
+          else
+            cat "$RUNNER_TEMP/release/npm-view-error.log" >&2
+            exit 1
+          fi
+      - name: Create GitHub Release and upload package
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TARBALL: ${{ steps.pack.outputs.tarball }}
+          PRERELEASE: ${{ steps.release.outputs.prerelease }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "$TARBALL" --clobber
+          else
+            flags=()
+            if [[ "$PRERELEASE" == 'true' ]]; then
+              flags+=(--prerelease --latest=false)
+            fi
+            gh release create "$RELEASE_TAG" "$TARBALL" --verify-tag \
+              --title "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/release/notes.md" "${flags[@]}"
+          fi

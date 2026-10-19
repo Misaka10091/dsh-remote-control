@@ -1,0 +1,3 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "验收时核对不变量与门禁"}
+{"file": ".trellis/spec/backend/index.md", "reason": "质量检查清单"}
+{"file": ".trellis/tasks/10-19-github-release-flow/design.md", "reason": "核对差异表与验证边界是否被如实执行"}

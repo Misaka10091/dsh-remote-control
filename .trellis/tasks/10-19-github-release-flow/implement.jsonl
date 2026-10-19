@@ -1,0 +1,4 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "开发前清单与质量门：发布流也要过同一套门"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "文件级不变量：两份清单版本一致、files 白名单、不得引入依赖"}
+{"file": ".trellis/tasks/10-19-github-release-flow/design.md", "reason": "工作流步骤顺序、幂等分支、与参考实现的差异表、验证边界"}
+{"file": ".trellis/tasks/10-19-github-release-flow/implement.md", "reason": "执行顺序与本地验证命令"}

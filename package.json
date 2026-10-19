@@ -56,8 +56,8 @@
     "src/host/origin.js",
     "src/host/audit.js",
     "src/host/classify.js",
-    "src/host/addresses.js",
     "src/host/api.js",
+    "src/host/addresses.js",
     "src/host/gateway/server.js",
     "src/host/gateway/auth.js",
     "src/host/gateway/origin.js",
@@ -75,7 +75,8 @@
   ],
   "scripts": {
     "test": "node --test \"tests/*.test.mjs\"",
-    "check:syntax": "node --check src/index.js && node --check src/client.js && node --check src/host/constants.js && node --check src/host/store.js && node --check src/host/pairing.js && node --check src/host/tokens.js && node --check src/host/jwt-key.js && node --check src/host/loopback.js && node --check src/host/origin.js && node --check src/host/audit.js && node --check src/host/classify.js && node --check src/host/api.js && node --check src/host/gateway/server.js && node --check src/host/gateway/auth.js && node --check src/host/gateway/origin.js && node --check src/host/gateway/inner-auth.js && node --check src/host/gateway/proxy.js && node --check src/host/gateway/wsproxy.js && node --check src/host/gateway/activity.js && node --check src/host/gateway/pairing-route.js && node --check src/host/gateway/wire.js"
+    "version": "node -e \"const fs=require('fs');const m=JSON.parse(fs.readFileSync('dsh.plugin.json','utf8'));const v=JSON.parse(fs.readFileSync('package.json','utf8')).version;m.version=v;fs.writeFileSync('dsh.plugin.json',JSON.stringify(m,null,2)+'\\n')\" && git add dsh.plugin.json",
+    "check:syntax": "node --check src/index.js && node --check src/client.js && node --check src/host/constants.js && node --check src/host/addresses.js && node --check src/host/store.js && node --check src/host/pairing.js && node --check src/host/tokens.js && node --check src/host/jwt-key.js && node --check src/host/loopback.js && node --check src/host/origin.js && node --check src/host/audit.js && node --check src/host/classify.js && node --check src/host/api.js && node --check src/host/gateway/server.js && node --check src/host/gateway/auth.js && node --check src/host/gateway/origin.js && node --check src/host/gateway/inner-auth.js && node --check src/host/gateway/proxy.js && node --check src/host/gateway/wsproxy.js && node --check src/host/gateway/activity.js && node --check src/host/gateway/pairing-route.js && node --check src/host/gateway/wire.js && node --check scripts/prepare-release.mjs"
   },
   "keywords": [
     "dsh",
