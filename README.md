@@ -1,392 +1,327 @@
 # @misaka10091/dsh-remote-control
 
-Pairing-gated remote access for `dsh web`: open the **same** session from a phone
-or another computer on your LAN, with a device panel and a local audit trail.
+为 `dsh web` 增加一层配对门控的远程接入：手机或局域网里的另一台电脑可以打开**同一个**会话，
+附带一个设备管理面板和一份本地审计记录。
 
-> **Status: stages 0–5 of 6.** Every host-side piece is implemented and tested: the
-> device store, pairing codes, signed device **JWT**s, the **HTTP gateway** (listener, auth,
-> Origin fence, inner credential, reverse proxy), the **WebSocket upgrade proxy**,
-> the **management API** with the audit trail, and the **pairing flow** on the
-> gateway port (`GET`/`POST /remote-control/pair`) that actually redeems a code.
+> **状态：6 个阶段完成 0–5。** 宿主侧每一块都已实现并测试：设备存储、配对码、签名的设备
+> **JWT**、**HTTP 网关**（监听、鉴权、Origin 围栏、内层凭证、反向代理）、**WebSocket 升级代理**、
+> 带审计的**管理 API**，以及网关端口上真正能兑换配对码的**配对流程**
+> （`GET`/`POST /remote-control/pair`）。
 >
-> Stage 6 (real-device verification — phone → open the pairing link → open the
-> session → send a message → receive the stream → stop) is the remaining work, and
-> it needs hardware this test suite cannot provide. Everything below is verified
-> over a real gateway on an OS-assigned port; see [Roadmap](#roadmap).
+> 阶段 6（真机验证——手机 → 打开配对链接 → 打开会话 → 发消息 → 收流 → 停止）是剩下的事，
+> 它需要这套测试提供不了的硬件。以下所有内容都在真实网关、OS 分配的端口上验证过；
+> 进度见[路线图](#路线图)。
 
-## Why this exists
+## 为什么需要它
 
-`dsh web` binds `127.0.0.1`, so the moment you leave your desk the agent becomes
-unobservable and un-interruptible. Community options either route traffic through
-an external relay (a third party you have to trust) or give every paired device
-full access with no boundary to tighten later.
+`dsh web` 绑定在 `127.0.0.1`，你一离开工位，agent 就变得既不可观测也无法干预。
+社区方案要么把流量绕经外部中转（一个你不得不信任的第三方），要么让每台配对设备获得完整权限、
+以后想收紧都没有边界。
 
-This plugin takes a different route:
+这个插件选了另一条路：
 
-- The **official `dsh web` port stays on loopback**. The plugin opens its own
-  listener as the *only* remote entry point.
-- An unpaired request is rejected **before** it reaches DSH at all.
-- Local loopback access never goes through the gateway, so behaviour without
-  remote access enabled is identical to a plain `dsh web`.
-- The gateway is a plain authenticating reverse proxy. It does not understand DSH
-  internals, so a DSH upgrade does not break it.
+- **官方 `dsh web` 端口始终留在回环**。插件自己开一个监听，作为*唯一*的远程入口。
+- 未配对的请求在到达 DSH **之前**就被拒绝。
+- 本机回环访问从不经过网关，所以未开启远程接入时，行为与原生 `dsh web` 完全一致。
+- 网关就是一个纯鉴权反向代理。它不理解 DSH 内部，所以 DSH 升级不会把它弄坏。
 
-## Pairing a device
+## 配对一台设备
 
-1. Open the device panel (sidebar, bottom) and choose **Add device**. The host
-   mints an 8-character base32 code with a 120-second lifetime, shown grouped as
-   `XXXX-XXXX` with a copy button, beside a **QR code** of the same pairing link.
-2. Scan the QR with the phone camera, or open the link
-   `http://<lan-ip>:<port>/remote-control/pair#<pairId>:<code>` on the device, or
-   type the code into the manual entry field. The pair lives in the **fragment**,
-   which a browser never sends to a server, so the code cannot land in an access
-   log.
-3. The gateway serves a small self-contained page that reads the fragment
-   client-side and POSTs `{ pairId, code }` back to the same path.
-4. On success the gateway **signs a JWT** (HS256) carrying `iss`/`sub`/`aud`/`iat`/
-   `exp`/`jti`/`name`, answers `303` to `/` with `Set-Cookie: dsh-rc-jwt=…;
-   Max-Age=2592000; Path=/; HttpOnly; SameSite=Lax`, and records a `pair` audit
-   event. The token's `sub` is the device id, which is what the gateway looks up.
-5. A wrong code is refused and recorded as `pair_failed`. An expired or
-   already-used code is refused **without** a `pair_failed` line — that is normal
-   behaviour, and a signal a user learns to ignore is a signal that stops working.
+1. 打开设备面板（侧栏底部「远程连接」）。面板**顶部**是总开关与端口，
+   下面四个 tab：**配对 / 接入 / 设备 / 审计**。在「配对」里选好接入地址
+   （局域网网卡 IP，或你自己配置的公网地址），点**生成配对码**。
+   宿主生成一个 8 位 base32 码，有效期 120 秒，按 `XXXX-XXXX` 分组显示并带复制按钮，
+   旁边是同一个配对链接的**二维码**。
+2. 用手机相机扫码，或在设备上打开链接
+   `http://<lan-ip>:<port>/remote-control/pair#<pairId>:<code>`，
+   或把码输入页面上的手动输入框。这对值放在 URL 的 **fragment** 里，
+   浏览器从不把 fragment 发给服务器，所以配对码不会落进访问日志。
+3. 网关返回一个自包含的小页面，由它在浏览器端读取 fragment，并把
+   `{ pairId, code }` POST 回同一路径。
+4. 成功后网关**签发 JWT**（HS256），载荷含 `iss`/`sub`/`aud`/`iat`/`exp`/`jti`/`name`，
+   以 `303` 跳回 `/` 并下发 `Set-Cookie: dsh-rc-jwt=…; Max-Age=2592000; Path=/; HttpOnly; SameSite=Lax`，
+   同时记一条 `pair` 审计。`sub` 就是设备 id，网关后续靠它查表。
+5. 码错了会被拒绝，并记 `pair_failed`。码过期或已用过会被拒绝，但**不**记
+   `pair_failed`——那是正常行为，一个用户学会忽略的信号等于没有信号。
 
-The code is never logged, never audited and never written to disk. Without a
-fragment the page shows a manual entry field for the `<pairId>:<code>` pair.
+配对码从不写日志、不进审计、不落盘。没有 fragment 时，页面显示手动输入 `<pairId>:<code>` 的输入框。
 
-> **The QR code is hand-written and byte-mode only.** No dependency was added: the
-> encoder (byte mode, error-correction level M, versions 1–15, mask chosen by the
-> N1–N4 penalty) is plain JavaScript in the browser half. It is verified by
-> bit-for-bit comparison against node-qrcode — a development-time tool that is
-> **not** a dependency — for 6 texts × 8 masks plus 8 automatic version/mask
-> choices, and its output was read back by an independent decoder for v1–v11.
-> Two consequences worth knowing:
+> **二维码是手写的，且只做 byte 模式。** 没有为此引入依赖：编码器（byte 模式、纠错等级 M、
+> 版本 1–15、掩码按 N1–N4 罚分选择）就是客户端半边里的普通 JavaScript。
+> 它用 6 段文本 × 8 个掩码、外加 8 组自动版本/掩码，与 node-qrcode（**开发期**工具，
+> 不是依赖）逐位比对，并用一个独立解码器回读了 v1–v11 的输出。两点后果值得知道：
 >
-> - It never segments a link into numeric / alphanumeric / byte runs, so a symbol
->   can be one or two versions larger than the theoretical minimum. Predictable
->   and verifiable beats smallest.
-> - The symbol is always dark modules on a light surround, dark theme included. It
->   uses the theme-independent members of the design token set (never a literal
->   colour), because the theme-following pair inverts the symbol on a dark theme
->   and some scanners refuse a light-on-dark code. Its four-module quiet zone is
->   part of the geometry, so it scales with the symbol instead of disappearing on
->   the smallest one.
+> - 它不会把链接拆成数字段 / 字母数字段 / 字节段，所以符号可能比理论最小值大一到两个版本。
+>   可预测、可验证，比最小更重要。
+> - 符号永远是浅底深点，深色主题下也一样。它用的是设计 token 里**不随主题翻转**的那一组
+>   （从不写死颜色），因为跟随主题的那一对会在深色主题下把符号反相，而有些扫码器拒绝
+>   浅色点深色底的码。四模块静区是几何的一部分，随符号缩放，不会在最小的符号上消失。
 >
-> A link longer than v15-M can hold (412 bytes) shows a message and keeps the text
-> code and the link — nothing is ever truncated. And **no real phone has scanned
-> one of these yet**: the automated verification is a reference encoder plus an
-> independent decoder, not a camera.
+> 超过 v15-M 容量的链接（412 字节）会给出提示，并保留文本码与链接——**绝不截断**。
+> 另外：**还没有任何真机扫过这个码**，自动化验证是「参考编码器 + 独立解码器」，不是摄像头。
+> 「接入」tab 只管公网地址簿（增、删、备注、标出使用中）；「审计」tab 除了计数与导出，
+> 还能看最近的事件明细，并按动作筛选。
 
-> **Upgrading from an earlier build: every paired device must re-pair.**
+> **从早期版本升级：所有已配对设备都必须重新配对。**
 >
-> The device credential used to be an opaque 32-byte random string verified against
-> `sha256` hashes in `devices.json`. It is now a signed JWT, and the cookie is
-> `dsh-rc-jwt` instead of `dsh-rc-device`. The old cookie name is **not** accepted:
-> a second accepted cookie name would be a second code path through the one
-> authorization decision, and the value it holds is not something the JWT verifier
-> can check anyway. There is deliberately **no automatic migration** — exchanging
-> an old hash for a new JWT would be a trust chain nobody designed
-> (`research/jwt-device-credential.md` §3.6). Open the panel and pair each device
-> again; the device table itself keeps its rows, names and history.
+> 设备凭证过去是 32 字节随机串，用 `devices.json` 里的 `sha256` 摘要比对；现在是签名的 JWT，
+> cookie 名也从 `dsh-rc-device` 变成 `dsh-rc-jwt`。**不接受**旧 cookie 名：多接受一个
+> cookie 名，就等于在唯一那处鉴权决定上多开一条代码路径，而它存的值本来也不是 JWT 校验器
+> 能检查的东西。这里**故意不做自动迁移**——把旧哈希换成新 JWT 会是一条没人设计过的信任链
+> （`research/jwt-device-credential.md` §3.6）。打开面板，把每台设备重新配对一次即可；
+> 设备表里的行、名字和历史都保留。
 
-## How the credential works
+## 凭据是怎么工作的
 
 ```
-pair:   one-time code  →  POST /remote-control/pair  →  signed JWT in an HttpOnly cookie
-auth:   verify JWT (HS256, iss, aud, exp)  →  look up `sub` in the device table  →  check the revoked set
+配对：  一次性码  →  POST /remote-control/pair  →  签名的 JWT 写进 HttpOnly cookie
+鉴权：  验 JWT（HS256、iss、aud、exp）  →  用 `sub` 查设备表  →  查吊销集合
 ```
 
-An **OAuth-shaped** flow: a short-lived single-use code is exchanged for a bearer
-credential that carries the claims the gateway needs. Two pieces make it work, and
-neither is optional:
+这是一条 **OAuth 形状**的流程：用短命的一次性码换一个携带网关所需声明的 bearer 凭证。
+两件东西让它成立，缺一不可：
 
-| Piece | What it answers | Where |
+| 组成 | 它回答什么 | 位置 |
 |---|---|---|
-| Signed JWT | "which device is this, without scanning a hash table?" | `src/host/tokens.js` |
-| Server-side revoked set | "has it been revoked *since* it was signed?" | `src/host/gateway/server.js` |
+| 签名的 JWT | 「这是哪台设备，且不用扫哈希表？」 | `src/host/tokens.js` |
+| 服务端吊销集合 | 「它签出来之后有没有被吊销？」 | `src/host/gateway/server.js` |
 
-A **purely stateless** JWT cannot satisfy constraint 5 (吊销必须即时生效): once
-signed, a token is valid until `exp`, and nothing but a server-side list can end it
-early. So the JWT carries `sub` and the gateway keeps a `Set` of revoked ids,
-seeded from `devices.json` at start and updated by `gateway.revokeDevice`. The
-per-request cost is one `Set` lookup — **not** a disk read.
+**纯无状态**的 JWT 满足不了约束 5（吊销必须即时生效）：一经签发，它到 `exp` 之前都有效，
+只有服务端的列表能提前结束它。所以 JWT 里带 `sub`，网关维护一个已吊销 id 的 `Set`，
+启动时从 `devices.json` 填充，由 `gateway.revokeDevice` 更新。每个请求的代价是一次 `Set` 查找，
+**不是**一次磁盘读。
 
-Three details are load-bearing:
+三个细节是承重的：
 
-- **HS256 only, and the header is compared rather than trusted.** Reading `alg` out
-  of the token and obliging is the classic algorithm-confusion hole. `alg: none`,
-  `HS512`, `RS256` and a lower-case spelling are all refused, before any HMAC is
-  computed. Tests in `tests/tokens.test.mjs` pin each of them.
-- **The name is read from the store, never from the token.** A JWT is a snapshot:
-  a device renamed in the panel would otherwise keep announcing its old label until
-  it re-paired.
-- **Nothing sensitive is in the payload.** A JWT is signed, not encrypted, so
-  `devices.json` is the only place the device's state lives. No inner credential,
-  no token hash, no pairing code, no address.
+- **只接受 HS256，且 header 是比对而不是信任。** 从令牌里读 `alg` 再照办，就是经典的算法混淆漏洞。
+  `alg: none`、`HS512`、`RS256`，以及小写拼写，全部在任何 HMAC 计算之前拒绝。
+  `tests/tokens.test.mjs` 为每一种都钉了断言。
+- **名字从存储里读，绝不从令牌里读。** JWT 是快照：否则在面板里改过名的设备会一直自称旧名字，
+  直到它重新配对。
+- **载荷里没有敏感数据。** JWT 是签名不是加密，所以设备状态只存在于 `devices.json`。
+  不放内层凭证、不放令牌摘要、不放配对码、不放地址。
 
-## Install
+## 安装
 
 ```bash
 dsh plugin --profile <name> add @misaka10091/dsh-remote-control
 ```
 
-The `dsh.bundle.patch` declaration inserts one loader row
-(`id: remote-control`); no profile file needs editing. The web half is served
-through `exports["./client"]` and mounted by the browser boot graph.
+`dsh.bundle.patch` 声明会插入一条 loader 行（`id: remote-control`），不需要改 profile 文件。
+客户端半边通过 `exports["./client"]` 提供，由浏览器 boot 图挂载。
 
-To install a local checkout instead of the registry package:
+要装本地 checkout 而不是 registry 上的包：
 
 ```bash
 dsh plugin --profile <name> add link:/absolute/path/to/dsh-remote-control
 ```
 
-> The `desktop` profile is managed by the Electron app and rejects CLI plugin
-> commands. Use a CLI profile (`web`) for install verification.
+> `desktop` profile 由 Electron 应用托管，会拒绝 CLI 插件命令。验证安装请用 CLI profile（`web`）。
 
-## Security boundary — read this
+## 安全边界（务必读）
 
-This is the MVP, and these limits are deliberate. They are documented rather than
-hidden because they decide whether the plugin is appropriate for you.
+这是 MVP，下面这些限制是**刻意的**。写出来而不是藏起来，因为它们决定这个插件是否适合你。
 
-1. **No transport encryption.** The gateway speaks plain HTTP on the LAN, so a
-   passive listener on the same network segment can read session traffic. For TLS,
-   put your own reverse proxy in front of it, or use Tailscale (or a similar
-   private overlay) — the plugin does not build either in.
-2. **A device token is full control.** All paired devices are equivalent: there is
-   no per-device capability allowlist yet (PRD D6). The data model and the
-   judgement point reserve room for one; MVP does not implement it.
-3. **`SameSite=Lax` + Origin checks stop cross-site writes**, including requests
-   from a malicious page on another origin. They do **not** stop same-site XSS or
-   a malicious program already running on the host.
-4. **Revocation is forward-looking.** Revoking a device rejects its new requests
-   and closes its live connections; it does not undo actions already performed.
-5. **Disabled means gone.** Turning the plugin off (or killing the process) closes
-   the listener; no port is left behind.
-6. **The inner credential never leaves the server.** The gateway must present a
-   `dsh-auth-*` cookie to the upstream port (the official port authenticates even
-   loopback requests). That cookie is equivalent to full access to the whole DSH
-   instance, so it exists only on the gateway → upstream hop and is never sent to
-   a client, logged, or placed in an audit record.
-7. **Local traffic is not authenticated at the gateway.** A request that both
-   arrives over a loopback socket *and* names a loopback `Host` is exempt from
-   pairing, which is what keeps the desktop browser and CLI tools working. Both
-   halves are required: a loopback socket alone is what DNS rebinding produces.
-8. **Guessing is rate-limited, not impossible.** Five wrong codes destroy a pairing
-   code; 20 wrong codes per minute block a source address, independently, so
-   rotating the pairing id does not reset the budget. Neither limit makes a
-   leaked-then-guessed code impossible — it makes a futile search loud and slow.
-9. **The pairing route is reachable without a cookie, by construction.** A device
-   being paired has no credential yet, so `GET`/`POST /remote-control/pair` are the
-   only paths not gated by the request pipeline below. They are still origin-fenced,
-   still refused while the switch is off, and still bounded by the same brute-force
-   budget — and they never reach the proxy, never mint a device without a valid
-   code, and never touch DSH. The exemption waives the credential and nothing else.
-10. **The device cookie carries no `Secure` attribute.** The LAN transport is plain
-   HTTP; a `Secure` cookie would simply never be sent back, so pairing would appear
-   to succeed and then fail on the next request. It is `HttpOnly; SameSite=Lax`,
-   which is the strongest combination that works over plain HTTP.
-11. **A leaked JWT is that device's full authority until it expires or is revoked.**
-   The token is a bearer credential: anyone who copies the cookie gets the same
-   access, from anywhere on the LAN, with no second factor. It lives 30 days, so
-   the panel's **revoke** button is the way to end it early — and revocation is
-   immediate (see the pipeline below), because the gateway holds a server-side
-   revoked set rather than trusting the token alone.
-12. **The signing key is on disk, and that is the trust anchor.** `jwt-key` in
-   `~/.dsh/remote-control` holds 32 raw bytes at mode `0600`. Anyone who can read
-   that file can mint a device credential for any `sub` — a forged token needs no
-   pairing code. This is the same trust level as "the local account is
-   compromised": the device table and the audit trail sit in that directory too,
-   and a local attacker who can read one can rewrite the others. The key is
-   persisted deliberately — an in-memory key would work perfectly until the next
-   restart and then silently invalidate every paired device.
-13. **A corrupt or unreadable key file refuses to start remote access.** It is not
-   regenerated. Regenerating would invalidate every device *and* hand the decision
-   to whoever damaged the file. Delete it by hand if you intend to un-pair
-   everything.
+1. **没有传输加密。** 网关在局域网上说的是明文 HTTP，同一网段的被动监听者可以读到会话流量。
+   要 TLS 就在前面放自己的反向代理，或用 Tailscale（或类似的私有组网）——插件事先不内置任何一种。
+2. **设备令牌就是完整控制权。** 所有配对设备等价：还没有按设备的能力白名单（PRD D6）。
+   数据模型和判定点给它留了位置，MVP 不实现。
+3. **`SameSite=Lax` + Origin 校验能挡住跨站写**，包括来自其他源恶意页面的请求。它们**挡不住**
+   同站 XSS，也挡不住已经在主机上运行的恶意程序。
+4. **吊销只面向未来。** 吊销一台设备会拒绝它的新请求并关闭它的在线连接，不会撤销已经做完的动作。
+5. **关掉就等于消失。** 关闭插件（或杀掉进程）会关闭监听，不留下任何端口。
+6. **内层凭证从不离开服务器。** 网关必须向官方端口出示一个 `dsh-auth-*` cookie
+   （官方端口连回环请求也鉴权）。那个 cookie 等价于整台 DSH 实例的完整访问权，
+   所以它只存在于「网关 → 上游」这一跳，从不发给客户端、从不写日志、从不进审计。
+7. **本机流量不在网关鉴权。** 同时满足「回环 socket」与「回环 `Host`」的请求免配对，
+   这是桌面浏览器与 CLI 工具还能工作的原因。两半必须同时成立：只有回环 socket 正是
+   DNS rebinding 能造出来的东西。
+8. **猜码是限速的，不是不可能的。** 5 次错码销毁一个配对码；每分钟 20 次错码独立封禁一个来源地址，
+   所以换 `pairId` 也重置不了额度。两条限制都不能让「泄露后猜中」变成不可能——
+   它们只是让无效搜索变得又吵又慢。
+9. **配对路由按设计就是无 cookie 可达的。** 正在配对的设备还没有凭证，所以
+   `GET`/`POST /remote-control/pair` 是下面那条请求流水线唯一不拦的路径。
+   它们仍然过 Origin 围栏、仍然在开关关闭时被拒、仍然受同一套暴力破解预算约束——
+   并且它们从不进入代理、没有有效码就不会签发设备、也从不触碰 DSH。
+   这个豁免只豁免凭证，别无其他。
+10. **设备 cookie 不带 `Secure`。** 局域网传输是明文 HTTP，`Secure` cookie 根本不会被回传，
+    于是配对看起来成功、下一次请求就失败。它是 `HttpOnly; SameSite=Lax`，
+    这是在明文 HTTP 上还能工作的最强组合。
+11. **泄露的 JWT 在该设备被吊销或过期前就是它的全部权限。** 令牌是 bearer 凭证：
+    复制到 cookie 的人从局域网任何位置都能获得同样的访问，没有第二因子。
+    它活 30 天，所以面板上的**吊销**按钮才是提前结束它的方式——而吊销是即时的
+    （见下面的流水线），因为网关持有服务端吊销集合，而不是只信令牌。
+12. **签名密钥在磁盘上，那就是信任锚。** `~/.dsh/remote-control/jwt-key` 里是 32 个原始字节，
+    权限 `0600`。能读这个文件的人可以为任意 `sub` 造一张设备凭证——伪造令牌连配对码都不需要。
+    这与「本机账户已被攻破」是同一信任级别：设备表与审计也在那个目录里，
+    能读一个的本地攻击者同样能改另外两个。密钥是刻意持久化的——内存中的密钥会完美工作到
+    下次重启，然后静默地让所有已配对设备失效。
+13. **密钥文件损坏或读不了时，远程接入拒绝启动。** 不会重新生成：重新生成会让所有设备失效，
+    *并且*把决定权交给弄坏文件的人。确实想全部取消配对，就手工删掉它。
 
-## Request pipeline
+## 请求流水线
 
-Every request to the gateway port passes these in order, in exactly one place
-(`src/host/gateway/auth.js`):
+所有到达网关端口的请求，按这个顺序、**只在一个地方**过检（`src/host/gateway/auth.js`）：
 
 ```
-0. /remote-control/pair?                    -> pairing-route.js (no credential yet)
-1. loopback socket AND loopback Host?       -> allow (no cookie needed)
-2. dsh-rc-jwt verifies?  (HS256/iss/aud/exp) -> continue;  else 401
-3. Origin fence:
-     Sec-Fetch-Site: cross-site             -> 403 (always)
-     write with Origin, mismatch Host       -> 403
-     write, no Origin, same-origin/same-site declared -> allow
-     write, no Origin, no Sec-Fetch-Site    -> 403
-4. sub revoked?                             -> 401 + clear the cookie
-   sub unknown to the table?                -> 401
-   otherwise                                -> allow, device name read from the store
+0. /remote-control/pair?                    -> pairing-route.js（此时还没有凭证）
+1. 回环 socket 且回环 Host？                 -> 放行（不需要 cookie）
+2. dsh-rc-jwt 验得过？（HS256/iss/aud/exp）   -> 继续；否则 401
+3. Origin 围栏：
+     Sec-Fetch-Site: cross-site             -> 403（无条件）
+     写请求带 Origin，但与 Host 不同源        -> 403
+     写请求无 Origin，声明 same-origin/same-site -> 放行
+     写请求无 Origin，也无 Sec-Fetch-Site     -> 403
+4. sub 已被吊销？                            -> 401 并清除 cookie
+   sub 在表里查不到？                        -> 401
+   其它                                    -> 放行，设备名从存储里读
 ```
 
-Step 0 is the pairing bootstrap (`gateway/pairing-route.js`) and is the only path
-that runs before step 1 — see security boundary note 9. It is matched exactly
-(`/remote-control/pair` and its trailing-slash spelling, never a prefix), runs the
-same origin fence for its `POST`, re-reads `settings.enabled` per request, and
-answers from process memory without forwarding anything upstream.
+第 0 步是配对的引导（`gateway/pairing-route.js`），是唯一跑在第 1 步之前的路径——
+见安全边界第 9 条。它按精确路径匹配（`/remote-control/pair` 与其带尾斜杠的写法，绝不是前缀），
+对自己的 `POST` 跑同一套 Origin 围栏，每个请求都重读 `settings.enabled`，
+并且只从进程内存作答，不向上游转发任何东西。
 
-Writes are everything except `GET` / `HEAD` / `OPTIONS`. The fourth arm is the
-CSRF rule `design.md` §3.2 asks for; the third exists because not every
-same-origin browser write carries `Origin`, and rejecting those would break
-normal use. `Sec-Fetch-Site` is checked first because a page cannot forge it.
+「写」指除 `GET` / `HEAD` / `OPTIONS` 之外的一切。第三条对应 `design.md` §3.2 要的 CSRF 规则；
+第四种分支存在，是因为并非每个同源的浏览器写请求都带 `Origin`，把它们拒掉会破坏正常使用。
+`Sec-Fetch-Site` 先查，因为页面伪造不了它。
 
-An admitted request is then rewritten before it reaches DSH — all three, or the
-official port answers 401/403:
+被放行的请求还要在到达 DSH 之前被改写——三条全做，否则官方端口会回 401/403：
 
-| # | Action | Why |
+| # | 动作 | 原因 |
 |---|---|---|
-| A | `Host` → `127.0.0.1:<official port>` | the official fence accepts a loopback authority |
-| B | strip `Origin` / `Sec-Fetch-*` | it compares `origin.host` to `Host`, so a rewritten `Host` with a surviving `Origin` is a guaranteed 403 |
-| C | attach the inner `dsh-auth-*` cookie | the official port has no loopback exemption |
+| A | `Host` → `127.0.0.1:<官方端口>` | 官方围栏只接受回环 authority |
+| B | 剥掉 `Origin` / `Sec-Fetch-*` | 它比较 `origin.host` 与 `Host`，改写了 `Host` 却留着 `Origin` 是必定的 403 |
+| C | 附上内层 `dsh-auth-*` cookie | 官方端口没有回环豁免 |
 
-A and B are applied in one function (`upstreamHeaders`), because doing one
-without the other is precisely the configuration that produces an unexplainable
-403.
+A 与 B 在同一个函数（`upstreamHeaders`）里完成，因为只做其中一个，正是那种会产出
+「无法解释的 403」的配置。
 
-## What runs where
+## 各文件职责
 
 ```
 src/
-├── index.js              # host entry: Cordis plugin (name / inject / apply)
-├── client.js             # client entry: window.__ModuleLoader__.load wrapper
+├── index.js              # 宿主入口：Cordis 插件（name / inject / apply）
+├── client.js             # 客户端入口：window.__ModuleLoader__.load 包装
 └── host/
-    ├── constants.js      # on-disk layout, data-model version, TTLs, JWT claims, file mode
-    ├── store.js          # devices.json read/write, atomic write, 0600
-    ├── pairing.js        # 8-char base32 codes, 120s TTL, one-time redemption, lockout
-    ├── tokens.js         # device credential: HS256 JWT sign/verify, hand-rolled
-    ├── jwt-key.js        # loads/creates the 32-byte HS256 key, 0600, loud on damage
-    ├── loopback.js       # the loopback predicate shared by both transports
-    ├── origin.js         # Origin / Sec-Fetch-Site fence, four arms + upgrade fence
-    ├── audit.js          # JSONL audit writer, retention sweep, export
-    ├── classify.js       # path + method -> audit event
-    ├── api.js            # /remote-control/api/*, loopback only
+    ├── constants.js      # 磁盘布局、数据模型版本、TTL、JWT 声明、文件权限
+    ├── store.js          # devices.json 读写、原子写、0600
+    ├── pairing.js        # 8 位 base32 配对码、120s TTL、一次性兑换、锁定
+    ├── tokens.js         # 设备凭证：HS256 JWT 签发/校验，手写实现
+    ├── jwt-key.js        # 加载/创建 32 字节 HS256 密钥，0600，损坏时大声失败
+    ├── loopback.js       # 两种传输共用的回环判定
+    ├── origin.js         # Origin / Sec-Fetch-Site 围栏，四条分支 + 升级围栏
+    ├── audit.js          # JSONL 审计写入、按天清理、导出、分页读取
+    ├── classify.js       # 路径 + 方法 -> 审计事件
+    ├── api.js            # /remote-control/api/*，仅回环
     └── gateway/
-        ├── server.js     # own http.Server, ctx.effect cleanup, status mapping
-        ├── auth.js       # the single authorization decision (loopback/JWT/origin/revoke)
-        ├── origin.js     # re-export of ../origin.js, kept for the public shape
-        ├── inner-auth.js # redeem + cache the upstream dsh-auth-* cookie
-        ├── proxy.js      # HTTP reverse proxy: A/B/C rewrites, SSE passthrough
-        ├── wsproxy.js    # WebSocket upgrade passthrough, no `ws`
-        ├── pairing-route.js # GET/POST /remote-control/pair, the redeem half
-        ├── activity.js   # throttled lastSeenAt persistence
-        └── wire.js       # response writers, cookie serialization
-locale/                   # zh / en dictionaries
+        ├── server.js     # 自建 http.Server、ctx.effect 清理、状态映射
+        ├── auth.js       # 唯一的鉴权决定（回环/JWT/Origin/吊销）
+        ├── origin.js     # 转出 ../origin.js，保留公开形状
+        ├── inner-auth.js # 兑换并缓存上游的 dsh-auth-* cookie
+        ├── proxy.js      # HTTP 反向代理：A/B/C 改写、SSE 透传
+        ├── wsproxy.js    # WebSocket 升级透传，不用 `ws`
+        ├── pairing-route.js # GET/POST /remote-control/pair，兑换的另一半
+        ├── activity.js   # lastSeenAt 节流落盘
+        └── wire.js       # 响应写入器、cookie 序列化
+locale/                   # zh / en 词典
 tests/                    # node --test
 ```
 
-Domain modules (`store`, `pairing`, `tokens`, `jwt-key`, `audit`, `loopback`, `origin`) never
-import `gateway/*`: they must stay usable from the loopback-only management API and
-testable without HTTP.
+领域模块（`store`、`pairing`、`tokens`、`jwt-key`、`audit`、`loopback`、`origin`）从不 import
+`gateway/*`：它们必须能被仅回环的管理 API 复用，也必须能脱离 HTTP 测试。
 
-## Notes from measurement
+## 实测数据
 
-Two costs were measured rather than guessed, and both shaped the design:
+两处成本是量出来的，不是猜的，都影响了设计：
 
-- `store.touchDevice()` costs **7.06 ms** per call (a full atomic write with
-  `fsync`). Calling it per request would cap the gateway near 140 req/s, so
-  `lastSeenAt` is updated in memory per request and persisted at most once per
-  device per 30 s — with a forced flush on revoke, on panel read and on shutdown.
-- The official port enforces a **Host/Origin fence plus an authority-bound
-  `dsh-auth-*` cookie with no loopback exemption**, so a naive reverse proxy gets
-  401/403 no matter how the listener is configured. Hence the A/B/C rewrites.
+- `store.touchDevice()` 每次 **7.06 ms**（一次带 `fsync` 的完整原子写）。每请求调一次会把网关
+  压到约 140 req/s，所以 `lastSeenAt` 在内存里按请求更新，每台设备最多每 30 秒落盘一次——
+  并在吊销、面板读取与退出时强制 flush。
+- 官方端口执行 **Host/Origin 围栏 + 与 authority 绑定的 `dsh-auth-*` cookie，且没有回环豁免**，
+  所以朴素的反向代理无论监听怎么配都是 401/403。这就是 A/B/C 改写的由来。
 
-## Data
+## 数据
 
-| Data | Location | Notes |
+| 数据 | 位置 | 说明 |
 |---|---|---|
-| Devices and settings | `~/.dsh/remote-control/devices.json` | mode `0600`, atomic write |
-| JWT signing key | `~/.dsh/remote-control/jwt-key` | 32 raw bytes, mode `0600`, generated on first use |
-| Audit trail (stage 4) | `~/.dsh/remote-control/audit-YYYY-MM-DD.jsonl` | UTC days, 30-day retention |
+| 设备与设置 | `~/.dsh/remote-control/devices.json` | 权限 `0600`，原子写 |
+| JWT 签名密钥 | `~/.dsh/remote-control/jwt-key` | 32 个原始字节，权限 `0600`，首次使用时生成 |
+| 审计记录 | `~/.dsh/remote-control/audit-YYYY-MM-DD.jsonl` | 按 UTC 分天，保留 30 天 |
 
 ```jsonc
 {
   "version": 1,
   "devices": [
     {
-      "id": "dev_xxx",            // this IS the JWT sub; the row key
+      "id": "dev_xxx",            // 它 IS JWT 的 sub，也是行主键
       "name": "iPhone · Safari",
       "ua": "...",
       "createdAt": "2026-10-17T...",
       "lastSeenAt": "2026-10-17T...",
       "revokedAt": null,
-      "capabilities": null        // reserved for a future capability allowlist
+      "capabilities": null        // 为将来的能力白名单预留
     }
   ],
   "settings": { "enabled": false, "port": 3090 }
 }
 ```
 
-**No credential is persisted.** The device holds the token; the file holds the row.
-That is a stronger property than "only the digest is stored", and it is the point of
-moving to a JWT: the token's authority comes from its signature, so there is
-nothing in the file for an attacker to verify guesses against.
+**不持久化任何凭证。** 令牌在设备手里，文件里只有设备行。这比「只存摘要」更强，
+也是改用 JWT 的意义：令牌的权限来自它的签名，文件里没有任何东西可供攻击者对着猜。
 
-`tokenHash` may still appear in a file written by an **earlier build**. It is read,
-validated and preserved so `version: 1` parses exactly as before — omitting it from
-the shape above is about what this build *writes*, not what it can *read*. Anything
-with a `tokenHash` cannot authenticate any more, because nothing compares a hash to
-a JWT.
+**更早的版本**写出的文件里可能还有 `tokenHash` 字段。它会被读取、校验并保留，
+好让 `version: 1` 与以前一样能解析——上面的形状说的是这个版本*写*什么，不是它能*读*什么。
+带 `tokenHash` 的行再也无法通过鉴权，因为没有任何地方拿哈希去和 JWT 比。
 
-The one comparison that must stay constant-time is the signature check, and it does:
-both operands are sha256-digested first, so `crypto.timingSafeEqual` always sees
-32-byte buffers. A raw comparison would throw on a length mismatch, turning a
-rejected credential into a 500 — a distinguishable signal on an unauthenticated
-request.
+唯一必须常量时间的那次比较是签名校验，而它确实是：两侧先各自 sha256，于是
+`crypto.timingSafeEqual` 永远看到 32 字节缓冲。直接比较会在长度不等时抛错，
+把「拒绝了一个凭证」变成 500——在一个未鉴权的请求上，这是一个可区分的信号。
 
-A `devices.json` that exists but does not parse is a **hard error**
-(`store/corrupt`), not an empty device table — treating it as empty would look
-exactly like "all devices unpaired" while remote access kept running.
+`devices.json` 存在但解析不了，是**硬错误**（`store/corrupt`），不是一张空设备表——
+当成空表会恰好表现为「所有设备都取消配对了」，而远程接入仍在运行。
 
-## Requirements
+## 环境要求
 
 - Node `>= 18`
 - dsh `>= 0.2.0-rc.2`
-- No runtime dependencies. The WebSocket passthrough uses raw sockets, so even
-  `ws` is not needed.
+- 零运行时依赖。WebSocket 透传用裸 socket，连 `ws` 都不需要。
 
-## Development
+## 开发
 
 ```bash
-node --check src/index.js      # syntax
-npm test                       # node:test suite
-npm run check:syntax           # every host module
+node --check src/index.js      # 语法
+npm test                       # node:test 测试套件
+npm run check:syntax           # 所有宿主模块
 ```
 
-Tests never touch the real `~/.dsh`: each one binds a store to its own temp
-directory and pins the clock through an injected `now`, so "expired" is asserted
-by advancing a number rather than sleeping.
+测试从不碰真实的 `~/.dsh`：每个用例把 store 绑到自己的临时目录，并通过注入的 `now` 钉住时钟，
+所以「已过期」是推进一个数字断言出来的，不是 sleep 出来的。
 
-> `node --test tests/` does not work on Node 21+ — directory arguments to `--test`
-> are matched as literal glob patterns and the directory is executed as if it were
-> a test file ([nodejs/node#64555](https://github.com/nodejs/node/issues/64555)).
-> The `test` script passes a glob instead, which works on every version.
+> `node --test tests/` 在 Node 21+ 不工作——`--test` 会把目录参数当作字面 glob，
+> 于是目录本身被当成测试文件执行（[nodejs/node#64555](https://github.com/nodejs/node/issues/64555)）。
+> 本仓库的 `test` 脚本传的是 glob，在所有版本上都能用。
 
-### Releasing
+### 发布
 
-`docs/RELEASING.md` is the runbook. Read its first section before anything else:
-`0.1.0` must be published by hand, because the package is not on npm yet and npm
-Trusted Publisher can only be configured on a package that already exists. From the
-next version on, pushing a `vX.Y.Z` tag publishes to npm over OIDC and creates a
-GitHub Release with the same `.tgz`, and the doc says exactly which parts of that
-path are locally verifiable and which are not.
+`docs/RELEASING.md` 是操作手册。**先读它的第一节**：`0.1.0` 必须手工发布，因为这个包还不在 npm 上，
+而 npm Trusted Publisher 只能配置在已存在的包上。从下一个版本起，推一个 `vX.Y.Z` 标签就会
+通过 OIDC 发布到 npm，并创建带同一个 `.tgz` 的 GitHub Release；文档里写清了这条链路哪些部分
+能在本地验证、哪些不能。
 
-## Roadmap
+## 路线图
 
-- [x] **0** Package skeleton, manifest, bundle patch, one-line load
-- [x] **1** Device store, pairing codes, device tokens (now signed JWTs)
-- [x] **2** Gateway HTTP: listener, auth, Origin check, inner credential, proxy
-  (+ pairing-code lockout, + `lastSeenAt` throttling)
-- [x] **3** Gateway WebSocket: upgrade auth, `/api/remote.mux` passthrough
-- [x] **4** Management API (`/remote-control/api/*`, loopback only) and audit
-- [x] **5** Client panel: enable switch, port, device list, revoke, audit export
-  (text code + one-time link + QR — see "Pairing a device")
-  (+ the pairing route that redeems the code — `gateway/pairing-route.js`)
-- [ ] **6** Real-device verification and documentation
+- [x] **0** 包骨架、清单、bundle patch、单行加载
+- [x] **1** 设备存储、配对码、设备令牌（现为签名 JWT）
+- [x] **2** 网关 HTTP：监听、鉴权、Origin 校验、内层凭证、代理
+  （+ 配对码锁定、+ `lastSeenAt` 节流）
+- [x] **3** 网关 WebSocket：升级鉴权、`/api/remote.mux` 透传
+- [x] **4** 管理 API（`/remote-control/api/*`，仅回环）与审计
+- [x] **5** 客户端面板：总开关与端口在顶部，四 tab（配对 / 接入 / 设备 / 审计），
+  设备列表与吊销，审计概览 + 事件明细与动作筛选 + 导出，配对码 + 一次性链接 + 二维码
+  （+ 真正兑换配对码的配对路由——`gateway/pairing-route.js`）
+- [ ] **6** 真机验证与文档
 
-## License
+## 许可证
 
 MIT
