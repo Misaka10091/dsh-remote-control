@@ -11,8 +11,29 @@
  * audit trail that silently stops working on the next release.
  *
  * So classification is **path prefix + method only**, and the answer for an
- * unrecognized request is `unknown` — recorded, not guessed. `design.md` §6 makes
- * that trade explicitly: 宁可漏记也不耦合内部接口.
+ * unrecognized request is `null` — i.e. record nothing (see below). `design.md`
+ * §6 makes that trade explicitly: 宁可漏记也不耦合内部接口.
+ *
+ * ### Why an unrecognized action is NOT recorded (2026-10-19)
+ *
+ * Until 2026-10-19 an unrecognized write was recorded as `unknown`, on the theory
+ * that "degrade rather than guess" still left a trace. In practice the panel's
+ * audit tab filled with 「未识别动作」 rows that named no action and no device the
+ * user could act on — DSH's own transport writes (`/api/session/control` and the
+ * streaming endpoints) are unrecognized by design, so the rows were constant
+ * noise around the handful of events the trail exists for (`pair`, `connect`,
+ * `send_message`, `stop_task`, `approval_answer`, `revoke`, `pair_failed`).
+ * A user asking for「未识别动作暂不记录」is asking for exactly that: the trail
+ * records KNOWN actions, and an unrecognized write is dropped rather than labelled
+ * with a name that says nothing.
+ *
+ * The `unknown` EVENT remains in `AUDIT_EVENTS` (`audit.js`) because it is still
+ * the grammar of files written before this change: dropping it from the closed set
+ * would make those lines unreadable and unfilterable. It is read-only legacy.
+ *
+ * The mapping stays a closed table, so the day DSH renames a path the event
+ * silently disappears — which is the accepted cost of not coupling to internal
+ * APIs, and is why `tests/classify.test.mjs` pins every rule as reachable.
  *
  * ## The mapping, and where each prefix comes from
  *
@@ -26,10 +47,10 @@
  * |---------------------------------------|-------------------|-----|
  * | `POST /api/session/prompt`            | `send_message`    | the only call that submits user text into a turn |
  * | `POST /api/session/cancel`            | `stop_task`       | the stop button — cancels the active turn |
- * | `POST /api/session/control`           | `unknown`         | the streaming control channel; direction is ambiguous, so it is NOT counted as a stop |
+ * | `POST /api/session/control`           | not recorded      | the streaming control channel; direction is ambiguous, so it is NOT counted as a stop |
  * | `POST /api/$events/result`            | `approval_answer` | the client's reply into a Host waterfall (approval, question, plan) |
  * | `POST /api/remote.mux`                | `connect`         | unreachable over HTTP (it is an upgrade) — listed for completeness |
- * | `GET  /remote-control/api/*`          | `unknown`         | never proxied; see below |
+ * | `GET  /remote-control/api/*`          | not recorded      | never proxied; see below |
  *
  * ### Why NOT `sendMessage`
  *
@@ -139,8 +160,9 @@ function pathnameOf(target) {
  *
  * @param {string | undefined} method
  * @param {string | undefined} url
- * @returns {string | null} A member of `AUDIT_EVENTS` for a write worth recording,
- *   `null` for "record nothing" (a read, or a request with no usable target).
+ * @returns {string | null} A member of `AUDIT_EVENTS` for a KNOWN write worth
+ *   recording; `null` for "record nothing" — a read, a request with no usable
+ *   target, or a write this hop does not recognize (`未识别动作暂不记录`).
  */
 export function classify(method, url) {
   /* Reads are not actions. `null` and not `'unknown'`: the trail must not fill
@@ -150,34 +172,37 @@ export function classify(method, url) {
   if (pathname === '') return null
 
   /* Requests this hop serves itself (the admin API lives on the official port,
-     never here) are not DSH actions at all. If one ever arrives it is a probe,
-     and `unknown` is the honest label. */
-  if (pathname === '/remote-control' || pathname.startsWith('/remote-control/')) return 'unknown'
+     never here) are not DSH actions at all. A write on that prefix is a probe,
+     and since 2026-10-19 a probe is not recorded: it has no action to name. */
+  if (pathname === '/remote-control' || pathname.startsWith('/remote-control/')) return null
 
   const verb = method.toUpperCase()
   for (const rule of RULES) {
     if (rule.method !== verb) continue
     if (pathname === rule.path || pathname.startsWith(`${rule.path}/`)) return rule.event
   }
-  return 'unknown'
+  /* Unrecognized: nothing is written. See the module note for why this is a
+     deliberate silence rather than an `unknown` label. */
+  return null
 }
 
 /**
  * Classify one WebSocket upgrade handshake.
  *
- * `connect` for the multiplexed channel, `unknown` for anything else — the
- * gateway proxies only `/api/remote.mux` in practice, but a future DSH channel
- * must be recorded rather than dropped.
+ * `connect` for the multiplexed channel, `null` for anything else. Only
+ * `/api/remote.mux` is proxied in practice, and a channel this hop does not
+ * recognize has no action to name — the same rule `classify` follows since
+ * 2026-10-19.
  *
  * @param {string | undefined} url
- * @returns {string} Always an event: an upgrade always IS an action.
+ * @returns {string | null}
  */
 export function classifyUpgrade(url) {
   const pathname = pathnameOf(url)
   for (const rule of UPGRADE_RULES) {
     if (pathname === rule.path || pathname.startsWith(`${rule.path}/`)) return rule.event
   }
-  return 'unknown'
+  return null
 }
 
 /**

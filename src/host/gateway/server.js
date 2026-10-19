@@ -366,11 +366,12 @@ export async function startGateway(options) {
        (`design.md` §6). Recorded BEFORE the proxy call so a stream that fails to
        establish is still visible as an attempted connection, and only for a device
        — the loopback exemption has no device to attribute it to.
-       `classifyUpgrade` returns `connect` for the multiplexed channel and
-       `unknown` for a channel this hop does not recognize: an unrecognized channel
-       is still an event, and dropping it would be a silent hole in the trail. */
+       `classifyUpgrade` returns `connect` for the multiplexed channel and `null`
+       for a channel this hop does not recognize: 未识别动作暂不记录 (2026-10-19),
+       the same rule the HTTP path follows. */
     const deviceId = verdict.device?.id ?? null
-    recordSafely({ event: classifyUpgrade(req?.url), deviceId, ip: peer })
+    const connectEvent = classifyUpgrade(req?.url)
+    if (connectEvent !== null) recordSafely({ event: connectEvent, deviceId, ip: peer })
 
     /* `disconnect` is emitted from the socket's own close, once. `wsproxy` already
        registers the socket in its revocation registry and tears it down from
@@ -460,8 +461,9 @@ export async function startGateway(options) {
 
     /* The audit line (`prd.md` R5, `design.md` §6). `classify` answers with the
        ACTION and nothing else — path prefix + method, because this hop does not
-       understand DSH semantics — and returns `null` for a read, which is not an
-       action. An unrecognized write is `unknown`: recorded, never guessed.
+       understand DSH semantics — and returns `null` for anything that is not a
+       known action: a read, or a write this hop does not recognize
+       (未识别动作暂不记录, 2026-10-19).
        The request body is never read here, which is the structural half of
        "audit records actions, never content". */
     const event = classify(req?.method, req?.url)

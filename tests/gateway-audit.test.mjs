@@ -206,7 +206,11 @@ test('stop_task and approval_answer are classified and recorded', async () => {
   }
 })
 
-test('an unrecognized write is recorded as unknown, not guessed', async () => {
+test('an unrecognized write is not recorded at all', async () => {
+  /* 2026-10-19: 「未识别动作暂不记录」. It used to be written as `unknown`, which
+     named no action and buried the events the trail exists for. The request still
+     goes through — this hop is a byte forwarder — it is only the audit line that
+     is gone. */
   const { gateway, dir, token, stop } = await makeGateway()
   try {
     const res = await send({
@@ -221,11 +225,9 @@ test('an unrecognized write is recorded as unknown, not guessed', async () => {
       },
       body: '{"x":1}',
     })
-    assert.equal(res.status, 200)
+    assert.equal(res.status, 200, 'the request is still proxied')
 
-    const line = auditLines(dir).find((entry) => entry.meta?.path === '/api/session/sendMessage')
-    assert.ok(line !== undefined)
-    assert.equal(line.event, 'unknown', 'the design trade: degrade rather than couple to internal APIs')
+    assert.deepEqual(auditLines(dir), [], 'and nothing was written for it')
   } finally {
     await stop()
   }

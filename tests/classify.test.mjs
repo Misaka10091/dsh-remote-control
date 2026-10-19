@@ -3,9 +3,10 @@
  *
  * `design.md` §6 makes one deliberate trade: the gateway does not understand DSH
  * semantics, so a request is classified by PATH PREFIX + METHOD, and anything
- * unrecognized becomes `unknown`. These tests exist to keep that trade honest in
- * both directions — the mapping must actually recognize what it claims to, and it
- * must degrade rather than guess when a path changes.
+ * unrecognized records NOTHING (「未识别动作暂不记录」, 2026-10-19 — it used to be
+ * recorded as `unknown`). These tests exist to keep that trade honest in both
+ * directions — the mapping must actually recognize what it claims to, and it must
+ * stay silent rather than guess when a path changes.
  *
  * The prefixes asserted here were measured against the installed host
  * (`@deepseek-ai/dsh-0.2.0-rc.2`); the reasoning is in `classify.js`. If a future
@@ -46,8 +47,8 @@ test('a matching prefix also matches its sub-paths', () => {
   assert.equal(classify('POST', '/api/session/prompt/extra'), 'send_message')
   assert.equal(classify('POST', '/api/session/cancel/'), 'stop_task')
   /* But not a LONGER name that merely starts with the same characters. */
-  assert.equal(classify('POST', '/api/session/promptly'), 'unknown')
-  assert.equal(classify('POST', '/api/session/cancelled'), 'unknown')
+  assert.equal(classify('POST', '/api/session/promptly'), null)
+  assert.equal(classify('POST', '/api/session/cancelled'), null)
 })
 
 test('a query string does not defeat the match', () => {
@@ -59,16 +60,20 @@ test('a query string does not defeat the match', () => {
  * Degradation
  * ------------------------------------------------------------------ */
 
-test('an unrecognized write degrades to unknown instead of guessing', () => {
+test('an unrecognized write records nothing instead of guessing', () => {
   /* The measured reason this matters: `design.md` §6's own example was
      `POST /api/...sendMessage`, and NO such path exists on the installed host.
      Had the classifier taken that literally, every real message would have been
-     recorded as `send_message` never and `unknown` always — silently. */
-  assert.equal(classify('POST', '/api/session/sendMessage'), 'unknown')
-  assert.equal(classify('POST', '/api/some/future/route'), 'unknown')
-  assert.equal(classify('POST', '/api/session/control'), 'unknown')
-  assert.equal(classify('DELETE', '/api/session/1'), 'unknown')
-  assert.equal(classify('PATCH', '/api/workspace/rename'), 'unknown')
+     silently missing from the trail.
+
+     Since 2026-10-19 the answer for such a path is `null`, not `unknown`: a row
+     that names no action told the reader nothing and buried the events they were
+     looking for (the DSH transport's own writes are unrecognized by design). */
+  assert.equal(classify('POST', '/api/session/sendMessage'), null)
+  assert.equal(classify('POST', '/api/some/future/route'), null)
+  assert.equal(classify('POST', '/api/session/control'), null)
+  assert.equal(classify('DELETE', '/api/session/1'), null)
+  assert.equal(classify('PATCH', '/api/workspace/rename'), null)
 })
 
 test('a read is never classified, so the trail does not fill with streams', () => {
@@ -90,10 +95,11 @@ test('a request with no usable target records nothing', () => {
 test('the admin API path is never classified as a device action', () => {
   /* It lives on the official loopback server and is refused by the gateway
      outright, so a request for it on this port is a probe. Recording it as an
-     action would misattribute it to whatever device sent it. */
-  assert.equal(classify('POST', '/remote-control/api/devices/dev_1/revoke'), 'unknown')
+     action would misattribute it to whatever device sent it — and since
+     2026-10-19 a probe is not recorded at all. */
+  assert.equal(classify('POST', '/remote-control/api/devices/dev_1/revoke'), null)
   assert.equal(classify('GET', '/remote-control/pair'), null, 'a read records nothing')
-  assert.equal(classify('POST', '/remote-control/pair'), 'unknown')
+  assert.equal(classify('POST', '/remote-control/pair'), null)
 })
 
 test('every classifier answer is a member of the closed event set, or null', () => {
@@ -111,7 +117,9 @@ test('every classifier answer is a member of the closed event set, or null', () 
     }
   }
   for (const path of paths) {
-    assert.ok(AUDIT_EVENTS.includes(classifyUpgrade(path)), path)
+    const upgrade = classifyUpgrade(path)
+    if (upgrade === null) continue
+    assert.ok(AUDIT_EVENTS.includes(upgrade), path)
   }
 })
 
@@ -119,19 +127,21 @@ test('every classifier answer is a member of the closed event set, or null', () 
  * Upgrades
  * ------------------------------------------------------------------ */
 
-test('an admitted multiplexed upgrade is a connect; any other channel is unknown', () => {
+test('an admitted multiplexed upgrade is a connect; any other channel is not recorded', () => {
   assert.equal(classifyUpgrade('/api/remote.mux'), 'connect')
   assert.equal(classifyUpgrade('/api/remote.mux?generation=1'), 'connect')
-  assert.equal(classifyUpgrade('/api/some-future.mux'), 'unknown')
-  assert.equal(classifyUpgrade('/'), 'unknown')
-  assert.equal(classifyUpgrade(undefined), 'unknown')
+  assert.equal(classifyUpgrade('/api/some-future.mux'), null)
+  assert.equal(classifyUpgrade('/'), null)
+  assert.equal(classifyUpgrade(undefined), null)
 })
 
-test('an upgrade is always an event, because a handshake is always an action', () => {
-  /* Unlike a read, an upgrade never means "nothing happened": a socket opened is
-     worth recording even when this hop cannot name the channel. */
-  for (const path of ['/api/remote.mux', '/anything', '', undefined]) {
-    assert.notEqual(classifyUpgrade(path), null)
+test('an upgrade records only a channel this hop can name', () => {
+  /* A handshake is always an action, but 「未识别动作暂不记录」 applies to the
+     upgrade path too: only the multiplexed channel has a name, and an unnamed one
+     is dropped instead of being labelled `unknown`. */
+  assert.equal(classifyUpgrade('/api/remote.mux'), 'connect')
+  for (const path of ['/anything', '', undefined]) {
+    assert.equal(classifyUpgrade(path), null, String(path))
   }
 })
 
@@ -178,12 +188,12 @@ test('the upgrade table is separate, because a handshake is a different question
   for (const rule of upgradeRules) {
     assert.equal(classifyUpgrade(rule.path), rule.event, `${rule.path} does not resolve`)
     /* And it must NOT be in the HTTP table under any method. A READ on it records
-       nothing at all; a WRITE on it is an unrecognized write, i.e. `unknown` — not
-       `connect`. Either way the HTTP path must never claim the upgrade's event. */
+       nothing at all; a WRITE on it is an unrecognized action, which since
+       2026-10-19 is not recorded either — never `connect`. */
     for (const method of ['GET', 'POST', 'PUT', 'DELETE']) {
       assert.notEqual(classify(method, rule.path), rule.event, `${method} ${rule.path} must not be ${rule.event}`)
     }
     assert.equal(classify('GET', rule.path), null, 'a read on the mux records nothing')
-    assert.equal(classify('POST', rule.path), 'unknown', 'a write on it is unrecognized, not a connect')
+    assert.equal(classify('POST', rule.path), null, 'a write on it is unrecognized, so it is not recorded')
   }
 })

@@ -92,10 +92,13 @@ import {
  * because the two answer different questions and a user scanning the file for
  * "was I attacked" should be able to grep one word.
  *
- * `unknown` is not a fallback for a defect — it is `design.md` §6's deliberate
- * answer for a request whose path this hop does not recognize. The gateway does
- * not understand DSH semantics, so an official path change must degrade the
- * audit to `unknown` rather than break it.
+ * `unknown` was originally the classification of a request whose path this hop
+ * does not recognize (`design.md` §6: the gateway does not understand DSH
+ * semantics). Since 2026-10-19 an unrecognized action is NOT RECORDED at all —
+ * 「未识别动作暂不记录」— so nothing writes this event any more. It stays in the
+ * closed set because it is the grammar of files written before that change:
+ * removing it would make those lines unreadable and impossible to filter to
+ * (`projectAuditRecord` drops an event outside the set).
  */
 export const AUDIT_EVENTS = Object.freeze([
   'pair',
