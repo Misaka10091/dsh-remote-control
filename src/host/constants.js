@@ -72,13 +72,17 @@ export const DEVICE_ID_PREFIX = 'dev_'
 export const DEVICE_COOKIE_NAME = 'dsh-rc-jwt'
 
 /**
- * The cookie name used before the JWT switch, exported for exactly one purpose:
- * the README and the tests need to name what is no longer accepted, and a bare
- * string literal at those call sites is how two spellings start to drift.
+ * The cookie name used before the JWT switch.
  *
- * The gateway does NOT read it. An old device presenting one is simply
- * unauthenticated, which is the honest answer — the credential it holds cannot be
- * verified and must not be silently translated into a new one.
+ * Exported for exactly one purpose: the gateway's authorization contract has to
+ * be testable against the credential it REJECTS. A device still holding an old
+ * `dsh-rc-device` cookie is simply unauthenticated, which is the honest answer —
+ * the value cannot be verified and must not be silently translated into a new
+ * one (`research/jwt-device-credential.md` §3.6, no automatic migration).
+ *
+ * The gateway does NOT read this name. It exists so `tests/gateway-auth.test.mjs`
+ * can prove the old credential is refused, and so a bare string literal is not
+ * how two spellings of the retired name start to drift.
  */
 export const LEGACY_DEVICE_COOKIE_NAME = 'dsh-rc-device'
 

@@ -18,7 +18,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 
-import { DEVICE_COOKIE_NAME } from '../src/host/constants.js'
+import { DEVICE_COOKIE_NAME, LEGACY_DEVICE_COOKIE_NAME } from '../src/host/constants.js'
 import {
   DECISION,
   authorize,
@@ -636,7 +636,10 @@ test('a credential in the OLD cookie name is refused', () => {
      value (`sha256` digest verifier) this verifier cannot check anyway. Old devices
      must re-pair — documented in the README. */
   withDevice(({ store, token }) => {
-    const oldName = decide({ req: request({ headers: { host: '192.168.1.7:3090', cookie: `dsh-rc-device=${token}` } }), store })
+    const oldName = decide({
+      req: request({ headers: { host: '192.168.1.7:3090', cookie: `${LEGACY_DEVICE_COOKIE_NAME}=${token}` } }),
+      store,
+    })
     assert.equal(oldName.decision, DECISION.UNAUTHENTICATED)
     assert.equal(oldName.reason, 'no-cookie')
   })

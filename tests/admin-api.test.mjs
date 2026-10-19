@@ -1175,9 +1175,76 @@ test('a host with no webServer.register degrades visibly, once, and still works'
   }
 })
 
-/* ------------------------------------------------------------------ *
- * The classifier's relationship to the audit the API writes
- * ------------------------------------------------------------------ */
+/**
+ * The registration branches, split on whether `ctx.effect` exists.
+ *
+ * These two are the reason the module needs a DECLARED disposer: the no-context
+ * branch assigns it, and an assignment to an undeclared binding is a
+ * `ReferenceError` in an ES module. The assertion that matters is therefore not
+ * "dispose does not throw" but "startAdminApi did not throw", because the throw
+ * happened during MOUNT — before `available` was set — so the failure surfaced as
+ * a plugin that silently had no admin API at all.
+ */
+test('mounting without a Cordis context registers the route and hands back a real disposer', () => {
+  const runtime = makeRuntime()
+  const registered = []
+  let removed = 0
+  const webServer = {
+    register: (route) => {
+      registered.push(route.path)
+      return () => { removed += 1 }
+    },
+  }
+
+  let api
+  assert.doesNotThrow(() => {
+    api = startAdminApi({ ctx: null, webServer, store: runtime.store, pairing: runtime.pairing, audit: runtime.audit })
+  }, 'the embedder/test-harness branch must not throw at mount')
+
+  try {
+    assert.equal(api.available, true, 'a host that CAN register reports it, even without a context')
+    assert.deepEqual(registered, [ADMIN_API_PREFIX], 'the prefix route was registered directly')
+
+    api.dispose()
+    assert.equal(removed, 1, 'dispose removes the route it registered directly')
+  } finally {
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('with a Cordis context the disposer belongs to ctx.effect, so API dispose is a no-op', () => {
+  /* Two owners for one route would remove it twice, and `webServer.register`'s
+     disposer deletes by key — a second call is harmless but it means the effect
+     and the handle disagree about who cleans up. The effect owns it; the handle
+     stays silent. */
+  const runtime = makeRuntime()
+  const effects = []
+  let removed = 0
+  const ctx = {
+    effect: (acquire, label) => {
+      effects.push({ release: acquire(), label })
+      return () => {}
+    },
+  }
+  const webServer = {
+    register: () => () => { removed += 1 },
+  }
+
+  const api = startAdminApi({ ctx, webServer, store: runtime.store, pairing: runtime.pairing, audit: runtime.audit })
+  try {
+    assert.equal(api.available, true)
+    assert.equal(effects.length, 1, 'one effect, one registration')
+    assert.match(effects[0].label, /admin API/)
+
+    api.dispose()
+    assert.equal(removed, 0, 'the handle does not double-free the effect-owned route')
+
+    effects[0].release()
+    assert.equal(removed, 1, 'the effect disposer is what removes the route')
+  } finally {
+    cleanupDir(runtime.dir)
+  }
+})
 
 test('the admin API paths are not device actions, so classify never labels them', () => {
   /* The API runs on the official port; the gateway never proxies it. If these

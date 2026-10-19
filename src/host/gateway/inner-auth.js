@@ -124,20 +124,6 @@ export function setCookieValues(headers) {
 }
 
 /**
- * Build an Error carrying a stable `code` (`error-handling.md` — plain Error with
- * a `code` string, no custom subclasses).
- *
- * @param {string} code
- * @param {string} message Must never contain cookie material.
- * @returns {Error}
- */
-function innerAuthError(code, message) {
-  const error = new Error(message)
-  error.code = code
-  return error
-}
-
-/**
  * Create the inner-credential provider.
  *
  * @param {object} options

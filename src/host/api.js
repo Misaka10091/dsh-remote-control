@@ -55,7 +55,7 @@
  */
 import { ADMIN_API_PREFIX, DEVICE_ID_PREFIX, PAIRING_ROUTE_PATH } from './constants.js'
 import { dayKeyOf } from './audit.js'
-import { headerValue, isLoopback } from './loopback.js'
+import { isLoopback } from './loopback.js'
 import { checkOrigin } from './origin.js'
 
 /** Largest JSON body the admin API accepts. Every documented request is a few dozen bytes. */
@@ -831,6 +831,14 @@ export function startAdminApi(options) {
      from the effect — so the effect body returns it directly rather than storing
      it, or the route would be dropped by the first reload and never come back. */
   let available = false
+  /* Declared, not left to the branch below: when a Cordis context exists the
+     disposer belongs to `ctx.effect` and this stays a no-op, but the
+     no-context branch ASSIGNS it, and referencing an undeclared binding is a
+     `ReferenceError` in an ES module (strict mode). Measured: `startAdminApi`
+     threw `ReferenceError: disposeRoute is not defined` for every caller without
+     `ctx.effect` — an embedder or a test harness — and the throw happened before
+     `available` was set, so the whole mount failed with no route and no warning. */
+  let disposeRoute = () => {}
   if (webServer !== null && typeof webServer === 'object' && typeof webServer.register === 'function') {
     /** @returns {() => void} the route's disposer. */
     const register = () => webServer.register({

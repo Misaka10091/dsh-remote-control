@@ -96,20 +96,6 @@ export function parseStatusLine(headText) {
 }
 
 /**
- * Read a header value as a string, tolerating node's `string[]` shape.
- *
- * @param {import('node:http').IncomingMessage} req
- * @param {string} name Lower-case header name.
- * @returns {string | undefined}
- */
-function headerOf(req, name) {
-  const value = req?.headers?.[name]
-  if (typeof value === 'string') return value
-  if (Array.isArray(value) && typeof value[0] === 'string') return value[0]
-  return undefined
-}
-
-/**
  * Build the header set for the upstream upgrade hop.
  *
  * `proxy.js`'s {@link upstreamHeaders} already performs (A) the `Host` rewrite,

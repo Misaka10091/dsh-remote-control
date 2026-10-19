@@ -66,35 +66,6 @@ function begin(res, status, headers) {
 }
 
 /**
- * Send a JSON body.
- *
- * @param {import('node:http').ServerResponse} res
- * @param {number} status
- * @param {unknown} payload
- * @returns {boolean} whether anything was written.
- */
-export function sendJson(res, status, payload) {
-  let body
-  try {
-    body = Buffer.from(JSON.stringify(payload), 'utf8')
-  } catch {
-    /* A payload that cannot be serialized is a bug in us, not in the request.
-       Fall back to a fixed body rather than letting the throw escape. */
-    body = Buffer.from('{"ok":false,"error":{"code":"gateway/internal","message":"error"}}', 'utf8')
-    status = 500
-  }
-  const opened = begin(res, status, {
-    'content-type': 'application/json; charset=utf-8',
-    'content-length': String(body.length),
-    'cache-control': 'no-store',
-    'x-content-type-options': 'nosniff',
-  })
-  if (!opened) return false
-  res.end(body)
-  return true
-}
-
-/**
  * Send the documented error envelope: `{ ok: false, error: { code, message } }`.
  *
  * @param {import('node:http').ServerResponse} res
