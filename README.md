@@ -9,10 +9,10 @@ or another computer on your LAN, with a device panel and a local audit trail.
 > the **management API** with the audit trail, and the **pairing flow** on the
 > gateway port (`GET`/`POST /remote-control/pair`) that actually redeems a code.
 >
-> Stage 6 (real-device verification — phone → scan → open the session → send a
-> message → receive the stream → stop) is the remaining work, and it needs hardware
-> this test suite cannot provide. Everything below is verified over a real gateway
-> on an OS-assigned port; see [Roadmap](#roadmap).
+> Stage 6 (real-device verification — phone → open the pairing link → open the
+> session → send a message → receive the stream → stop) is the remaining work, and
+> it needs hardware this test suite cannot provide. Everything below is verified
+> over a real gateway on an OS-assigned port; see [Roadmap](#roadmap).
 
 ## Why this exists
 
@@ -34,11 +34,13 @@ This plugin takes a different route:
 ## Pairing a device
 
 1. Open the device panel (sidebar, bottom) and choose **Add device**. The host
-   mints an 8-character base32 code with a 120-second lifetime.
-2. Scan the QR — or open the link it encodes. The link is
-   `http://<lan-ip>:<port>/remote-control/pair#<pairId>:<code>`: the pair lives in
-   the **fragment**, which a browser never sends to a server, so the code cannot
-   land in an access log.
+   mints an 8-character base32 code with a 120-second lifetime, shown grouped as
+   `XXXX-XXXX` with a copy button.
+2. Open the link
+   `http://<lan-ip>:<port>/remote-control/pair#<pairId>:<code>` on the device, or
+   type the code into the manual entry field. The pair lives in the **fragment**,
+   which a browser never sends to a server, so the code cannot land in an access
+   log.
 3. The gateway serves a small self-contained page that reads the fragment
    client-side and POSTs `{ pairId, code }` back to the same path.
 4. On success the gateway **signs a JWT** (HS256) carrying `iss`/`sub`/`aud`/`iat`/
@@ -51,6 +53,14 @@ This plugin takes a different route:
 
 The code is never logged, never audited and never written to disk. Without a
 fragment the page shows a manual entry field for the `<pairId>:<code>` pair.
+
+> **No QR code in this version.** The intended flow is a QR beside the text code,
+> but a QR encoder needs Reed–Solomon error correction, mask selection and format
+> info, and this package stays dependency-free (a rule enforced by a test). A
+> hand-written encoder cannot be validated without a scanner, and an unscannable
+> code is indistinguishable from a network fault — worse than no code. So the
+> text code and the one-time link are the primary path. A QR is planned once it
+> can be verified.
 
 > **Upgrading from an earlier build: every paired device must re-pair.**
 >
@@ -348,7 +358,8 @@ by advancing a number rather than sleeping.
   (+ pairing-code lockout, + `lastSeenAt` throttling)
 - [x] **3** Gateway WebSocket: upgrade auth, `/api/remote.mux` passthrough
 - [x] **4** Management API (`/remote-control/api/*`, loopback only) and audit
-- [x] **5** Client panel: enable switch, port, QR pairing, device list, revoke
+- [x] **5** Client panel: enable switch, port, device list, revoke, audit export
+  (text code + one-time link; **no QR** — see "Pairing a device")
   (+ the pairing route that redeems the code — `gateway/pairing-route.js`)
 - [ ] **6** Real-device verification and documentation
 

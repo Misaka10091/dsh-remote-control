@@ -69,6 +69,7 @@
     "cordis.patch.yml",
     "dsh.plugin.json",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
