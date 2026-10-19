@@ -13,7 +13,7 @@
 ## Forbidden Patterns
 
 1. **引入运行时依赖。** 宿主半边只用 Node 内置模块（`node:crypto`、`node:fs`、`node:path`、`node:os`、`node:http`、`node:net`）。唯一允许的是宿主提供的可选模块（如 `@deepseek-ai/schemastery`，按 `dsh-git-panel` 的方式动态可选加载，缺失时降级）。
-   *例外*：WebSocket 需要 `ws`。若必须引入，它要作为 `dependency` 并在 README 说明，且不得引入第二个用途重叠的库。
+   **没有例外。** WebSocket 透传用裸 `node:net`：自己写升级请求行 + 双向 pipe，不解析帧（`src/host/gateway/wsproxy.js`）。`ws`、`node:http2`、`jsonwebtoken`、`jose`、`jws` 都被 `tests/package.test.mjs` 明确禁止——那不是「暂时用不上」，而是零依赖这条设计决策本身（JWT 只有两个 base64url 段加一次 HMAC，手写面比库小）。
 
 2. **新增构建步骤。** 客户端半边是手写 ESM，保留 `window.__ModuleLoader__.load({ id, factory })` 单入口包装，禁止出现第二个 client entry 或编译产物目录。
 
@@ -35,8 +35,9 @@
 
 2. **原子写。** `devices.json` 写入必须是「临时文件 → fsync → rename」，任何时刻读到的都是完整文件。
 
-3. **常量时间比较，且用在真正的热路径上。** 令牌比对先各自 sha256 再 `crypto.timingSafeEqual`，保证长度恒等，避免长度侧信道与抛错。
-   **但只做到这一步是不够的**：阶段 1 复核发现 `tokens.js` 是常量时间的，而真正会被调用的 `findActiveDeviceByTokenHash` 却用 `===` 早退——等于白做。任何**比对凭据摘要**的地方都必须走同一个 `sameTokenHash()`。
+3. **常量时间比较，且用在真正的热路径上。** 凭据比对两侧先各自 sha256 再 `crypto.timingSafeEqual`，保证长度恒等，避免长度侧信道与「长度不等就抛错」（`tokens.js#sameBytes` / `#sameTokenHash`）。
+   **但只做到这一步是不够的**：阶段 1 复核发现 `tokens.js` 是常量时间的，而当时真正被调用的 `findActiveDeviceByTokenHash` 却用 `===` 早退——等于白做（该函数已随 JWT 改造移除）。
+   现状：鉴权热路径是 `gateway/auth.js` → `verifyDeviceToken()` 的 HMAC 比对；`hashToken` / `sameTokenHash` / `verifyToken` 只剩旧 `tokenHash` 行的兼容路径，**不在鉴权链路上**。任何**比对凭据**的地方都必须走常量时间原语，不许 `===`。
 
 4. **接受凭据的一方必须校验格式。** `verifyToken` 的可信侧（存储的 `tokenHash`）必须是 `^[0-9a-f]{64}$`，否则直接返回 false。
    阶段 1 复核发现的真实缺陷：旧实现把非摘要也走一遍 hash，导致 `verifyToken('hunter2','hunter2') === true`；配合存储接受任意非空字符串，**手写一个字段进 `devices.json` 就能用该字面量认证**，完全绕过「只存哈希」。这条要一直记着。
@@ -67,6 +68,7 @@
 
 16. **版本一致。** `package.json` 与 `dsh.plugin.json` 的 `version` 必须相等，且 `files` 列出的每个产物必须真实存在。
     `engines.dsh` 必须与**实测**的宿主版本对齐（用 `dsh --version` 复验，不要从二手信息推断——阶段 1 复核曾误判一次）。
+    发布侧的完整约束（标签文法、CHANGELOG 契约、dist-tag、幂等重试、打包边界）见 `../release/tag-and-release.md`。
 
 17. **「对某种请求够用」的宽松规则，不能给语义不同的请求复用。** 阶段 3 前置发现的真实缺陷：`origin.js` 的读请求分支对 GET 只在 `Sec-Fetch-Site: cross-site` 时才拒，带了 Origin 但不带该头时**放行**（对只读请求勉强可接受）。而 **WebSocket 升级本身就是一个 GET**，且不受 CORS 预检约束、浏览器发 `ws://` 时一定带 `Origin` 却不保证带 `Sec-Fetch-Site` —— 于是这个宽松分支直接把跨站 WebSocket 劫持（CSWSH）放了进来。
     **规矩**：给升级/长连接这类语义不同的请求，写**独立**的判定入口，不要去改已有入口来「顺便复用」。升级路径的 Origin 校验必须更严：只要有 `Origin` 就必须与 `Host` 同源，不能像读请求那样可以忽略。
@@ -94,6 +96,7 @@
 25. **默认值/排序规则必须拿真机数据验一次，别只信推理。** 阶段 6 的网卡排序按设计写成「私网优先、其余靠后」，单测全绿；真机上 Windows 同时报了 Hyper-V `vEthernet (Default Switch)` `172.29.240.1`、WSL `vEthernet` `172.30.192.1` 与真实网卡 `192.168.9.77`，按这条规则**默认值正好落在手机连不上的虚拟交换机上** —— 也就是这个面板存在的意义被默认值抵消了。修法是给排序加一层「物理网卡先于虚拟网卡」的启发式（按网卡名猜，Node 只暴露这个名字；猜错的代价只是下拉里一行位置）。教训：**凡是「替用户选一个默认值」的逻辑，都要在真实枚举结果上看一眼第一名是谁**，单测里的假数据永远比真机干净。
 
 26. **发布前的校验要前置到可单测的脚本里，而不是散在 workflow 的 shell 片段中。** 打标签发布这条链路出错时，代价是「一个不可回滚的已发布版本」或「npm 与 GitHub Release 内容不一致」，而 workflow 里的 `if`/`grep` 只能在真实推送时才知道对错。`scripts/prepare-release.mjs` 把所有能静态判定的东西收进一个纯函数：标签文法、tag ↔ `package.json` ↔ `dsh.plugin.json` 三方版本、仓库地址（npm provenance 绑它）、`CHANGELOG.md` 对应段落非空。workflow 只做编排。**并且这些断言必须能被变异测试打红**：首发版本的测试里，`v01.1.0`、`v0.1.0-beta.01` 这类用例会因为「版本不一致」先被拒绝，于是删掉文法/前导零规则测试依然全绿——检查代理用 11 个变异体验证，修好前有 2 个存活、修好后 0 个存活。教训：**断言要钉住「因为哪个原因被拒」，只钉「被拒了」等于没测**。
+    这条规范的落地细节（标签文法表、dist-tag、幂等重试、打包边界、本地能验到第几层）见 `../release/tag-and-release.md`。
 
 27. **分页游标必须带「同一时刻内的序号」，只用时间戳会漏或重。** 审计明细端点用 `"<ts>.<seq>"`（毫秒 + 按天序放大的行号）。理由是实测的：同一毫秒可以写入两条记录（同一批并发连接），只用时间戳作游标时「严格早于游标」把两条一起排除 → **丢一条**；放宽成「不晚于」→ **重一条**。页码/偏移更糟：审计是追加日志，翻页期间的新写入让偏移整体位移。实现要点：**游标的比较顺序必须与排序顺序完全一致**（按 `(ts, seq)` 排就按 `(ts, seq)` 比），否则「一致性」只是巧合；`seq` 还必须跨文件单调，否则同一毫秒的两条记录落在不同日期文件时，排序与游标会各自成立却互相矛盾。测试必须包含「同一毫秒写多条 + `limit=1` 逐页翻完，每条恰好出现一次」——把并列比较删掉，这条要变红。
 

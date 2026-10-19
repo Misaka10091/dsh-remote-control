@@ -21,7 +21,7 @@ locale/
 └── en.json
 ```
 
-当且仅当 `client.js` 超过约 1200 行时，才拆出 `src/client/` 子目录：
+**实测现状：`src/client.js` 约 4100 行 / 约 200 KB，仍是单文件单入口**，没有 `src/client/` 子目录。早期写的「超过约 1200 行就拆」并没有发生，也不该为了行数去拆：拆分要新增一份装配代码，而唯一的收益是阅读顺序。真需要拆时按下面的形态做，且 `package.json#exports["./client"]` 永远仍指向 `src/client.js`：
 
 ```
 src/client/
@@ -30,7 +30,7 @@ src/client/
 └── api.js                # 请求封装
 ```
 
-拆分时 `src/client.js` 仍保留为唯一入口，只做装配——`package.json` 的 `exports["./client"]` 永远指向它，不新增第二个 client entry。
+`src/client.js` 只做装配（`__ModuleLoader__.load` + `factory(require)`），不新增第二个 client entry。拆出来的模块是工厂体内部的普通函数/组件，**不能**变成 ESM 模块（浏览器侧没有打包器，见 `quality-guidelines.md`）。
 
 ---
 

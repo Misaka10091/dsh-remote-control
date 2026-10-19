@@ -42,9 +42,9 @@
 ## Quality Check
 
 ```bash
-node --check src/client.js
-node --test tests/          # 含文件级不变量：单入口、无顶层 import、词典键集一致
-npm pack --dry-run          # 确认 lib/src/locale 都被打进产物
+npm test                 # 含文件级不变量：单入口、无顶层 import、词典键集一致
+npm run check:syntax     # node --check 每个入口与宿主模块
+npm pack --dry-run       # 确认 src/locale 都被打进产物（31 个文件）
 ```
 
 外加人工过 [Quality Guidelines 的 Code Review Checklist](./quality-guidelines.md#code-review-checklist)。
@@ -56,3 +56,4 @@ npm pack --dry-run          # 确认 lib/src/locale 都被打进产物
 - 客户端半边**不是独立应用**，它只是往宿主页面注册一个座位；不要试图自己接管路由或连接。
 - 面板的所有管理接口是 `/remote-control/api/*`，**仅 loopback 可用**。远程设备即使已配对也打不开管理面板——这是有意设计（PRD R4 的安全边界），面板要能把这个 403 解释清楚，而不是显示"加载失败"。
 - 移动端布局依赖上游，本插件不重构官方 CSS（PRD 明确不在 MVP 内）。
+- **没有独立的前端发布流程。** `src/client.js` 与宿主半边同属一个 npm 包、同一个 tag、同一次发布，所以客户端改动同样要过 [发布规范](../release/index.md) 的三条 gate（含 `npm pack --dry-run` 的 31 文件清单）。

@@ -51,6 +51,16 @@ These guides help you **ask the right questions before coding**.
 
 → Read [Code Reuse Thinking Guide](./code-reuse-thinking-guide.md)
 
+### When Preparing a Release
+
+- [ ] 你改了 `package.json` / `dsh.plugin.json` / `CHANGELOG.md`
+- [ ] 你改了 `.github/workflows/*` 或 `scripts/prepare-release.mjs`
+- [ ] 你在 `src/` 下新增了文件（它必须同时进 `files` 与 `check:syntax`）
+- [ ] 你准备跑 `git tag` 或 `npm version`
+- [ ] 你正在写「发布已经验证」这类结论
+
+→ Read [Release Guidelines](../release/index.md) and [Tag & Release](../release/tag-and-release.md)
+
 ### When Verifying AI Cross-Review Results
 
 - [ ] Reviewer claims "user input can be malicious" → Check the actual data source (internal manifest? user config? external API?)

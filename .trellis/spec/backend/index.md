@@ -27,6 +27,11 @@
 | [Quality Guidelines](./quality-guidelines.md) | 代码标准、禁止模式、测试要求 | Done |
 | [Logging Guidelines](./logging-guidelines.md) | 诊断日志与审计日志的分工 | Done |
 
+## 相关规范
+
+- **发布与标签**：[`../release/index.md`](../release/index.md) —— 标签文法、三方版本一致、CHANGELOG 契约、npm/GitHub Release 流水线、打包边界。动 `package.json`、`dsh.plugin.json`、`CHANGELOG.md`、`.github/workflows/*` 或 `scripts/prepare-release.mjs` 时先读它。
+- 跨层数据流与代码复用：[`../guides/index.md`](../guides/index.md)。
+
 ---
 
 ## Pre-Development Checklist
@@ -39,17 +44,19 @@
 - [ ] 确认所有副作用（文件根目录、时钟、随机源）都走参数注入，测试可脱离真实环境
 - [ ] 确认新增的端口监听 / 定时器 / 订阅都有 `ctx.effect()` disposer
 - [ ] 确认日志与响应体里不含令牌、Cookie、配对码、消息正文
+- [ ] 若新增了源文件：它已进 `package.json#files` 与 `check:syntax`（`files` 是发布边界，见 [发布规范](../release/index.md)）
 
 ## Quality Check
 
 提交前必须全绿：
 
 ```bash
-node --check src/index.js
-node --check src/client.js
-node --test tests/
-npm pack --dry-run     # 产物完整性
+npm test                # 内部是 node --test "tests/*.test.mjs"
+npm run check:syntax    # 每个宿主模块 + scripts/prepare-release.mjs
+npm pack --dry-run      # 产物完整性：31 个文件
 ```
+
+> 不要写 `node --test tests/`：Node 21+ 会把目录参数当字面 glob，目录本身被当成测试文件执行（见 [Quality Guidelines](./quality-guidelines.md) 的 Testing Requirements）。`npm test` 传的是 glob，所有版本都能用。
 
 外加人工过一遍 [Quality Guidelines 的 Code Review Checklist](./quality-guidelines.md#code-review-checklist)，其中最关键的三条：
 

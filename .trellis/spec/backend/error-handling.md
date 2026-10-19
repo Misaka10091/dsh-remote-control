@@ -25,7 +25,18 @@ throw error
 
 理由：错误要跨进程/跨日志边界读取，`instanceof` 在动态加载场景不可靠，`code` 可序列化、可断言。
 
-`code` 命名用 `模块/原因` 形式：`pairing/expired`、`pairing/used`、`token/mismatch`、`store/corrupt`、`gateway/listen-failed`。
+`code` 命名用 `模块/原因` 形式。模块前缀是固定几个（源码里可按 `'$prefix/$reason'` 枚举出来，不要新造同类前缀），真实取值由各模块的构造点定义：
+
+| 前缀 | 真实例子 |
+|---|---|
+| `pairing/` | `expired`、`used`、`invalid-code`、`locked`、`source-locked`、`entropy`、`body-too-large`、`unsupported-media-type` |
+| `store/` | `corrupt`、`version-unsupported`、`unreadable`、`write-failed`、`invalid-device`、`duplicate-device` |
+| `token/` | `claims`、`entropy`、`key` |
+| `audit/` | `invalid-action`、`invalid-cursor`、`invalid-limit`、`unknown-event`、`write-failed`、`no-directory` |
+| `gateway/` | `unauthenticated`、`cross-origin`、`untrusted-origin`、`device-revoked`、`admin-not-here`、`upstream-timeout`、`upstream-unreachable`、`proxy-failed`、`invalid-upstream`、`pairing-disabled` |
+| `admin/` | `loopback-only`、`cross-origin`、`invalid-access`、`invalid-settings`、`unknown-device`、`body-too-large`、`method-not-allowed` |
+
+新增 code 之前先确认语义落在这六个前缀里的哪一个：同一个语义在两个前缀下各叫一次，排查时就会被当成两件事。
 
 ---
 
@@ -47,6 +58,7 @@ throw error
 - 代理转发时响应 `.pipe()` 的 `error` 事件必须监听，否则连接泄漏；出错时 `res.destroy()`。
 - 已 `headersSent` 时不能再 `writeHead`，改为 `res.destroy()`。
 - WebSocket 鉴权失败直接 `socket.destroy()`，不发响应体。
+- 管理 API 的 Origin 判定走 `origin.js#checkAdminOrigin`，比网关的 `checkOrigin` 多一条「无 `Origin` 时接受面板标记头 `x-dsh-remote-control-panel`」分支（桌面壳转发会删掉 `Origin`）。网关侧**绝不** re-export 它（`gateway/origin.js` 的注释与测试都守这条），因为网关对局域网可达、且会替调用方补齐内层凭证。
 
 ### 插件启动路径
 

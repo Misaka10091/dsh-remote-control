@@ -23,7 +23,7 @@
 - **原子写**：写临时文件 → `fsync` → `rename` 覆盖。禁止直接 `writeFile` 覆盖目标文件（进程中断会留下半个 JSON）。
 - **读取失败必须显式报错**：文件存在但 JSON 解析失败 → 抛 `store/corrupt`，并拒绝启用远程能力。不得当成"空设备表"静默继续——那会让用户以为设备都还在，或以为鉴权在生效其实没有。
 - **版本字段**：顶层 `version` 用于将来升级。读到更高版本的 `version` 必须拒绝启动并提示，不要"尽力解析"。
-- **不存明文令牌**：只存 `tokenHash`（sha256）。
+- **不持久化任何凭证。** 设备凭证是设备自己持有的 HS256 JWT（`tokens.js` + `jwt-key.js`），文件里没有任何可供攻击者对着猜的东西——这比「只存摘要」更强。旧文件里的 `tokenHash` 字段会被读取、校验并原样保留（`store.js` 的 legacy 路径），但**没有代码拿哈希做鉴权**，所以不需要改写迁移：它留在原位，只是一个再也无法通过鉴权的旧字段。
 
 ## Schema
 
@@ -34,9 +34,8 @@
   "version": 1,
   "devices": [
     {
-      "id": "dev_xxx",
+      "id": "dev_xxx",            // 设备 id：行主键，同时也是 JWT 的 sub
       "name": "iPhone · Safari",
-      "tokenHash": "<sha256>",
       "ua": "...",
       "createdAt": "...",
       "lastSeenAt": "...",
@@ -50,7 +49,7 @@
 
 ## Query Patterns
 
-没有查询层。设备查找用 `Array.prototype.find`，按 `id` 或 `tokenHash` 线性扫描——设备量级下这是正确的选择，不要提前优化成 Map（会引入两份状态同步的问题）。
+没有查询层。设备查找就是 `store.findDeviceById(id)` 里的 `Array.prototype.find`，按 `id` 线性扫描——设备量级（个位数到几十）下这是正确的选择，不要提前优化成 Map（会引入两份状态同步的问题）。`tokenHash` 上的查找已随 JWT 改造消失，不要再加回来。
 
 ## Migrations
 

@@ -15,25 +15,38 @@
 ```
 src/
 ├── index.js              # 宿主入口：Cordis 插件（name / inject / apply）
-├── client.js             # 客户端入口：window.__ModuleLoader__.load 包装
-├── host/
-│   ├── store.js          # devices.json 读写、原子写、权限
-│   ├── pairing.js        # 配对码生成/兑换/过期
-│   ├── tokens.js         # 令牌生成、sha256、timingSafeEqual
-│   ├── audit.js          # 审计 JSONL 追加、清理、导出
-│   ├── api.js            # /remote-control/api/*（仅 loopback）
-│   └── gateway/
-│       ├── server.js     # 自建 http.Server，监听与清理
-│       ├── auth.js       # Cookie 解析、令牌校验、loopback 判定
-│       ├── origin.js     # Origin / Sec-Fetch-Site 校验
-│       ├── inner-auth.js # 内层 dsh-auth-* 兑换与缓存
-│       ├── proxy.js      # HTTP 反向代理
-│       └── wsproxy.js    # WebSocket 升级透传
+├── client.js             # 客户端入口：window.__ModuleLoader__.load 包装（见 ../frontend/）
+└── host/                 # 与传输无关的领域模块
+    ├── constants.js      # 磁盘布局、数据模型版本、TTL、JWT 声明、文件权限
+    ├── store.js          # devices.json 读写、原子写、0600
+    ├── addresses.js      # 接入地址的归一化（store 与 api 共用）
+    ├── pairing.js        # 8 位 base32 配对码、120s TTL、一次性兑换、锁定
+    ├── tokens.js         # 设备凭证：HS256 JWT 签发/校验，手写实现
+    ├── jwt-key.js        # 加载/创建 32 字节 HS256 密钥，0600，损坏时大声失败
+    ├── loopback.js       # 两种传输共用的回环判定
+    ├── origin.js         # Origin / Sec-Fetch-Site 围栏（含 checkAdminOrigin）
+    ├── audit.js          # JSONL 审计写入、按天清理、导出、分页读取
+    ├── classify.js       # 路径 + 方法 -> 审计事件
+    ├── api.js            # /remote-control/api/*，仅回环
+    └── gateway/          # 只在网关里成立的传输模块
+        ├── server.js     # 自建 http.Server、ctx.effect 清理、状态映射
+        ├── auth.js       # 唯一的鉴权决定（回环 / JWT / Origin / 吊销）
+        ├── origin.js     # 转出 ../origin.js，保留公开形状（不转出 checkAdminOrigin）
+        ├── inner-auth.js # 兑换并缓存上游的 dsh-auth-* cookie
+        ├── proxy.js      # HTTP 反向代理：Host/Origin/Cookie 改写、SSE 透传
+        ├── wsproxy.js    # WebSocket 升级透传，裸 node:net，不用 `ws`
+        ├── pairing-route.js # GET/POST /remote-control/pair
+        ├── activity.js   # lastSeenAt 节流落盘
+        └── wire.js       # 响应写入器、cookie 序列化
 locale/                   # 词典 json（zh / en）
-tests/                    # node --test
+tests/                    # node:test（npm test = node --test "tests/*.test.mjs"）
+scripts/
+└── prepare-release.mjs   # 发布校验的纯函数 + CLI（见 ../release/）
 ```
 
-两级划分的理由：`src/host/*.js` 是**与传输无关的领域模块**（存储、配对、令牌、审计），`src/host/gateway/*` 是**只在网关里成立的传输模块**。领域模块不得 import gateway 里的任何东西，否则它们就没法被 `/remote-control/api` 复用，也没法脱离 HTTP 单测。
+`src/host/*.js` 是**与传输无关的领域模块**（存储、地址、配对、令牌、审计），`src/host/gateway/*` 是**只在网关里成立的传输模块**。领域模块不得 import gateway 里的任何东西，否则它们就没法被 `/remote-control/api` 复用，也没法脱离 HTTP 单测。
+
+`scripts/` 与 `.github/` 属于发布链路，**不在 npm 包内**（`package.json#files` 未列）。新增工具脚本时先想清楚它属于「发布/仓库」还是「运行时」：只有后者才进 `files`。
 
 ---
 

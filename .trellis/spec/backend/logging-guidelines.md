@@ -51,8 +51,8 @@ ctx.logger.info(`[remote-control] device paired: ${device.id} (${device.name})`)
 ```
 
 - `ts` 一律 ISO-8601 UTC（`new Date().toISOString()`）。
-- `event` 取值封闭集合：`pair`、`connect`、`disconnect`、`send_message`、`stop_task`、`approval_answer`、`revoke`、`unknown`。
-- `meta` 只放标识符（如 `sessionId`），**不放正文**。
+- `event` 取值封闭集合，定义在 `src/host/audit.js#AUDIT_EVENTS`，写入侧与读取侧都按它校验：`pair`、`connect`、`disconnect`、`send_message`、`stop_task`、`approval_answer`、`revoke`、`pair_failed`、`unknown`。新增动作要同时改 `AUDIT_EVENTS` 与 `META_KEYS`，并且**不要**在 `src/client.js` 里抄一份——面板从 `GET /state` 的 `audit.actions` 读取闭集。
+- `meta` 只放标识符，键同样来自闭集 `META_KEYS`（`sessionId`、`pairId`、`turnId`、`requestId`、`count`、`method`、`path`、`status`、`code`、`closedSockets`），**不放正文**、不放自由文本。
 
 ---
 
