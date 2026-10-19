@@ -46,6 +46,16 @@ test('a missing devices.json reads as an empty document with default settings', 
     assert.deepEqual(document.devices, [])
     assert.equal(document.settings.enabled, false, 'remote access is OFF by default (PRD D1)')
     assert.equal(document.settings.port, DEFAULT_GATEWAY_PORT)
+    /* The access block exists from the first read, in its documented default: LAN
+       mode with no explicit choice, so the first enumerated private address wins.
+       Starting in `public` would be starting in the mode whose reachability the
+       plugin cannot check. */
+    assert.deepEqual(document.settings.access, {
+      mode: 'lan',
+      lanAddress: '',
+      public: [],
+      selectedPublicId: null,
+    })
   } finally {
     cleanupDir(dir)
   }
@@ -84,7 +94,7 @@ test('addDevice persists the documented device shape, in field order, including 
     assert.equal(stored.revokedAt, null)
     assert.equal(stored.capabilities, null, 'capabilities is reserved and unused (PRD D6)')
     assert.deepEqual(Object.keys(onDisk), ['version', 'devices', 'settings'])
-    assert.deepEqual(Object.keys(onDisk.settings), ['enabled', 'port'])
+    assert.deepEqual(Object.keys(onDisk.settings), ['enabled', 'port', 'access'])
     assert.equal(record.id, 'dev_1')
   } finally {
     cleanupDir(dir)
@@ -361,6 +371,12 @@ test('a document missing optional fields is backfilled', () => {
     assert.equal(document.devices[0].capabilities, null)
     assert.equal(document.settings.enabled, false)
     assert.equal(document.settings.port, DEFAULT_GATEWAY_PORT)
+    assert.deepEqual(document.settings.access, {
+      mode: 'lan',
+      lanAddress: '',
+      public: [],
+      selectedPublicId: null,
+    })
   } finally {
     cleanupDir(dir)
   }
@@ -525,10 +541,15 @@ test('settings merge partially and persist', () => {
   const dir = makeTempDir()
   try {
     const { store } = makeStore(dir)
-    assert.deepEqual(store.getSettings(), { enabled: false, port: DEFAULT_GATEWAY_PORT })
+    const defaultAccess = { mode: 'lan', lanAddress: '', public: [], selectedPublicId: null }
+    assert.deepEqual(store.getSettings(), { enabled: false, port: DEFAULT_GATEWAY_PORT, access: defaultAccess })
 
-    assert.deepEqual(store.updateSettings({ enabled: true }), { enabled: true, port: DEFAULT_GATEWAY_PORT })
-    assert.deepEqual(store.updateSettings({ port: 3091 }), { enabled: true, port: 3091 })
+    assert.deepEqual(store.updateSettings({ enabled: true }), {
+      enabled: true,
+      port: DEFAULT_GATEWAY_PORT,
+      access: defaultAccess,
+    })
+    assert.deepEqual(store.updateSettings({ port: 3091 }), { enabled: true, port: 3091, access: defaultAccess })
     assert.equal(store.getSettings().port, 3091, 'the enabled flag survived the port update')
   } finally {
     cleanupDir(dir)
@@ -544,6 +565,193 @@ test('settings reject out-of-range ports and keep the previous value', () => {
       assert.equal(store.updateSettings({ port }).port, DEFAULT_GATEWAY_PORT, `rejected port ${String(port)}`)
     }
     assert.equal(store.updateSettings({ enabled: 'yes' }).enabled, false, 'only a real boolean flips the switch')
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+/* ------------------------------------------------------------------ *
+ * settings.access — the pairing link's address (`prd.md` R5)
+ * ------------------------------------------------------------------ */
+
+test('a devices.json written before access existed loads with the default', () => {
+  /* The field is ADDITIVE (`design.md` §1.1): no migration script, no `version`
+     bump. A pre-upgrade file must load byte-identically and merely gain the
+     default — anything else would refuse to start for every existing user. */
+  const dir = makeTempDir()
+  try {
+    const { store } = makeStore(dir)
+    writeFileSync(store.devicesPath, JSON.stringify({
+      version: 1,
+      devices: [{ id: 'dev_1', name: 'phone' }],
+      settings: { enabled: true, port: 3091 },
+    }))
+
+    const settings = store.getSettings()
+    assert.equal(settings.enabled, true)
+    assert.equal(settings.port, 3091)
+    assert.deepEqual(settings.access, { mode: 'lan', lanAddress: '', public: [], selectedPublicId: null })
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('access settings survive a write and read back', () => {
+  const dir = makeTempDir()
+  try {
+    const { store } = makeStore(dir)
+    const access = {
+      mode: 'public',
+      lanAddress: '192.168.1.5',
+      public: [
+        { id: 'pub_a', label: '家里 DDNS', address: 'home.example.com:3090' },
+        { id: 'pub_b', label: '', address: 'https://dsh.example.net' },
+      ],
+      selectedPublicId: 'pub_b',
+    }
+
+    assert.deepEqual(store.updateSettings({ access }).access, access)
+    /* The file is the source of truth: a second store over the same directory
+       must see exactly what was written. */
+    const reopened = createStore({ baseDir: dir })
+    assert.deepEqual(reopened.getSettings().access, access)
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('access normalization drops what it cannot use and keeps the rest', () => {
+  /* A hand-edited file must never fail to load (`database-guidelines.md`): a
+     broken address book is a broken LINK, not a broken plugin. So the reader is
+     lenient — which is also why `validateAccess`'s strict form exists for the API
+     path, where the caller must be told instead of rewritten. */
+  const dir = makeTempDir()
+  try {
+    const { store } = makeStore(dir)
+    writeFileSync(store.devicesPath, JSON.stringify({
+      version: 1,
+      devices: [],
+      settings: {
+        access: {
+          mode: 'nonsense',
+          lanAddress: 'not a host',
+          public: [
+            { id: 'pub_a', label: 'ok', address: 'home.example.com:3090' },
+            { id: '', label: 'no id', address: 'kept-nowhere.example' },
+            { id: 'pub_c', address: 'dsh.example.net/path' },
+            'not an object',
+          ],
+          selectedPublicId: 'pub_missing',
+        },
+      },
+    }))
+
+    /* Every FIELD falls back on its own and every unusable ROW is dropped, so the
+       usable rest survives. An unknown mode is `lan` — the reader never upgrades
+       the user into `public`, the mode whose reachability it cannot check. */
+    assert.deepEqual(store.getSettings().access, {
+      mode: 'lan',
+      lanAddress: '',
+      public: [{ id: 'pub_a', label: 'ok', address: 'home.example.com:3090' }],
+      selectedPublicId: null,
+    }, 'each unusable field and row is dropped, the usable ones survive')
+
+    writeFileSync(store.devicesPath, JSON.stringify({
+      version: 1,
+      devices: [],
+      settings: {
+        access: {
+          mode: 'public',
+          lanAddress: 'not a host',
+          public: [
+            { id: 'pub_a', label: 'ok', address: 'home.example.com:3090' },
+            { id: '', label: 'no id', address: 'kept-nowhere.example' },
+            { id: 'pub_c', address: 'dsh.example.net/path' },
+          ],
+          selectedPublicId: 'pub_a',
+        },
+      },
+    }))
+
+    assert.deepEqual(store.getSettings().access, {
+      mode: 'public',
+      /* An unusable LAN address is cleared, not carried: it can never match a NIC
+         entry, and a value that can never match is a setting that lies. */
+      lanAddress: '',
+      public: [{ id: 'pub_a', label: 'ok', address: 'home.example.com:3090' }],
+      selectedPublicId: 'pub_a',
+    })
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('the public address book is truncated to its documented maximum', () => {
+  /* The cap is 8 (`PUBLIC_ADDRESS_MAX`). Truncation is the reader's fallback; the
+     API refuses an oversized list outright, which is what a real caller sees. */
+  const dir = makeTempDir()
+  try {
+    const { store } = makeStore(dir)
+    const publicRows = Array.from({ length: 12 }, (unused, index) => ({
+      id: `pub_${String(index)}`,
+      label: '',
+      address: `host${String(index)}.example`,
+    }))
+    store.updateSettings({ access: { mode: 'public', lanAddress: '', public: publicRows, selectedPublicId: 'pub_0' } })
+
+    const kept = store.getSettings().access.public
+    assert.equal(kept.length, 8)
+    assert.equal(kept[0].id, 'pub_0', 'order is the display order and is preserved')
+    assert.equal(kept[7].id, 'pub_7')
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('a label or an id that cannot be stored is refused by the writer, not silently kept', () => {
+  const dir = makeTempDir()
+  try {
+    const { store } = makeStore(dir)
+    /* 41 characters, one over `PUBLIC_LABEL_MAX`. */
+    const longLabel = 'l'.repeat(41)
+    assert.deepEqual(
+      store.updateSettings({
+        access: {
+          mode: 'public',
+          public: [{ id: 'pub_a', label: longLabel, address: 'home.example.com' }],
+          selectedPublicId: 'pub_a',
+        },
+      }).access,
+      {
+        mode: 'public',
+        lanAddress: '',
+        /* The whole block is rejected by the shared validator, so the store falls
+           back to the default rather than half-applying it. */
+        public: [],
+        selectedPublicId: null,
+      },
+    )
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('updating one setting never disturbs the access block', () => {
+  const dir = makeTempDir()
+  try {
+    const { store } = makeStore(dir)
+    const access = {
+      mode: 'public',
+      lanAddress: '',
+      public: [{ id: 'pub_a', label: 'home', address: 'home.example.com:8443' }],
+      selectedPublicId: 'pub_a',
+    }
+    store.updateSettings({ access })
+
+    const after = store.updateSettings({ port: 4000 })
+    assert.equal(after.port, 4000)
+    assert.deepEqual(after.access, access, 'the port write kept the addresses')
+    assert.deepEqual(store.updateSettings({ enabled: true }).access, access)
   } finally {
     cleanupDir(dir)
   }

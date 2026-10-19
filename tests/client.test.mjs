@@ -20,15 +20,28 @@
  *      the origin root 404s under a sub-path deployment, and a 403 rendered as
  *      "load failed" sends a user to the wrong place for the wrong reason.
  *
- * What is NOT covered here, and must not be claimed as verified: rendering,
- * focus behaviour, `Esc` handling, clipboard writes, the poll ticking in a real
- * page, and the export download. Those need the real GUI (`implement.md` stage 6).
+ * What is NOT covered here, and must not be claimed as verified: anything that
+ * needs a real DOM — layout, focus behaviour, `Esc` handling, clipboard writes,
+ * the poll ticking in a page, the export download, and whether a phone camera can
+ * actually read the QR symbol. The element TREE is inspected (the stub React
+ * records it), which proves structure and data flow, not pixels.
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
+
+import {
+  effectiveAddress as hostEffectiveAddress,
+  formatAddress as hostFormatAddress,
+  parseAddress as hostParseAddress,
+} from '../src/host/addresses.js'
+import {
+  ADDRESS_TEXT_MAX as HOST_ADDRESS_TEXT_MAX,
+  PUBLIC_ADDRESS_MAX as HOST_PUBLIC_ADDRESS_MAX,
+  PUBLIC_LABEL_MAX as HOST_PUBLIC_LABEL_MAX,
+} from '../src/host/constants.js'
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const clientSource = readFileSync(path.join(repoRoot, 'src/client.js'), 'utf8')
@@ -41,10 +54,11 @@ function readJson(relativePath) {
 /**
  * Minimal React stand-in.
  *
- * The factory only needs `createElement` at materialization time; the hooks are
- * never called because no component is rendered here. `createElement` returns a
- * small descriptor so a test could inspect a tree, but nothing currently does —
- * the point is that `require('react')` must not throw.
+ * The factory only needs `createElement` at materialization time. The hooks are
+ * trivial stand-ins so a component CAN be called as a plain function and its
+ * element tree inspected (`PairingSection` below): with no DOM there is no other
+ * way to check that the QR symbol really reaches the tree, and the stub records
+ * the tree rather than rendering it.
  */
 const REACT_STUB = {
   createElement: (type, props, ...children) => ({ type, props, children }),
@@ -55,6 +69,26 @@ const REACT_STUB = {
 }
 
 /**
+ * Minimal `react-dom` stand-in.
+ *
+ * The panel is portalled to the document body (`prd.md` R1): as an absolutely
+ * positioned child of the sidebar foot it was clipped by the sidebar's
+ * `overflow`, and no z-index reaches that. `createPortal` is recorded rather than
+ * performed — there is no DOM here — which is enough to prove the bundle asks for
+ * the right module and calls the portal instead of rendering in place.
+ */
+function makeReactDomStub() {
+  const portals = []
+  return {
+    createPortal: (node, target) => {
+      portals.push({ node, target })
+      return { type: 'portal', node, target }
+    },
+    portals,
+  }
+}
+
+/**
  * Execute `src/client.js` against a fake `window.__ModuleLoader__` and return
  * the materialized bundle exports plus the raw registration.
  *
@@ -62,15 +96,17 @@ const REACT_STUB = {
  * it is not an ES module, and importing it would be testing a different thing
  * than what a browser does with it.
  *
- * @param {{ React?: object, onWarn?: (message: string) => void }} [options]
+ * @param {{ React?: object, ReactDOM?: object, onWarn?: (message: string) => void }} [options]
  * @returns {{
  *   registration: { id: string, factory: Function },
  *   bundle: any,
  *   required: string[],
+ *   reactDom: ReturnType<typeof makeReactDomStub>,
  * }}
  */
 function loadClientBundle(options = {}) {
   const react = options.React ?? REACT_STUB
+  const reactDom = options.ReactDOM ?? makeReactDomStub()
   const registrations = []
   const required = []
 
@@ -105,12 +141,13 @@ function loadClientBundle(options = {}) {
   const bundle = registration.factory((specifier) => {
     required.push(specifier)
     if (specifier === 'react') return react
+    if (specifier === 'react-dom') return reactDom
     /* Any other request is a contract violation this test must surface, not
        something to stub out: the baseline table is what the browser can answer. */
     throw new Error(`unexpected require(${JSON.stringify(specifier)})`)
   })
 
-  return { registration, bundle, required }
+  return { registration, bundle, required, reactDom }
 }
 
 /** A fake Cordis client context recording every effect and service probe. */
@@ -152,6 +189,62 @@ function makeSlots() {
   }
 }
 
+/**
+ * A context that behaves like the REAL Cordis client context.
+ *
+ * This matters more than it looks. Cordis hands each plugin a Proxy and refuses
+ * every service the plugin did not declare: both `ctx.get('locale')` and
+ * `ctx.locale` throw `cannot get property "locale" without inject` until
+ * `inject` covers them. The plain `makeContext` below exposes services as
+ * ordinary properties, so it cannot reproduce that — which is exactly how the
+ * 2026-10-19 regression shipped (the plugin read an undeclared `locale`, threw
+ * during activation, and the web boot refused to draw the whole GUI).
+ *
+ * @param {Record<string, any>} services services the composition provides
+ * @param {{ missing?: string[] }} [options] declared-but-absent services; a
+ *   service listed here never resolves, so `ctx.inject` waits forever like the
+ *   real context does
+ */
+function makeCordisContext(services = {}, options = {}) {
+  const missing = new Set(options.missing ?? [])
+  const effects = []
+  const injected = []
+
+  const build = (granted) => {
+    const read = (name) => {
+      if (!granted.has(name)) throw new Error(`cannot get property "${name}" without inject`)
+      if (missing.has(name)) return undefined
+      return services[name]
+    }
+    const api = {
+      effect(acquire, label) {
+        const release = acquire()
+        effects.push({ label, release: typeof release === 'function' ? release : () => {} })
+        return release
+      },
+      get(name) {
+        return read(name)
+      },
+      inject(names, visit) {
+        injected.push(names)
+        /* A declared service that never appears leaves the callback waiting, so
+           nothing inside it runs — the real "the plugin still activates" case. */
+        if (names.some((name) => missing.has(name))) return
+        visit(build(new Set([...granted, ...names])))
+      },
+    }
+    /* Property reads are the second door into the same guard. */
+    return new Proxy(api, {
+      get(target, property, receiver) {
+        if (typeof property !== 'string' || property in target) return Reflect.get(target, property, receiver)
+        return read(property)
+      },
+    })
+  }
+
+  return { ctx: build(new Set()), effects, injected }
+}
+
 /* ---------------------------------------------------------------------- *
  * Load contract
  * ---------------------------------------------------------------------- */
@@ -164,18 +257,84 @@ test('the bundle registers one entry under the package name and requires only th
   assert.equal(typeof bundle.apply, 'function')
 
   /* Exactly the modules the host seeds into the platform table. A request for
-     anything else fails at boot in the browser, where no test can see it. */
-  assert.deepEqual(required, ['react'])
+     anything else fails at boot in the browser, where no test can see it.
+     `react-dom` is there for ONE reason: `createPortal`, which is what gets the
+     panel out of the sidebar's `overflow` (both are in the whitelist
+     `tests/package.test.mjs` asserts). */
+  assert.deepEqual(required, ['react', 'react-dom'])
+  assert.equal(bundle.internals.hasPortal(), true, 'the portal must be available')
 })
 
-test('the bundle declares the one service it cannot work without', () => {
+test('the bundle declares no global service, so no missing service can park the row', () => {
   const { bundle } = loadClientBundle()
 
-  /* `slots` is required: without the slot service there is no seat to fill.
-     `locale` is deliberately NOT declared — a composition without it must still
-     mount the panel (English fallback) instead of parking the plugin forever. */
-  assert.deepEqual(bundle.inject, ['slots'])
-  assert.ok(!bundle.inject.includes('locale'), 'locale must stay optional')
+  /* An `inject: ['slots']` row that never receives `slots` stays PENDING, and the
+     web boot refuses to draw the GUI over any entry that did not activate
+     ("Failed to load plugins"). 2026-10-19 shipped exactly that failure in the
+     other direction too: an undeclared `locale` read threw during activation.
+     Both facilities are therefore requested per-use inside `apply`, never on the
+     plugin object. */
+  assert.deepEqual(bundle.inject, [])
+})
+
+test('a Cordis context that throws on undeclared services still gets the panel', () => {
+  const { bundle } = loadClientBundle()
+  const slots = makeSlots()
+  const locale = makeLocale()
+  const { ctx, effects, injected } = makeCordisContext({ slots, locale })
+
+  /* The fixture really is Cordis-shaped: an undeclared read throws. If this
+     assertion ever stops failing, the test below stops proving anything. */
+  assert.throws(() => ctx.get('locale'), /without inject/)
+  assert.throws(() => ctx.locale, /without inject/)
+
+  assert.doesNotThrow(() => bundle.apply(ctx))
+
+  assert.deepEqual(slots.injected, ['sidebar.footer.action'])
+  assert.equal(slots.registered.length, 1)
+  assert.equal(locale.registrations.length, 1, 'the dictionaries must still register')
+  assert.deepEqual(injected, [['locale'], ['slots']], 'each optional service is requested, then used')
+  assert.ok(effects.some((entry) => entry.label === 'remote-control: styles'))
+})
+
+test('a service that never appears leaves the row activated and the GUI intact', () => {
+  const { bundle } = loadClientBundle()
+  const { ctx, effects, injected } = makeCordisContext({}, { missing: ['slots', 'locale'] })
+
+  /* Nothing mounts, nothing throws: the seat's absence is a missing feature, not
+     a failed boot. This is the difference between "no device panel" and "no GUI". */
+  assert.doesNotThrow(() => bundle.apply(ctx))
+  assert.deepEqual(injected, [['locale'], ['slots']])
+  assert.equal(effects.length, 1, 'only the stylesheet, which needs no service')
+})
+
+test('a service that throws mid-mount is reported, never rethrown', () => {
+  const { bundle } = loadClientBundle()
+  const slots = {
+    inject() {
+      throw new Error('slot service exploded')
+    },
+    register() {
+      return () => {}
+    },
+  }
+  const { ctx } = makeContext({ slots })
+
+  const errors = []
+  const previousConsole = globalThis.console
+  globalThis.console = { ...previousConsole, error: (...args) => errors.push(args.map(String).join(' ')) }
+  try {
+    /* The web boot aborts the WHOLE application when a client entry does not
+       activate, with no per-plugin opt-out. So the plugin must swallow: one
+       broken panel may cost its own seat, never the user's session. */
+    assert.doesNotThrow(() => bundle.apply(ctx))
+  } finally {
+    globalThis.console = previousConsole
+  }
+
+  assert.equal(errors.length, 1)
+  assert.match(errors[0], /\[remote-control\]/)
+  assert.match(errors[0], /slot service exploded/)
 })
 
 test('applying the plugin registers the sidebar footer seat exactly once', () => {
@@ -431,7 +590,8 @@ test('the pairing link carries the code in the fragment, never the query', () =>
 
   const url = pairingUrl(
     { fragment: 'pair_abc:ABCD1234', pairPath: '/remote-control/pair', port: 3090 },
-    'http://192.168.1.7:3080/',
+    '192.168.1.7',
+    'http://127.0.0.1:3080/',
   )
   assert.equal(url, 'http://192.168.1.7:3090/remote-control/pair#pair_abc:ABCD1234')
 
@@ -443,24 +603,73 @@ test('the pairing link carries the code in the fragment, never the query', () =>
   assert.equal(parsed.pathname, '/remote-control/pair')
 })
 
-test('the pairing link uses the gateway port, which is the only reachable listener', () => {
+test('the pairing link is built from the selected address, not from the page', () => {
+  const { pairingUrl } = loadClientBundle().bundle.internals
+  const pair = { fragment: 'p:c', port: 3090 }
+
+  /* The defect this stage exists for: the desktop page is on 127.0.0.1, so a link
+     built from the page's own origin can never be opened from a phone. */
+  assert.equal(
+    pairingUrl(pair, '192.168.1.5', 'http://127.0.0.1:3080/'),
+    'http://192.168.1.5:3090/remote-control/pair#p:c',
+  )
+  /* An address carrying its own port WINS over the gateway port: `:8443` is a
+     statement about where the gateway is reachable (`prd.md` acceptance 5). */
+  assert.equal(
+    pairingUrl(pair, 'home.example.com:8443', 'http://127.0.0.1:3080/'),
+    'http://home.example.com:8443/remote-control/pair#p:c',
+  )
+  /* An explicit scheme is preserved — `https://` is the user's proxy terminating
+     TLS in front of the plain-HTTP gateway (`design.md` §6). */
+  assert.equal(
+    pairingUrl(pair, 'https://dsh.example.net', 'http://127.0.0.1:3080/'),
+    'https://dsh.example.net:3090/remote-control/pair#p:c',
+  )
+  /* No scheme means the gateway's own: it speaks plain HTTP. */
+  assert.equal(
+    pairingUrl(pair, 'dsh.example.net', 'http://127.0.0.1:3080/'),
+    'http://dsh.example.net:3090/remote-control/pair#p:c',
+  )
+  /* A bracketed IPv6 literal keeps its brackets, which are what make the URL parse. */
+  assert.equal(
+    pairingUrl(pair, '[::1]:4000', 'http://127.0.0.1:3080/'),
+    'http://[::1]:4000/remote-control/pair#p:c',
+  )
+})
+
+test('the pairing link falls back to the page host and its own port only', () => {
   const { pairingUrl } = loadClientBundle().bundle.internals
 
-  /* The desktop page is on the official port (3080); a phone cannot reach that,
-     so the link must point at the gateway instead. */
+  /* No effective address at all (no NIC entry, no public row): the pre-address
+     behaviour, which the panel pairs with `pair.loopbackHint` rather than
+     presenting as a working link. */
+  for (const missing of [null, undefined, '', 'not an address', 'http://x/a']) {
+    assert.equal(
+      pairingUrl({ fragment: 'p:c', port: 3090 }, missing, 'http://127.0.0.1:3080/'),
+      'http://127.0.0.1:3090/remote-control/pair#p:c',
+      `fallback for ${JSON.stringify(missing)}`,
+    )
+  }
+  /* With no gateway port either, the page's own port is the honest answer (the
+     panel separately warns that nothing is listening). */
   assert.equal(
-    pairingUrl({ fragment: 'p:c', port: 3090 }, 'http://127.0.0.1:3080/'),
-    'http://127.0.0.1:3090/remote-control/pair#p:c',
-  )
-  /* With no gateway there is no port to offer, and the page's own is the honest
-     fallback (the panel also warns that nothing is listening). */
-  assert.equal(
-    pairingUrl({ fragment: 'p:c', port: null }, 'http://127.0.0.1:3080/'),
+    pairingUrl({ fragment: 'p:c', port: null }, null, 'http://127.0.0.1:3080/'),
     'http://127.0.0.1:3080/remote-control/pair#p:c',
   )
   /* An unusable base yields no link rather than a broken one. */
-  assert.equal(pairingUrl({ fragment: 'p:c' }, 'not a url'), null)
-  assert.equal(pairingUrl(null, 'http://127.0.0.1:3080/'), null)
+  assert.equal(pairingUrl({ fragment: 'p:c' }, null, 'not a url'), null)
+  assert.equal(pairingUrl(null, '192.168.1.5', 'http://127.0.0.1:3080/'), null)
+})
+
+test('a pairing link still uses the gateway port when the page has none', () => {
+  const { pairingUrl } = loadClientBundle().bundle.internals
+
+  /* The old "gateway port, not the page port" rule must survive the address
+     change: a phone cannot reach the official port. */
+  assert.equal(
+    pairingUrl({ fragment: 'p:c', port: 3090 }, null, 'http://127.0.0.1:3080/'),
+    'http://127.0.0.1:3090/remote-control/pair#p:c',
+  )
 })
 
 test('the pairing code is grouped for reading but not altered', () => {
@@ -549,6 +758,251 @@ test('loopback detection covers the spellings a browser and a socket produce', (
   for (const host of ['192.168.1.7', '10.0.0.2', 'example.com', '']) {
     assert.equal(isLoopbackName(host), false, `${host} is not loopback`)
   }
+})
+
+/* ---------------------------------------------------------------------- *
+ * Access addresses
+ * ---------------------------------------------------------------------- */
+
+/**
+ * Accept/reject matrix shared by the client and the host, so the two copies of
+ * the parser are compared on the same inputs rather than on two hand-written
+ * lists that would drift apart exactly where it matters.
+ */
+const ADDRESS_ACCEPTED = [
+  '192.168.1.5',
+  '10.0.0.7',
+  '1.2.3.4',
+  'home.example.com',
+  'home.example.com:3090',
+  'dsh.lan:65535',
+  'http://dsh.lan',
+  'https://dsh.example.net',
+  'https://dsh.example.net:8443',
+  'HTTP://UPPER.example',
+  '[::1]',
+  '[::1]:3090',
+  '[2001:db8::1]:8443',
+]
+
+const ADDRESS_REJECTED = [
+  '',
+  '   ',
+  '192.168.1.5 3090',
+  '192.168.1.5:0',
+  '192.168.1.5:65536',
+  '192.168.1.5:',
+  '192.168.1.5:abc',
+  '192.168.1.5:12 34',
+  'http://dsh.lan/path',
+  'http://dsh.lan/?q=1',
+  'http://dsh.lan/#frag',
+  'user@dsh.lan',
+  'http://user:pass@dsh.lan',
+  'ftp://dsh.lan',
+  'file:///etc/passwd',
+  '//dsh.lan',
+  'dsh.lan/',
+  '::1',
+  '[::1',
+  '[zz]:3090',
+  'dsh..lan',
+  '-dsh.lan',
+  '.dsh.lan',
+  'a'.repeat(254),
+]
+
+test('the client address parser applies the same rules as the host copy', () => {
+  /* The browser half cannot import `src/host/addresses.js` (single factory, no
+     top-level import), so the parser is genuinely duplicated. Two copies of a
+     rule set are two places to change, and a divergence ships a panel that
+     accepts what the server then refuses with a 400 — so both are run over the
+     same matrix here. */
+  const { parseAddress, formatAddress } = loadClientBundle().bundle.internals
+
+  for (const text of ADDRESS_ACCEPTED) {
+    assert.deepEqual(parseAddress(text), hostParseAddress(text), `both must accept ${JSON.stringify(text)}`)
+    assert.notEqual(parseAddress(text), null, `${JSON.stringify(text)} must parse`)
+    /* Round-tripping is what `POST /settings` relies on: the panel sends the
+       formatted form, the store re-parses it. */
+    assert.equal(formatAddress(parseAddress(text)), hostFormatAddress(hostParseAddress(text)), text)
+  }
+  for (const text of ADDRESS_REJECTED) {
+    assert.equal(parseAddress(text), null, `client must reject ${JSON.stringify(text)}`)
+    assert.equal(hostParseAddress(text), null, `host must reject ${JSON.stringify(text)}`)
+  }
+})
+
+test('the two parsers agree at the documented length boundary', () => {
+  /* The matrix above pins WHICH strings are legal; this pins the BOUND the
+     legality depends on. `ADDRESS_TEXT_MAX` is a duplicated constant, so a copy
+     that drifted by one would accept a 254-character name in the panel and be
+     refused by the server — a 400 for input the client just validated. */
+  const { parseAddress } = loadClientBundle().bundle.internals
+  /* Each label stays inside the 63-character label limit, so this exercises the
+     total-length bound rather than the per-label one. */
+  const longest = ['a'.repeat(63), 'b'.repeat(63), 'c'.repeat(63), 'd'.repeat(61)].join('.')
+  assert.equal(longest.length, HOST_ADDRESS_TEXT_MAX)
+
+  assert.notEqual(parseAddress(longest), null, 'the limit is inclusive')
+  assert.deepEqual(parseAddress(longest), hostParseAddress(longest))
+  for (const text of [longest + 'e', longest + '.e']) {
+    assert.equal(parseAddress(text), null, `one character too long: ${String(text.length)}`)
+    assert.equal(hostParseAddress(text), null)
+  }
+})
+
+test('the client copies the host limits exactly, not approximately', () => {
+  /* Three numbers are duplicated across the halves and none of them is verifiable
+     by behaviour alone: if the panel allowed 10 rows where the store keeps 8, the
+     ninth address would vanish on the next poll with no error shown — the
+     "looks like it worked, then it did not" state `quality-guidelines.md`
+     forbidden pattern 7 rules out. Compared against the host constants rather
+     than against literals, so raising the cap stays a one-line change. */
+  const number = (name) => {
+    const found = new RegExp(`const ${name} = (\\d[\\d_]*)`).exec(clientSource)
+    assert.ok(found !== null, `src/client.js must define ${name}`)
+    return Number(found[1].replace(/_/g, ''))
+  }
+
+  assert.equal(number('PUBLIC_ADDRESS_MAX'), HOST_PUBLIC_ADDRESS_MAX)
+  assert.equal(number('PUBLIC_LABEL_MAX'), HOST_PUBLIC_LABEL_MAX)
+  assert.equal(number('ADDRESS_TEXT_MAX'), HOST_ADDRESS_TEXT_MAX)
+})
+
+test('both copies of effectiveAddress resolve the same matrix', () => {
+  /* `design.md` §1.2 is one rule with two implementations: the host copy is the
+     reference, the client copy is what actually builds the link. A divergence
+     would mean the panel links to an address the documented rule would not have
+     chosen — including the fallback, which is the half no unit test of a single
+     copy can catch. Hostile entries are in the matrix on purpose: `GET /state` is
+     JSON the panel did not necessarily produce. */
+  const { effectiveAddress } = loadClientBundle().bundle.internals
+
+  const lanSets = [
+    [],
+    undefined,
+    [{ address: '192.168.1.5', iface: 'WLAN' }, { address: '10.0.0.7', iface: 'Ethernet' }],
+    /* Malformed rows must be skipped by BOTH, not used as the fallback. */
+    [{ address: 123 }, { address: '10.0.0.7' }],
+    [{ address: '' }, { address: '10.0.0.7' }],
+    [null, 'x', { address: '10.0.0.7' }],
+  ]
+  const accesses = [
+    null,
+    {},
+    { mode: 'lan', lanAddress: '' },
+    { mode: 'lan', lanAddress: '10.0.0.7' },
+    { mode: 'lan', lanAddress: '172.16.0.9' },
+    { mode: 'nonsense', lanAddress: '10.0.0.7' },
+    { mode: 'public', public: [] },
+    { mode: 'public', public: [{ id: 'a', address: 'home.example.com:3090' }] },
+    { mode: 'public', public: [{ id: 'a', address: 'home.example.com' }, { id: 'b', address: ' x ' }], selectedPublicId: 'b' },
+    { mode: 'public', public: [{ id: 'a', address: 'home.example.com' }], selectedPublicId: 'gone' },
+  ]
+
+  for (const access of accesses) {
+    for (const lan of lanSets) {
+      assert.equal(
+        effectiveAddress(access, lan),
+        hostEffectiveAddress(access, lan),
+        `both must resolve ${JSON.stringify({ access, lan })}`,
+      )
+    }
+  }
+})
+
+test('the parser normalizes an address without inventing a scheme', () => {
+  const { parseAddress, formatAddress } = loadClientBundle().bundle.internals
+
+  assert.deepEqual(parseAddress('home.example.com:3090'), { scheme: null, host: 'home.example.com', port: 3090 })
+  assert.equal(formatAddress({ scheme: null, host: 'home.example.com', port: 3090 }), 'home.example.com:3090')
+  /* `http`/`https` only; anything else never reaches storage. */
+  assert.equal(formatAddress(parseAddress('HTTPS://dsh.example.net')), 'https://dsh.example.net')
+  /* Trimmed on the way in, so a pasted value with spaces still saves. */
+  assert.equal(formatAddress(parseAddress('  192.168.1.5  ')), '192.168.1.5')
+  assert.equal(formatAddress(null), '')
+  assert.equal(formatAddress({}), '')
+})
+
+test('the effective address follows the stored choice and falls back without writing', () => {
+  const { effectiveAddress } = loadClientBundle().bundle.internals
+  const lan = [
+    { address: '192.168.1.5', iface: 'WLAN', private: true },
+    { address: '10.0.0.7', iface: 'Ethernet', private: true },
+  ]
+
+  /* LAN, stored choice still present: the choice wins over the first entry. */
+  assert.equal(effectiveAddress({ mode: 'lan', lanAddress: '10.0.0.7' }, lan), '10.0.0.7')
+  /* LAN, stored choice gone (cable pulled, interface renamed): first entry. */
+  assert.equal(effectiveAddress({ mode: 'lan', lanAddress: '172.16.0.9' }, lan), '192.168.1.5')
+  /* LAN with nothing stored / an empty list: the auto default, then nothing. */
+  assert.equal(effectiveAddress({ mode: 'lan', lanAddress: '' }, lan), '192.168.1.5')
+  assert.equal(effectiveAddress({ mode: 'lan' }, []), null)
+  assert.equal(effectiveAddress({ mode: 'lan' }, undefined), null)
+
+  const book = [
+    { id: 'pub_a', label: 'home', address: 'home.example.com:3090' },
+    { id: 'pub_b', label: 'tunnel', address: 'https://dsh.example.net' },
+  ]
+  assert.equal(effectiveAddress({ mode: 'public', public: book, selectedPublicId: 'pub_b' }, lan), 'https://dsh.example.net')
+  /* A dangling selection resolves to the first row, never to the LAN list. */
+  assert.equal(effectiveAddress({ mode: 'public', public: book, selectedPublicId: 'pub_gone' }, lan), 'home.example.com:3090')
+  assert.equal(effectiveAddress({ mode: 'public', public: book, selectedPublicId: null }, lan), 'home.example.com:3090')
+  assert.equal(effectiveAddress({ mode: 'public', public: [] }, lan), null)
+  /* Public mode with an empty book falls back to NO address, not to the LAN list:
+     the mode is an instruction about which list to read. */
+  assert.equal(effectiveAddress({ mode: 'public', public: [], selectedPublicId: null }, lan), null)
+})
+
+test('the access settings are rebuilt from whatever the host sent', () => {
+  const { accessOf, defaultAccess } = loadClientBundle().bundle.internals
+
+  const fallback = defaultAccess()
+  assert.deepEqual(fallback, { mode: 'lan', lanAddress: '', public: [], selectedPublicId: null })
+  /* A fresh object every call: the panel hands this straight back to the API, and
+     a shared literal would be one mount's mutation seen by the next. */
+  assert.notEqual(defaultAccess(), fallback)
+
+  assert.deepEqual(accessOf(null), fallback)
+  assert.deepEqual(accessOf({}), fallback)
+  assert.deepEqual(accessOf({ access: null }), fallback)
+  /* Default off LAN, never public: public is the mode whose reachability the
+     plugin cannot check, so it must never be the accidental default. */
+  assert.equal(accessOf({ access: { mode: 'PUBLIC' } }).mode, 'lan')
+  assert.deepEqual(accessOf({
+    access: {
+      mode: 'public',
+      lanAddress: '192.168.1.5',
+      public: [
+        { id: 'pub_a', label: 'home', address: 'home.example.com' },
+        { id: '', label: 'broken', address: 'x' },
+        { id: 'pub_b', address: 'dsh.example.net:8443' },
+        'not an object',
+      ],
+      selectedPublicId: 'pub_a',
+    },
+  }), {
+    mode: 'public',
+    lanAddress: '192.168.1.5',
+    public: [
+      { id: 'pub_a', label: 'home', address: 'home.example.com' },
+      { id: 'pub_b', label: '', address: 'dsh.example.net:8443' },
+    ],
+    selectedPublicId: 'pub_a',
+  })
+})
+
+test('a new public address id is unique inside the book', () => {
+  const { newPublicId } = loadClientBundle().bundle.internals
+
+  const existing = [{ id: 'pub_1' }, { id: 'pub_2' }]
+  const id = newPublicId(existing)
+  assert.match(id, /^pub_[a-z0-9]{1,20}$/)
+  assert.ok(!existing.some((row) => row.id === id))
+  /* Bounded loop: a stubbed constant source must not hang the panel. */
+  const { newPublicId: again } = loadClientBundle().bundle.internals
+  assert.equal(typeof again([]), 'string')
 })
 
 /* ---------------------------------------------------------------------- *
@@ -727,4 +1181,426 @@ test('no automatic retry is wired into the request path', () => {
   for (const body of timers) {
     assert.ok(!/requestJson\(|fetch\(/.test(body), `a timer must not re-issue a request: ${body.trim()}`)
   }
+})
+
+/* ---------------------------------------------------------------------- *
+ * The modal — structural, because a DOM test environment does not exist here
+ * ---------------------------------------------------------------------- */
+
+test('the panel is portalled to the document body, not laid out in the sidebar', () => {
+  /* `prd.md` R1. The anchored panel was CLIPPED by the sidebar's `overflow` on the
+     right and bottom (2026-10-19 screenshots), and no z-index can reach a
+     clipping ancestor — so the assertion is about the portal, not about a
+     stacking value. `component-guidelines.md` allows `react-dom` for this. */
+  assert.match(clientSource, /require\('react-dom'\)/, 'the portal comes from react-dom')
+  /* The target is the body of the live document, read at call time (not a cached
+     `document.body`, which a hot reload could outlive). */
+  assert.match(clientSource, /const body = document\.body/, 'the portal target is document.body')
+  assert.match(clientSource, /createPortal\(node, body\)/, 'the portal is performed against the body')
+  assert.match(clientSource, /portal\(open \?/, 'the panel is rendered through the portal helper')
+  /* Three degradations, and the throw-free order matters: no `react-dom` or a
+     `document` without a body renders in place; no DOM at all renders NOTHING
+     (there is nowhere to put it). `apply` may never throw
+     (`quality-guidelines.md`), which is why the DOM is probed rather than
+     dereferenced. */
+  assert.match(clientSource, /typeof document === 'undefined'/, 'the DOM access is guarded')
+  assert.match(
+    clientSource,
+    /if \(typeof document === 'undefined' \|\| document === null\) return null/,
+    'without a DOM the panel renders nothing instead of throwing',
+  )
+  assert.match(
+    clientSource,
+    /if \(body === null \|\| body === undefined \|\| createPortal === null\) return node/,
+    'a body-less or portal-less host still renders the panel, in place',
+  )
+})
+
+test('the panel closes on the close button and Esc, and never on an outside click', () => {
+  /* `prd.md` D1: a modal that disappears when the mouse wanders is how a user
+     loses a pairing code they were reading. The old `pointerdown` listener is
+     gone, and the scrim carries NO click handler at all — an absent listener
+     cannot be defeated by event ordering, which a "return early" handler could. */
+  assert.ok(!/addEventListener\(\s*'pointerdown'/.test(clientSource), 'the outside-pointerdown dismissal must be removed')
+  assert.ok(!/addEventListener\(\s*'click'/.test(clientSource), 'no document-level click dismissal may be reintroduced')
+  assert.match(clientSource, /event\.key === 'Escape'/, 'Esc still closes the panel')
+  assert.match(clientSource, /onClick: onClose/, 'the close button still closes the panel')
+  /* The scrim is a bare wrapper: its props object holds `className` and nothing
+     else, so there is no click handler to dismiss the panel with. */
+  assert.match(clientSource, /h\('div', \{ className: 'drc-overlay' \},/)
+  assert.ok(
+    !/className: 'drc-overlay'[^}]*on[A-Z]/.test(clientSource),
+    'the scrim must bind no event handler',
+  )
+  /* The two dismissals are the ONLY `setOpen(false)` call sites: the keydown
+     listener and the close button passed down to the panel. A third one would be
+     a dismissal path nobody documented. */
+  const dismissals = (clientSource.match(/setOpen\(false\)/g) ?? []).length
+  assert.equal(dismissals, 2, 'exactly two dismissal paths: Esc and the close button')
+})
+
+test('the dialog exposes the ARIA contract, traps Tab and moves focus in and back out', () => {
+  /* `design.md` §3.1: `role="dialog"` + `aria-modal` + a label pointing at the
+     VISIBLE title (not a duplicated `aria-label` that could drift), initial focus
+     inside, and focus returned to the trigger on close.
+     `aria-modal="true"` promises assistive technology that everything outside the
+     dialog is inert, so the Tab cycle has to stay inside it — the earlier version
+     left that promise unhonoured (`ui-ux-pro-max`: focus must stay reachable and
+     visible within a modal). */
+  assert.match(clientSource, /role: 'dialog'/)
+  assert.match(clientSource, /'aria-modal': 'true'/)
+  assert.match(clientSource, /'aria-labelledby': TITLE_ID/)
+  assert.match(clientSource, /id: TITLE_ID/)
+  /* The label target really exists on the heading the user reads. */
+  assert.match(clientSource, /const TITLE_ID = 'drc-panel-title'/)
+  assert.match(clientSource, /h\('h2', \{ className: 'drc-panelTitle', id: TITLE_ID \}/)
+
+  /* Focus in on open, and back to the trigger on close — the cleanup is what
+     runs on close, which is why the return of focus lives there. */
+  assert.match(clientSource, /const node = panelRef\.current[\s\S]*?node\.focus\(\)/)
+  assert.match(clientSource, /const trigger = triggerRef\.current[\s\S]*?trigger\.focus\(\)/)
+  assert.match(clientSource, /ref: triggerRef/)
+  /* The trap intercepts only the two edges of the cycle, so ordinary Tab order in
+     between stays the browser's. */
+  assert.match(clientSource, /if \(event\.key !== 'Tab'\) return/)
+  assert.match(clientSource, /const first = focusable\[0\]/)
+  assert.match(clientSource, /event\.shiftKey === true/)
+})
+
+test('the modal card scrolls internally instead of overflowing the viewport', () => {
+  /* `prd.md` acceptance 1: fully visible at 1024x700 AND at 601x1731. A card with
+     a `max-height` and a scrolling body satisfies both; the old
+     `bottom:calc(100% + 8px)` anchor satisfied neither. */
+  const stylesheet = /const CSS = ([\s\S]*?)\]\.join\('\\n'\)/.exec(clientSource)
+  assert.ok(stylesheet !== null, 'the injected stylesheet must be discoverable')
+  const css = stylesheet[1]
+
+  assert.match(css, /\.drc-overlay\{[^}]*position:fixed/)
+  assert.match(css, /\.drc-overlay\{[^}]*inset:0/)
+  assert.match(css, /\.drc-overlay\{[^}]*align-items:center/)
+  assert.match(css, /\.drc-overlay\{[^}]*justify-content:center/)
+  assert.match(css, /\.drc-panel\{[^}]*width:min\(640px,100%\)/)
+  assert.match(css, /\.drc-panel\{[^}]*max-height:min\(760px,calc\(100vh - 32px\)\)/)
+  assert.match(css, /\.drc-body\{[^}]*overflow-y:auto/)
+  /* And the anchoring that caused the clipping is gone for good. */
+  assert.ok(!/\.drc-panel\{[^}]*position:absolute/.test(css), 'the panel must not be absolutely positioned')
+  assert.ok(!/bottom:calc\(100% \+ 8px\)/.test(css), 'the popover anchor must be removed')
+})
+
+test('the address section offers both modes, a LAN list and a public book', () => {
+  /* `prd.md` R2/R3. Asserted at source level because the browser half has no DOM
+     test environment; the strings themselves are pinned by the dictionary parity
+     tests above. */
+  const section = /function AddressSection\(\{ t, settings, addresses, updateSettings \}\) \{([\s\S]*?)\n    \}/.exec(clientSource)
+  assert.ok(section !== null, 'AddressSection must be discoverable')
+  const body = section[1]
+
+  /* The mode switch writes `settings.access.mode`, not a local flag: anything
+     else would be state the host never hears about. */
+  assert.match(body, /mode,/)
+  assert.match(body, /segment\('lan', 'address\.modeLan'\)/)
+  assert.match(body, /segment\('public', 'address\.modePublic'\)/)
+  /* LAN: a select over the SERVER's list (the browser cannot enumerate NICs). */
+  assert.match(body, /addresses\.lan/)
+  assert.match(body, /h\('select'/)
+  assert.match(body, /t\('address\.lanEmpty'\)/)
+  /* Public: add with an optional label, delete, radio-select. */
+  assert.match(body, /t\('address\.add'\)/)
+  assert.match(body, /t\('address\.delete'\)/)
+  assert.match(body, /type: 'radio'/)
+  assert.match(body, /t\('address\.publicEmpty'\)/)
+  /* The honest hint. The plugin probes nothing (`prd.md` D3), so the only claim it
+     may make is that it makes no claim — asserted on the strings themselves in the
+     next test. */
+  assert.match(body, /t\('address\.publicHint'\)/)
+
+  /* Every write goes through the ONE documented field, and never optimistically:
+     the value comes back from the server's answer. */
+  assert.match(body, /updateSettings\(\{ access: next \}\)/)
+})
+
+test('the pairing link hints match how the link was built', () => {
+  /* `design.md` §3.3. `pair.loopbackHint` is for the LEGACY fallback (the page's
+     own host, which on the desktop is 127.0.0.1); `pair.publicHint` is for a
+     public address, where reachability is the user's port mapping. Showing
+     neither would present a link with no caveat; showing both would contradict
+     itself. */
+  const section = /function PairingSection\(\{ t, pairing, gateway, addressText, mode \}\) \{([\s\S]*?)\n    \}/.exec(clientSource)
+  assert.ok(section !== null, 'PairingSection must be discoverable')
+  const body = section[1]
+
+  assert.match(body, /pairingUrl\(current, addressText, documentBase\(\)\)/, 'the link takes the effective address')
+  assert.match(body, /t\('pair\.loopbackHint'\)/)
+  assert.match(body, /t\('pair\.publicHint'\)/)
+  /* One hint, chosen by branch — not two independent conditions. */
+  assert.match(body, /if \(usedFallback\) \{/)
+  assert.match(body, /else if \(mode === 'public'\)/)
+})
+
+test('the address and pairing-link strings exist in both languages', () => {
+  const { ZH, EN } = loadClientBundle().bundle.internals
+  const required = [
+    'address.heading',
+    'address.modeLan',
+    'address.modePublic',
+    'address.lanEmpty',
+    'address.publicEmpty',
+    'address.label',
+    'address.address',
+    'address.add',
+    'address.delete',
+    'address.invalid',
+    'address.tooMany',
+    'address.publicHint',
+    'address.staleHint',
+    'pair.publicHint',
+  ]
+  for (const key of required) {
+    assert.equal(typeof ZH[key], 'string', `zh.${key} is missing`)
+    assert.equal(typeof EN[key], 'string', `en.${key} is missing`)
+  }
+  /* The two hints that carry a VERDICT about reachability must say the opposite of
+     "verified": the plugin does not probe anything (`prd.md` D3). */
+  assert.match(ZH['address.publicHint'], /不检测可达性/)
+  assert.match(EN['address.publicHint'], /never checks reachability/i)
+  assert.match(ZH['pair.publicHint'], /不检测可达性/)
+  assert.match(EN['pair.publicHint'], /does not check reachability/i)
+})
+
+/* ---------------------------------------------------------------------- *
+ * The pairing QR symbol
+ *
+ * `prd.md` R2/R3 and acceptance 4/5. The browser half has no DOM, so the panel is
+ * rendered by CALLING `PairingSection` with the stub React: the returned element
+ * tree is inspected directly. That proves the symbol reaches the tree, that it is
+ * drawn from the same matrix the encoder produced, and that it follows the
+ * selected address — it does NOT prove the symbol is scannable, which is what the
+ * reference fixture and the one-off decoder round-trip are for.
+ * ---------------------------------------------------------------------- */
+
+/** Every node in an element tree matching a predicate. */
+function findAll(node, predicate, found = []) {
+  if (node === null || node === undefined) return found
+  if (Array.isArray(node)) {
+    for (const child of node) findAll(child, predicate, found)
+    return found
+  }
+  if (typeof node !== 'object') return found
+  if (typeof node.type === 'string' && predicate(node)) found.push(node)
+  findAll(node.children, predicate, found)
+  return found
+}
+
+/** The concatenated text of an element tree. */
+function textOf(node) {
+  if (node === null || node === undefined) return ''
+  if (typeof node === 'string' || typeof node === 'number') return String(node)
+  if (Array.isArray(node)) return node.map((child) => textOf(child)).join('')
+  if (typeof node !== 'object') return ''
+  return textOf(node.children)
+}
+
+/** The props of a node, never undefined. */
+function propsOf(node) {
+  return node.props === null || node.props === undefined ? {} : node.props
+}
+
+/**
+ * Repaint a `d` attribute back into a matrix.
+ *
+ * One `<path>` of horizontal runs is the whole picture, so replaying the runs is
+ * the only way to check what was drawn.
+ */
+function paintPath(d, size) {
+  const modules = new Uint8Array(size * size)
+  const pattern = /M(\d+) (\d+)h(\d+)v1h-\3z/g
+  let match
+  while ((match = pattern.exec(d)) !== null) {
+    const col = Number.parseInt(match[1], 10)
+    const row = Number.parseInt(match[2], 10)
+    const run = Number.parseInt(match[3], 10)
+    for (let offset = 0; offset < run; offset++) modules[(row * size) + col + offset] = 1
+  }
+  return modules
+}
+
+/** A pairing snapshot shaped like `usePairing`'s result. */
+function pairingSnapshot(overrides = {}) {
+  const { current: currentOverrides, ...rest } = overrides
+  return {
+    busy: false,
+    failure: null,
+    remainingMs: 90_000,
+    start: async () => {},
+    clear: () => {},
+    ...rest,
+    current: {
+      code: '7K3M9Q2X',
+      fragment: 'AbCdEfGhIjKl:7K3M9Q2X',
+      pairPath: '/remote-control/pair',
+      port: 3090,
+      ...(currentOverrides ?? {}),
+    },
+  }
+}
+
+/**
+ * Render the pairing card and return the tree plus the URL it encoded.
+ *
+ * @param {{ addressText?: string, pairing?: object, mode?: 'lan' | 'public' }} [options]
+ */
+function renderPairing(options = {}) {
+  const { bundle } = loadClientBundle()
+  const { PairingSection, pairingUrl, fallbackTranslate } = bundle.internals
+  const pairing = options.pairing ?? pairingSnapshot()
+  const addressText = options.addressText ?? '192.168.9.77'
+  const tree = PairingSection({
+    t: fallbackTranslate,
+    pairing,
+    gateway: { listening: true },
+    addressText,
+    mode: options.mode ?? 'lan',
+  })
+  /* `documentBase()` degrades to 'http://localhost/' without a DOM, and with a
+     usable address the fallback is never consulted. */
+  const url = pairingUrl(pairing.current, addressText, 'http://localhost/')
+  return { tree, url, bundle }
+}
+
+test('the pairing card renders a QR symbol built from the pairing link', () => {
+  const { tree, url, bundle } = renderPairing()
+  const { encodeQr, qrPathData, qrViewBox, EN } = bundle.internals
+
+  const svg = findAll(tree, (node) => node.type === 'svg' && propsOf(node).className === 'drc-qr')
+  assert.equal(svg.length, 1, 'exactly one QR symbol must be drawn')
+  const props = propsOf(svg[0])
+  assert.equal(props.role, 'img')
+  assert.equal(props['aria-label'], EN['pair.qrAlt'], 'the label must be the readable dictionary string')
+  assert.equal(props.shapeRendering, 'crispEdges', 'crisp edges, or the modules blur at small sizes')
+  assert.equal(props.focusable, 'false', 'a decorative image must not enter the tab order')
+
+  const expected = encodeQr(url)
+  assert.equal(expected.ok, true, 'the fixture link must encode')
+  assert.equal(props.viewBox, qrViewBox(expected.size))
+  assert.deepEqual(props.viewBox, `-4 -4 ${expected.size + 8} ${expected.size + 8}`)
+
+  const paths = findAll(svg[0], (node) => node.type === 'path')
+  assert.equal(paths.length, 1, 'one path, not one node per module')
+  assert.equal(propsOf(paths[0]).d, qrPathData(expected.modules, expected.size))
+  assert.deepEqual(paintPath(propsOf(paths[0]).d, expected.size), expected.modules,
+    'the drawn modules must be the encoder matrix')
+  assert.equal(propsOf(paths[0]).fill, 'currentColor', 'the colour comes from the theme, not a literal')
+})
+
+test('the pairing card keeps the text code and the link beside the symbol', () => {
+  /* `prd.md` D2: the QR is the fast path, never the only path. */
+  const { tree, url } = renderPairing()
+  const code = findAll(tree, (node) => propsOf(node).className === 'drc-code drc-mono')
+  assert.equal(code.length, 1)
+  assert.equal(textOf(code[0]), '7K3M9Q2X', 'the grouped code must still be readable and selectable')
+
+  const link = findAll(tree, (node) => node.type === 'input')
+  assert.equal(link.length, 1)
+  assert.equal(propsOf(link[0]).value, url)
+  assert.equal(propsOf(link[0]).readOnly, true)
+})
+
+test('switching the access address redraws the symbol and keeps the pairing code', () => {
+  /* `prd.md` R3/acceptance 5: the link follows the address, the code does not. */
+  const lan = renderPairing({ addressText: '192.168.9.77' })
+  const other = renderPairing({ addressText: '10.0.0.4' })
+
+  const dOf = (rendered) => {
+    const path = findAll(rendered.tree, (node) => node.type === 'path')
+    return propsOf(path[0]).d
+  }
+  const codeOf = (rendered) => textOf(findAll(rendered.tree, (node) => propsOf(node).className === 'drc-code drc-mono')[0])
+
+  assert.notEqual(lan.url, other.url)
+  assert.notEqual(dOf(lan), dOf(other), 'a different address must produce a different symbol')
+  assert.equal(codeOf(lan), codeOf(other), 'the pairing code must survive an address switch')
+})
+
+test('a link too long for a symbol degrades to the text code, without throwing', () => {
+  /* `prd.md` R4: never truncate, never emit a broken symbol, never take the panel
+     down. The address field is capped at 253 characters, so the reachable way to
+     exceed v15-M is a long host-supplied `pairPath`. */
+  const pairing = pairingSnapshot({ current: { pairPath: '/' + 'p'.repeat(600) } })
+  const { tree, url, bundle } = renderPairing({ pairing })
+  const { encodeQr, EN } = bundle.internals
+
+  assert.equal(encodeQr(url).ok, false, 'the fixture link must really be past capacity')
+  assert.equal(findAll(tree, (node) => propsOf(node).className === 'drc-qr').length, 0,
+    'no symbol may be drawn for a link that does not fit')
+  assert.ok(textOf(tree).includes(EN['pair.tooLong']), 'the reason must be on screen')
+  /* And the fallbacks are untouched. */
+  assert.equal(textOf(findAll(tree, (node) => propsOf(node).className === 'drc-code drc-mono')[0]), '7K3M9Q2X')
+  assert.equal(propsOf(findAll(tree, (node) => node.type === 'input')[0]).value, url)
+})
+
+test('the QR hint names the text code, so the symbol is never the only way in', () => {
+  const { tree, bundle } = renderPairing()
+  const { EN } = bundle.internals
+  /* The hint sits in the TEXT column beside the symbol, not centred underneath
+     it: at the symbol's width the sentence wraps to three narrow lines and pushes
+     the code away from the eye that just found the symbol (2026-10-19 layout
+     pass). It must still appear exactly once, and inside the pairing card. */
+  const card = findAll(tree, (node) => propsOf(node).className === 'drc-pairCard')
+  assert.equal(card.length, 1)
+  const hints = findAll(card[0], (node) => propsOf(node).className === 'drc-hint'
+    && textOf(node).includes(EN['pair.qrHint']))
+  assert.equal(hints.length, 1, 'the hint must name the text code exactly once')
+  const main = findAll(tree, (node) => propsOf(node).className === 'drc-pairMain')
+  assert.equal(main.length, 1)
+  assert.ok(textOf(main[0]).includes(EN['pair.qrHint']), 'and it belongs to the text column')
+})
+
+test('the symbol is styled with theme tokens, a card-width cap and a real quiet zone', () => {
+  /* Source level, because there is no layout engine here. The quiet zone is
+     GEOMETRY — four modules carried by the viewBox — rather than a padding in
+     pixels, because a fixed padding is ~1 module on a v1 symbol and ~3 on a v11
+     one: it cannot be the four the standard asks for on every version. The CSS
+     padding stays as extra breathing room around it. */
+  const stylesheet = /const CSS = ([\s\S]*?)\]\.join\('\\n'\)/.exec(clientSource)
+  assert.ok(stylesheet !== null, 'the injected stylesheet must be discoverable')
+  const css = stylesheet[1]
+
+  /* 176px, not a viewport-relative cap: the pairing card is two columns and the
+     symbol column has to leave ~374px for the code, the countdown and the link
+     inside a 640px modal. Growing it is a layout decision, not a fluid one. */
+  assert.match(css, /\.drc-qr\{[^}]*width:176px/)
+  assert.match(css, /\.drc-qr\{[^}]*aspect-ratio:1/)
+  assert.match(css, /\.drc-qr\{[^}]*padding:10px/, 'the extra margin around the quiet zone')
+
+  /* A QR symbol is dark modules on a LIGHT surround in every theme. The
+     `--dsw-alias-*` pair used to be asked for that, but it flips: on a dark theme
+     label-primary turns light and bg-layer-1 turns dark, so the panel drew a
+     light-on-dark symbol. The theme-independent members of the token set are the
+     only ones that keep the polarity fixed, and they are still tokens. */
+  assert.match(css, /\.drc-qr\{[^}]*color:var\(--dsw-static-neutral-bluish-1000\)/)
+  assert.match(css, /\.drc-qr\{[^}]*background:var\(--dsw-static-neutral-bluish-00\)/)
+  assert.ok(!/\.drc-qr\{[^}]*color:var\(--dsw-alias-label-primary\)/.test(css),
+    'the module colour must not follow the theme, or a dark theme inverts the symbol')
+  assert.ok(!/\.drc-qr\{[^}]*background:var\(--dsw-alias-bg-layer-1\)/.test(css),
+    'the surround must stay light on every theme')
+  /* No literal colour anywhere near the symbol. */
+  assert.ok(!/#[0-9a-fA-F]{3,8}\b/.test(css), 'no hex colour may appear in the stylesheet')
+})
+
+test('the QR strings exist in both languages and in the locale files', () => {
+  const { ZH, EN } = loadClientBundle().bundle.internals
+  const zhFile = readJson('locale/zh.json')
+  const enFile = readJson('locale/en.json')
+  for (const key of ['pair.qrAlt', 'pair.qrHint', 'pair.tooLong']) {
+    assert.equal(typeof ZH[key], 'string', `zh.${key} is missing`)
+    assert.equal(typeof EN[key], 'string', `en.${key} is missing`)
+    assert.equal(zhFile[key], ZH[key], `locale/zh.json disagrees with the inline ZH for ${key}`)
+    assert.equal(enFile[key], EN[key], `locale/en.json disagrees with the inline EN for ${key}`)
+  }
+  /* The label has to be readable on its own: it is what a screen reader announces
+     in place of the image. */
+  assert.ok(EN['pair.qrAlt'].length >= 8 && ZH['pair.qrAlt'].length >= 4)
+  /* And the too-long message must point at the fallback rather than just refuse. */
+  assert.match(EN['pair.tooLong'], /text code/i)
+  assert.match(ZH['pair.tooLong'], /文本码/)
 })

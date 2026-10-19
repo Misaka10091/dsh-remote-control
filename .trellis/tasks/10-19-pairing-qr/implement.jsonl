@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/frontend/index.md", "reason": "前端开发前清单：本次改动全在客户端半边"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "单入口契约、apply 不抛、baseline 白名单、i18n 四份同步"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "组件与模态内的布局、主题 token、无写死颜色"}
+{"file": ".trellis/tasks/10-19-pairing-qr/research/qr-reference-vectors.md", "reason": "参考实现与解码器用法、三个实测坑、容量曲线"}
+{"file": ".trellis/tasks/10-19-pairing-qr/design.md", "reason": "编码器流水线、SVG 形状、fixture 格式与断言清单"}

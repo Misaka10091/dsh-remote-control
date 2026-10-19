@@ -18,7 +18,11 @@
   "commit": null,
   "pr_url": null,
   "subtasks": [],
-  "children": [],
+  "children": [
+    "10-19-panel-access-modes",
+    "10-19-pairing-qr",
+    "10-19-github-release-flow"
+  ],
   "parent": null,
   "relatedFiles": [],
   "notes": "",

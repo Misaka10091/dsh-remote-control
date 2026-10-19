@@ -54,6 +54,7 @@
  * failure destroys the response instead of throwing `ERR_HTTP_HEADERS_SENT`.
  */
 import { ADMIN_API_PREFIX, DEVICE_ID_PREFIX, PAIRING_ROUTE_PATH } from './constants.js'
+import { listLanAddresses, validateAccess } from './addresses.js'
 import { dayKeyOf } from './audit.js'
 import { isLoopback } from './loopback.js'
 import { checkOrigin } from './origin.js'
@@ -318,6 +319,10 @@ function publicDevice(device, liveConnections) {
  *   revocation reaches `gateway.revokeDevice` — the single entry point that both
  *   writes the store AND closes live sockets (`quality-guidelines.md` §18).
  * @param {object} [options.logger]
+ * @param {() => { address: string, iface: string, private: boolean }[]} [options.listLanAddresses]
+ *   Injectable NIC enumeration. Defaults to the real `os.networkInterfaces()` read;
+ *   overridden by tests so an assertion about `GET /state` never depends on the
+ *   machine running the suite (`quality-guidelines.md` — injectable side effects).
  * @returns {{ dispose: () => void, available: boolean, guard: Function }}
  */
 export function startAdminApi(options) {
@@ -328,6 +333,9 @@ export function startAdminApi(options) {
   const audit = options.audit
   const getGateway = typeof options.getGateway === 'function' ? options.getGateway : () => null
   const logger = options.logger
+  const readLanAddresses = typeof options.listLanAddresses === 'function'
+    ? options.listLanAddresses
+    : () => listLanAddresses()
 
   /** Report one diagnostic line; never a body, a code, or a token. */
   function log(level, message) {
@@ -454,6 +462,13 @@ export function startAdminApi(options) {
       status: 200,
       data: {
         settings: store.getSettings(),
+        /* The NIC list travels with the state read because it is a fact about
+           THIS MOMENT, not a setting: a cable that comes back does not need the
+           panel restarted, and the stored `lanAddress` is returned unchanged
+           beside it so the panel can tell "your choice is still here" from "your
+           choice is gone, showing a fallback" (`design.md` §1.2).
+           No address is written from this read — nothing here persists. */
+        addresses: { lan: readLanAddresses() },
         devices: {
           active: devices.filter((device) => device.revokedAt === null).length,
           total: devices.length,
@@ -537,8 +552,10 @@ export function startAdminApi(options) {
     const port = gateway?.port ?? null
     /* The QR carries the pair in the FRAGMENT, so the code is never sent to the
        server as part of a navigation and never lands in an access log
-       (`design.md` §3.1 step 3). `host` is left for the panel: only it knows
-       which LAN address this machine is reachable on.
+       (`design.md` §3.1 step 3). `host` is left for the panel: it renders the link
+       from `settings.access` plus the NIC list in `GET /state`, and neither of
+       those is this response's business (the port is, because the gateway knows
+       it and the panel does not).
        `pairPath` comes from `constants.js` and is served by
        `gateway/pairing-route.js` — the panel and the route share one definition, so
        the link cannot point at a path nothing answers (which is what it did while
@@ -574,20 +591,45 @@ export function startAdminApi(options) {
   /**
    * POST /settings
    *
-   * Only `enabled` and `port` are writable, and both take effect on the NEXT
-   * plugin load. Saying so explicitly is the difference between a user
-   * understanding that their phone cannot connect yet and a user filing a bug:
-   * this stage deliberately does not restart a live listener underneath itself.
+   * Three writable fields, and the reload flag now answers a narrower question
+   * than it used to (`design.md` §2.3):
+   *
+   *   - `enabled` / `port` re-bind the listener, so a change to either really does
+   *     need `dsh` restarted. `requiresReload` is `true` only when one of them
+   *     ACTUALLY changed — comparing before and after, not "a settings write
+   *     happened". A panel that says "restart to apply" after an address edit
+   *     sends the user to restart a process for nothing.
+   *   - `access` only shapes the pairing link the panel renders. It takes effect
+   *     immediately and is never a reason to restart.
+   *
+   * `access` is validated strictly and, on failure, the request is refused BEFORE
+   * anything is written: a 400 that had already half-applied the other fields
+   * would leave the panel's next read disagreeing with what it was told.
    */
   function updateSettings(body) {
     const patch = {}
     if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
     if (Number.isInteger(body.port) && body.port > 0 && body.port <= 65535) patch.port = body.port
+    if (body.access !== undefined) {
+      const validated = validateAccess(body.access)
+      if (!validated.ok) throw adminError('admin/invalid-access', validated.message)
+      patch.access = validated.access
+    }
     if (Object.keys(patch).length === 0) {
       throw adminError('admin/invalid-settings', 'no writable setting was provided')
     }
+    /* Read BEFORE the write so "did the listener configuration change" is a real
+       comparison. Both reads are of the same file within one request, so there is
+       no window a concurrent writer could exploit here: this API has one client. */
+    const before = store.getSettings()
     const settings = store.updateSettings(patch)
-    return { status: 200, data: { settings, requiresReload: true } }
+    return {
+      status: 200,
+      data: {
+        settings,
+        requiresReload: settings.enabled !== before.enabled || settings.port !== before.port,
+      },
+    }
   }
 
   /** GET /audit — the panel's summary. */
@@ -791,7 +833,10 @@ export function startAdminApi(options) {
       case 'admin/invalid-device':
       case 'admin/invalid-name':
       case 'admin/invalid-source':
-      case 'admin/invalid-settings': return 400
+      case 'admin/invalid-settings':
+      /* A malformed access address is the caller's input, not a server fault:
+         reporting 500 would send the user to the host log for a typo. */
+      case 'admin/invalid-access': return 400
       case 'admin/unknown-device': return 404
       case 'admin/loopback-only':
       case 'admin/cross-origin': return 403

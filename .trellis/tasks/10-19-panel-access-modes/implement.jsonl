@@ -1,0 +1,7 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "开发前清单与质量门：本次跨 host 存储/API 与客户端两层"}
+{"file": ".trellis/spec/backend/database-guidelines.md", "reason": "settings 新增 access 字段的向后兼容与归一化规则"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "POST /settings 非法输入的错误码与不写盘约定"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "host 侧实现红线与测试要求"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "客户端加载期不崩、服务守卫、apply 不抛的既有红线"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "面板组件、portal、Esc 与焦点约定"}
+{"file": ".trellis/spec/frontend/state-management.md", "reason": "地址选择状态不得跨挂载泄漏"}

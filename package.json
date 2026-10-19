@@ -56,6 +56,7 @@
     "src/host/origin.js",
     "src/host/audit.js",
     "src/host/classify.js",
+    "src/host/addresses.js",
     "src/host/api.js",
     "src/host/gateway/server.js",
     "src/host/gateway/auth.js",

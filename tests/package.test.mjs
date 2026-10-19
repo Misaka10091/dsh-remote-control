@@ -204,6 +204,21 @@ test('the gateway modules exist and are all packaged', () => {
   }
 })
 
+test('the access-address module exists and is packaged', () => {
+  /* `files` is a publish boundary, and this module is imported by BOTH `store.js`
+     and `api.js` — a package missing it does not merely lose a feature, it fails
+     to load at all. It is exactly the kind of file that gets added to `src/` and
+     forgotten in the whitelist (`implement.md` step 6 calls this out). */
+  assert.ok(existsSync(path.join(repoRoot, 'src/host/addresses.js')))
+  assert.ok(pkg.files.includes('src/host/addresses.js'), 'src/host/addresses.js must be listed in files')
+  /* And the panel's addresses are only reachable through it, so the dependency is
+     real rather than decorative. */
+  for (const relative of ['src/host/store.js', 'src/host/api.js']) {
+    const source = readFileSync(path.join(repoRoot, relative), 'utf8')
+    assert.match(source, /from '\.\/addresses\.js'/, `${relative} must import the address rules`)
+  }
+})
+
 test('the signing-key module exists and is packaged', () => {
   /* `jwt-key.js` is required at gateway start, so a package without it installs a
      plugin that cannot bind a listener at all. */

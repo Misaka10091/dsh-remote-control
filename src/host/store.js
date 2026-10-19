@@ -43,6 +43,7 @@ import {
 import { homedir } from 'node:os'
 import path from 'node:path'
 
+import { defaultAccess, normalizeAccess } from './addresses.js'
 import {
   DEFAULT_GATEWAY_PORT,
   DEVICES_FILE_MODE,
@@ -76,9 +77,21 @@ function emptyDocument() {
   return {
     version: DEVICES_VERSION,
     devices: [],
-    settings: { enabled: false, port: DEFAULT_GATEWAY_PORT },
+    settings: { enabled: false, port: DEFAULT_GATEWAY_PORT, access: defaultAccess() },
   }
 }
+
+/**
+ * Normalizing `settings.access` is delegated to `addresses.js#normalizeAccess`,
+ * which is the LENIENT policy of that module's `readAccess`: it keeps what
+ * survives, drops what does not, and never throws. This file always takes that
+ * path on purpose — a `devices.json` on disk must NEVER fail to load because of a
+ * hand edit (`database-guidelines.md`: forward-compatible additions, defaults for
+ * missing fields). A broken address book is a broken LINK, not a broken plugin, so
+ * it degrades to "no addresses" and the panel says so. The strict twin,
+ * `validateAccess`, is what `POST /settings` answers `400 admin/invalid-access`
+ * with; same rules, different policy.
+ */
 
 /** Coerce a timestamp-ish value to a string, or null. */
 function asRecordedTime(value) {
@@ -186,6 +199,10 @@ function normalizeDocument(parsed) {
     settings: {
       enabled: settings.enabled === true,
       port,
+      /* Additive and backfilled: a `devices.json` written before this field
+         existed loads with the documented defaults instead of needing a
+         migration (`database-guidelines.md` §Migrations). */
+      access: normalizeAccess(settings.access),
     },
   }
 }
@@ -284,7 +301,7 @@ function buildStore(baseDir, now) {
    * Temp file in the same directory → write → `fsync` → `rename`. Same directory
    * matters: `rename` is only atomic within one filesystem.
    *
-   * @param {{ version?: number, devices: unknown[], settings?: { enabled?: boolean, port?: number } }} document
+   * @param {{ version?: number, devices: unknown[], settings?: { enabled?: boolean, port?: number, access?: object } }} document
    */
   function write(document) {
     const normalized = normalizeDocument(
@@ -342,12 +359,31 @@ function buildStore(baseDir, now) {
     return read().settings
   }
 
-  /** Merge a partial settings patch and persist. Only `enabled` / `port` are writable. */
+  /**
+   * Merge a partial settings patch and persist.
+   *
+   * `enabled` / `port` / `access` are the writable fields; anything else in the
+   * patch is ignored, which is what keeps a caller from inventing settings the
+   * rest of the package does not read.
+   *
+   * `access` is replaced WHOLESALE rather than merged. A partial merge would make
+   * "delete the third public address" inexpressible without an index-shaped
+   * protocol, and the panel always holds the full value anyway (it re-reads
+   * `GET /state` after every write). The replacement is normalized first, so a
+   * caller that skips `addresses.js` still cannot store an unusable address.
+   *
+   * @param {{ enabled?: boolean, port?: number, access?: object }} [patch]
+   */
   function updateSettings(patch = {}) {
     const document = read()
-    const next = { enabled: document.settings.enabled, port: document.settings.port }
+    const next = {
+      enabled: document.settings.enabled,
+      port: document.settings.port,
+      access: document.settings.access,
+    }
     if (typeof patch.enabled === 'boolean') next.enabled = patch.enabled
     if (Number.isInteger(patch.port) && patch.port > 0 && patch.port <= 65535) next.port = patch.port
+    if (patch.access !== undefined) next.access = normalizeAccess(patch.access)
     document.settings = next
     return write(document).settings
   }

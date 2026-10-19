@@ -51,6 +51,43 @@ export const TOKEN_HASH_PATTERN = /^[0-9a-f]{64}$/
 /** Default port of the self-hosted gateway when `settings.port` is absent. */
 export const DEFAULT_GATEWAY_PORT = 3090
 
+/* ------------------------------------------------------------------ *
+ * Access addresses (`settings.access`, `prd.md` R2/R3/R5)
+ *
+ * The pairing link's hostname comes from an address the user picks, not from the
+ * page's own origin — a desktop browser on `127.0.0.1` would otherwise hand a
+ * phone a link it can never open. These are DISPLAY-LAYER facts: a wrong address
+ * makes a link unusable and changes nothing else. It is never an authorization
+ * input (never compared against a device, never gates the listener), so the
+ * bounds below exist to keep storage and the panel sane, not to defend a trust
+ * boundary.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Most entries the user's public-address book may hold.
+ *
+ * The list is hand-maintained (a home DDNS name, an office domain, a tunnel
+ * hostname…) and every row has to be individually selectable in the panel, so the
+ * cap is about the UI staying usable rather than about abuse. Truncation is the
+ * store's fallback; the API refuses an oversized list outright.
+ */
+export const PUBLIC_ADDRESS_MAX = 8
+
+/** Longest free-text label on one public-address row. A note, not a description. */
+export const PUBLIC_LABEL_MAX = 40
+
+/**
+ * Longest accepted access-address string.
+ *
+ * 253 is the DNS name length limit (RFC 1035 §2.3.4, in presentation form), which
+ * is the natural ceiling for `host[:port]` / `scheme://host[:port]`. Rejecting
+ * longer input keeps a pasted log line from becoming a stored address.
+ */
+export const ADDRESS_TEXT_MAX = 253
+
+/** Accepted values of `settings.access.mode`. `lan` is the default and the safer one. */
+export const ACCESS_MODES = Object.freeze(['lan', 'public'])
+
 /** Leading string of every device id, so an id can never be mistaken for a token hash. */
 export const DEVICE_ID_PREFIX = 'dev_'
 

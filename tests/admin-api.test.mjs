@@ -39,6 +39,22 @@ import { TEST_JWT_KEY, cleanupDir, makeTempDir, pairDevice } from './helpers.mjs
 /** Fixed clock: 2026-10-17T03:04:43.000Z. */
 const AT = Date.UTC(2026, 9, 17, 3, 4, 43)
 
+/**
+ * The NIC list every admin-API test reports.
+ *
+ * Injected (`startAdminApi` takes `listLanAddresses`) because the real
+ * `os.networkInterfaces()` differs per machine: an assertion about `GET /state`
+ * must not describe the runner's hardware, and a suite that silently depends on
+ * "this box has a 192.168 address" fails only on somebody else's laptop.
+ */
+const FAKE_LAN = [
+  { address: '192.168.1.5', iface: 'WLAN', private: true },
+  { address: '10.0.0.7', iface: 'Ethernet', private: true },
+]
+
+/** The default access block a fresh store carries. */
+const DEFAULT_ACCESS = { mode: 'lan', lanAddress: '', public: [], selectedPublicId: null }
+
 /** Every listener started by a test, torn down in `after`. */
 const started = []
 
@@ -132,6 +148,9 @@ async function startAdminHost(spec) {
     pairing: spec.runtime.pairing,
     audit: spec.runtime.audit,
     getGateway: () => spec.gateway ?? null,
+    /* A fixed NIC list, so `GET /state` is asserted against a known answer rather
+       than against the machine running the suite. */
+    listLanAddresses: spec.listLanAddresses ?? (() => FAKE_LAN),
     logger: {
       debug: () => {}, info: () => {}, error: () => {},
       warn: (message) => log.push(message),
@@ -824,9 +843,9 @@ test('settings are readable and writable, and a reload is flagged', async () => 
     })
     assert.equal(after.status, 200)
     const data = JSON.parse(after.body).data
-    assert.deepEqual(data.settings, { enabled: true, port: 3091 })
+    assert.deepEqual(data.settings, { enabled: true, port: 3091, access: DEFAULT_ACCESS })
     assert.equal(data.requiresReload, true, 'a live listener is not restarted underneath itself')
-    assert.deepEqual(runtime.store.getSettings(), { enabled: true, port: 3091 })
+    assert.deepEqual(runtime.store.getSettings(), { enabled: true, port: 3091, access: DEFAULT_ACCESS })
   } finally {
     await host.stop()
     cleanupDir(runtime.dir)
@@ -848,7 +867,161 @@ test('an invalid setting is refused rather than silently ignored', async () => {
       assert.equal(res.status, 400, body)
       assert.equal(JSON.parse(res.body).error.code, 'admin/invalid-settings', body)
     }
-    assert.deepEqual(runtime.store.getSettings(), { enabled: false, port: 3090 }, 'nothing changed')
+    assert.deepEqual(runtime.store.getSettings(), { enabled: false, port: 3090, access: DEFAULT_ACCESS }, 'nothing changed')
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('the state read reports the live NIC list beside the stored choice', async () => {
+  /* The list is a fact about THIS MOMENT while the choice is a setting, so they
+     travel together and the panel resolves them. `GET /state` never writes the
+     fallback (`design.md` §1.2) — a cable that comes back must not have silently
+     replaced what the user picked. */
+  const runtime = makeRuntime()
+  runtime.store.updateSettings({ access: { mode: 'lan', lanAddress: '10.0.0.7' } })
+  const host = await startAdminHost({ runtime })
+  try {
+    const res = await send({
+      port: host.port,
+      path: `${ADMIN_API_PREFIX}/state`,
+      headers: { host: loopbackHost(host.port) },
+    })
+    assert.equal(res.status, 200)
+    const data = JSON.parse(res.body).data
+    assert.deepEqual(data.addresses, { lan: FAKE_LAN })
+    assert.deepEqual(data.settings.access, {
+      mode: 'lan',
+      lanAddress: '10.0.0.7',
+      public: [],
+      selectedPublicId: null,
+    })
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('an invalid access block is refused with 400 and nothing is written', async () => {
+  /* The point of the strict validator: a refused request must not half-apply. The
+     FILE BYTES are compared, not just the parsed settings — a write that left the
+     same values in a different order would still be a write, and a 400 followed by
+     a disk change is exactly the panel/host disagreement this guards. */
+  const runtime = makeRuntime()
+  const host = await startAdminHost({ runtime })
+  const settingsPath = path.join(runtime.dir, 'devices.json')
+  try {
+    /* Seed a document so the file exists before the refused requests. */
+    runtime.store.updateSettings({ port: 3090 })
+    const before = readFileSync(settingsPath, 'utf8')
+
+    const invalid = [
+      { access: null },
+      { access: 'nope' },
+      { access: { mode: 'sideload' } },
+      { access: { lanAddress: 'has/a/path' } },
+      { access: { public: 'nope' } },
+      { access: { public: [{ id: 'pub_a', address: 'has/a/path' }] } },
+      { access: { public: [{ id: '', address: 'home.example.com' }] } },
+      /* A valid `port` beside an invalid `access` must not be applied either. */
+      { port: 4000, access: { mode: 'sideload' } },
+    ]
+    for (const body of invalid) {
+      const res = await send({
+        port: host.port,
+        method: 'POST',
+        path: `${ADMIN_API_PREFIX}/settings`,
+        headers: { host: loopbackHost(host.port), 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      assert.equal(res.status, 400, JSON.stringify(body))
+      const payload = JSON.parse(res.body)
+      assert.equal(payload.error.code, 'admin/invalid-access', JSON.stringify(body))
+      /* Renderable: the panel shows this sentence, so it must not be empty and must
+         not quote internals. */
+      assert.ok(payload.error.message.length > 0)
+      assert.ok(!payload.error.message.includes(runtime.dir), 'no file paths in the message')
+    }
+
+    assert.equal(readFileSync(settingsPath, 'utf8'), before, 'not one byte may change on a refused write')
+    assert.deepEqual(runtime.store.getSettings(), { enabled: false, port: 3090, access: DEFAULT_ACCESS })
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('an access write is live immediately, so it does not ask for a reload', async () => {
+  /* `requiresReload` narrowed (`design.md` §2.3): it now answers "did the
+     LISTENER configuration change", not "did a settings write happen". Telling a
+     user to restart dsh after editing an address sends them to restart a process
+     for a string. */
+  const runtime = makeRuntime()
+  const host = await startAdminHost({ runtime })
+  const post = (body) => send({
+    port: host.port,
+    method: 'POST',
+    path: `${ADMIN_API_PREFIX}/settings`,
+    headers: { host: loopbackHost(host.port), 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  try {
+    const access = {
+      mode: 'public',
+      lanAddress: '192.168.1.5',
+      public: [
+        { id: 'pub_a', label: '家里 DDNS', address: 'home.example.com:3090' },
+        { id: 'pub_b', label: '隧道', address: 'https://dsh.example.net' },
+        { id: 'pub_c', label: '', address: '10.1.2.3:4000' },
+      ],
+      selectedPublicId: 'pub_b',
+    }
+
+    const onlyAccess = await post({ access })
+    assert.equal(onlyAccess.status, 200)
+    const accessData = JSON.parse(onlyAccess.body).data
+    assert.equal(accessData.requiresReload, false, 'addresses never re-bind the listener')
+    assert.deepEqual(accessData.settings.access, access)
+    /* Three rows coexist, which is `prd.md` acceptance 4. */
+    assert.equal(accessData.settings.access.public.length, 3)
+
+    /* Re-sending the SAME values is still not a listener change. */
+    assert.equal(JSON.parse((await post({ enabled: false })).body).data.requiresReload, false)
+
+    /* The port really does need a restart. */
+    const portChange = await post({ port: 4000 })
+    const portData = JSON.parse(portChange.body).data
+    assert.equal(portData.requiresReload, true)
+
+    /* And so does the switch. */
+    const enabled = await post({ enabled: true })
+    assert.equal(JSON.parse(enabled.body).data.requiresReload, true)
+
+    /* Re-saving the same port is not a change: the flag answers "differs", not
+       "was written". */
+    assert.equal(JSON.parse((await post({ port: 4000 })).body).data.requiresReload, false)
+
+    /* The address block survived every one of those writes. */
+    assert.deepEqual(runtime.store.getSettings().access, access)
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('the state read never invents an address when the host has no NICs', async () => {
+  /* The container/CI case, and the case the panel's `pair.loopbackHint` exists for:
+     an empty list must come back as an empty list, not as a fabricated loopback. */
+  const runtime = makeRuntime()
+  const host = await startAdminHost({ runtime, listLanAddresses: () => [] })
+  try {
+    const res = await send({
+      port: host.port,
+      path: `${ADMIN_API_PREFIX}/state`,
+      headers: { host: loopbackHost(host.port) },
+    })
+    assert.deepEqual(JSON.parse(res.body).data.addresses, { lan: [] })
   } finally {
     await host.stop()
     cleanupDir(runtime.dir)

@@ -35,8 +35,8 @@ This plugin takes a different route:
 
 1. Open the device panel (sidebar, bottom) and choose **Add device**. The host
    mints an 8-character base32 code with a 120-second lifetime, shown grouped as
-   `XXXX-XXXX` with a copy button.
-2. Open the link
+   `XXXX-XXXX` with a copy button, beside a **QR code** of the same pairing link.
+2. Scan the QR with the phone camera, or open the link
    `http://<lan-ip>:<port>/remote-control/pair#<pairId>:<code>` on the device, or
    type the code into the manual entry field. The pair lives in the **fragment**,
    which a browser never sends to a server, so the code cannot land in an access
@@ -54,13 +54,28 @@ This plugin takes a different route:
 The code is never logged, never audited and never written to disk. Without a
 fragment the page shows a manual entry field for the `<pairId>:<code>` pair.
 
-> **No QR code in this version.** The intended flow is a QR beside the text code,
-> but a QR encoder needs Reed–Solomon error correction, mask selection and format
-> info, and this package stays dependency-free (a rule enforced by a test). A
-> hand-written encoder cannot be validated without a scanner, and an unscannable
-> code is indistinguishable from a network fault — worse than no code. So the
-> text code and the one-time link are the primary path. A QR is planned once it
-> can be verified.
+> **The QR code is hand-written and byte-mode only.** No dependency was added: the
+> encoder (byte mode, error-correction level M, versions 1–15, mask chosen by the
+> N1–N4 penalty) is plain JavaScript in the browser half. It is verified by
+> bit-for-bit comparison against node-qrcode — a development-time tool that is
+> **not** a dependency — for 6 texts × 8 masks plus 8 automatic version/mask
+> choices, and its output was read back by an independent decoder for v1–v11.
+> Two consequences worth knowing:
+>
+> - It never segments a link into numeric / alphanumeric / byte runs, so a symbol
+>   can be one or two versions larger than the theoretical minimum. Predictable
+>   and verifiable beats smallest.
+> - The symbol is always dark modules on a light surround, dark theme included. It
+>   uses the theme-independent members of the design token set (never a literal
+>   colour), because the theme-following pair inverts the symbol on a dark theme
+>   and some scanners refuse a light-on-dark code. Its four-module quiet zone is
+>   part of the geometry, so it scales with the symbol instead of disappearing on
+>   the smallest one.
+>
+> A link longer than v15-M can hold (412 bytes) shows a message and keeps the text
+> code and the link — nothing is ever truncated. And **no real phone has scanned
+> one of these yet**: the automated verification is a reference encoder plus an
+> independent decoder, not a camera.
 
 > **Upgrading from an earlier build: every paired device must re-pair.**
 >
@@ -350,6 +365,15 @@ by advancing a number rather than sleeping.
 > a test file ([nodejs/node#64555](https://github.com/nodejs/node/issues/64555)).
 > The `test` script passes a glob instead, which works on every version.
 
+### Releasing
+
+`docs/RELEASING.md` is the runbook. Read its first section before anything else:
+`0.1.0` must be published by hand, because the package is not on npm yet and npm
+Trusted Publisher can only be configured on a package that already exists. From the
+next version on, pushing a `vX.Y.Z` tag publishes to npm over OIDC and creates a
+GitHub Release with the same `.tgz`, and the doc says exactly which parts of that
+path are locally verifiable and which are not.
+
 ## Roadmap
 
 - [x] **0** Package skeleton, manifest, bundle patch, one-line load
@@ -359,7 +383,7 @@ by advancing a number rather than sleeping.
 - [x] **3** Gateway WebSocket: upgrade auth, `/api/remote.mux` passthrough
 - [x] **4** Management API (`/remote-control/api/*`, loopback only) and audit
 - [x] **5** Client panel: enable switch, port, device list, revoke, audit export
-  (text code + one-time link; **no QR** — see "Pairing a device")
+  (text code + one-time link + QR — see "Pairing a device")
   (+ the pairing route that redeems the code — `gateway/pairing-route.js`)
 - [ ] **6** Real-device verification and documentation
 
