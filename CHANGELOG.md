@@ -212,6 +212,17 @@ local audit trail. No relay, no third-party service.
   absent service leaves the callback pending) and asserts it really throws
   before asserting the panel still mounts; a second test drives a service that
   explodes mid-mount and asserts `apply` reports instead of rethrowing.
+- **"No runtime directory yet" is decided by cause, not by platform.** `store.js`
+  and `jwt-key.js` accepted only `ENOENT` as "no file here yet". When the base
+  directory is really a regular file, Linux reports `ENOTDIR` for the very same
+  setup, so `store/unreadable` and `jwt-key/unreadable` were raised on Linux while
+  the assertions expected `write-failed` — the reason this repository's first real
+  `npm-publish.yml` run failed at `Test package` with exactly two assertion errors,
+  after a fully green local suite. Both codes are lexical facts about the path, not
+  evidence of an unreadable secret, so the guard now accepts either and lets
+  `ensureDir` report the real failure. `audit.js` deliberately keeps the narrow
+  `ENOENT`: it reads `baseDir` itself, where `ENOTDIR` genuinely means the audit
+  directory is not a directory.
 
 ### Security notes
 

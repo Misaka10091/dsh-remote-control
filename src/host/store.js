@@ -283,7 +283,14 @@ function buildStore(baseDir, now) {
     try {
       raw = readFileSync(devicesPath, 'utf8')
     } catch (error) {
-      if (error !== null && typeof error === 'object' && error.code === 'ENOENT') return emptyDocument()
+      /* `ENOENT` is "no such file"; `ENOTDIR` is "a component of the path is not a
+         directory", which is what Linux reports where Windows reports `ENOENT` for
+         the same setup — a base directory that is really a regular file. Both mean
+         "no devices.json here yet", so the first run stays a first run on every
+         platform and the genuine failure (the directory cannot be made) is reported
+         by `ensureDir` as `store/write-failed` instead of being pre-empted here. */
+      if (error !== null && typeof error === 'object'
+        && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) return emptyDocument()
       throw storeError('store/unreadable', 'devices.json could not be read')
     }
     let parsed

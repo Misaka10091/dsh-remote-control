@@ -204,7 +204,14 @@ function readKeyFile(keyPath) {
   try {
     bytes = readFileSync(keyPath)
   } catch (error) {
-    if (error !== null && typeof error === 'object' && error.code === 'ENOENT') return undefined
+    /* `ENOENT` is "no such file"; `ENOTDIR` is "a component of the path is not a
+       directory". Linux reports the second where Windows reports the first for the
+       same setup — a runtime directory that is really a regular file — and both mean
+       "there is no key at this path". Narrowing this to `ENOENT` classified the
+       failure by platform instead of by cause: on Linux the missing key became
+       `jwt-key/unreadable` and the real news never got a chance to surface. */
+    if (error !== null && typeof error === 'object'
+      && (error.code === 'ENOENT' || error.code === 'ENOTDIR')) return undefined
     /* Permissions, a directory in the way, an I/O error: all of them mean "there is
        a key here that this process cannot use", which is a refusal to start rather
        than a reason to mint a second one. */

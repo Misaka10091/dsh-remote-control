@@ -667,6 +667,11 @@ export function createAudit(options = {}) {
       names = readdirSync(baseDir)
     } catch (error) {
       /* A missing directory is the first run, not a failure. */
+      /* Only `ENOENT` is the first run. `ENOTDIR` is deliberately NOT exempt here:
+         unlike `store.js`/`jwt-key.js`, which read a FILE below `baseDir` (where a
+         non-directory component only means "that file does not exist yet"), this
+         call reads `baseDir` ITSELF — `ENOTDIR` means the audit directory is really
+         a regular file, i.e. damage, and must stay a reported failure. */
       if (error !== null && typeof error === 'object' && error.code === 'ENOENT') {
         return { scanned: 0, deleted: [] }
       }
