@@ -4,6 +4,31 @@ All notable changes to this project are documented here.
 
 Format: `## vX.Y.Z — YYYY-MM-DD`.
 
+## Unreleased
+
+### Changed
+
+- **The pairing card now says 「已使用」 once a device has redeemed the code.**
+  The card only had a local countdown, so a redeemed code kept counting down as
+  though it were still good — the one question a user actually asks after scanning
+  (「配上了吗」) had no answer on screen. The card gains a **刷新** button that asks
+  the new `GET /remote-control/api/pairing/:pairId` what became of that code
+  (`pending` / `used` / `locked` / `expired` / `unknown`), and a code that is no
+  longer redeemable is replaced by its state plus 「生成新码」 — symbol, text code
+  and link are removed rather than left as an invitation to a scan that must fail.
+  The read is deliberately manual (no polling) and spends no failure budget, so
+  refreshing can never burn the code it describes; it also never returns the code
+  or the label.
+
+- **The audit no longer records 「未识别动作」 (`unknown`).** Every write whose path
+  the classifier does not recognize used to be written as `unknown`, on the theory
+  that degrading beat guessing. In practice DSH's own transport writes
+  (`/api/session/control` and the streaming endpoints) are unrecognized by design,
+  so the trail filled with rows that named no action and no device, around the
+  handful of events it exists for. Unknown writes and unknown upgrade channels are
+  now dropped; the `unknown` event stays readable and filterable for files written
+  before this change.
+
 ## v0.1.1 — 2026-10-19
 
 ### Fixed
