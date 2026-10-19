@@ -1502,7 +1502,9 @@ function pairingSnapshot(overrides = {}) {
     busy: false,
     failure: null,
     remainingMs: 90_000,
+    state: 'pending',
     start: async () => {},
+    refresh: async () => {},
     clear: () => {},
     ...rest,
     current: {
@@ -1625,6 +1627,81 @@ test('the QR hint names the text code, so the symbol is never the only way in', 
   assert.equal(main.length, 1)
   assert.ok(textOf(main[0]).includes(EN['pair.qrHint']), 'and it belongs to the text column')
 })
+
+test('the pairing card offers a manual state refresh, and asks the host for it', () => {
+  /* 2026-10-19: 已用的配对码显示已使用，支持手动刷新. The countdown cannot tell a
+     waiting code from a redeemed one, and the card does not poll: the button is the
+     whole mechanism (`prd.md`: no auto-refresh). */
+  let asked = 0
+  const { tree, bundle } = renderPairing({ pairing: pairingSnapshot({ refresh: async () => { asked += 1 } }) })
+  const { EN } = bundle.internals
+
+  const refresh = findAll(tree, (node) => node.type === 'button'
+    && textOf(node) === EN['pair.refresh'])
+  assert.equal(refresh.length, 1, 'one refresh button on a live code')
+  propsOf(refresh[0]).onClick()
+  return Promise.resolve().then(() => {
+    assert.equal(asked, 1, 'the click must reach the hook, not just look like it does')
+  })
+})
+
+test('a code the host reports as used shows 已使用 instead of a live countdown', () => {
+  const { tree, bundle } = renderPairing({ pairing: pairingSnapshot({ state: 'used' }) })
+  const { EN } = bundle.internals
+
+  /* Nothing that invites a scan survives: a dead code's symbol, text and link are
+     all removed, not merely annotated. */
+  assert.equal(findAll(tree, (node) => propsOf(node).className === 'drc-qr').length, 0, 'no symbol')
+  assert.equal(findAll(tree, (node) => propsOf(node).className === 'drc-code drc-mono').length, 0, 'no code')
+  assert.equal(findAll(tree, (node) => node.type === 'input').length, 0, 'no link')
+
+  const text = textOf(tree)
+  assert.ok(text.includes(EN['pair.state.used']), '已使用 must be on screen')
+  assert.ok(text.includes(EN['pair.state.usedHint']), 'and it must say the device is listed')
+  assert.ok(text.includes(EN['pair.newCode']), 'the useful next action is offered')
+  assert.ok(!text.includes(EN['pair.expires'].replace('{seconds}', '90')), 'no countdown for a dead code')
+  assert.ok(!text.includes(EN['pair.refresh']), 'nothing left to refresh')
+})
+
+test('every dead pair state is named, and only a used one says the device paired', () => {
+  const { bundle } = loadClientBundle()
+  const { EN, pairingStateLabel, fallbackTranslate } = bundle.internals
+
+  assert.equal(pairingStateLabel('pending', fallbackTranslate), null, 'a waiting code needs no badge')
+  assert.equal(pairingStateLabel('used', fallbackTranslate), EN['pair.state.used'])
+  assert.equal(pairingStateLabel('expired', fallbackTranslate), EN['pair.state.expired'])
+  assert.equal(pairingStateLabel('locked', fallbackTranslate), EN['pair.state.locked'])
+  assert.equal(pairingStateLabel('unknown', fallbackTranslate), EN['pair.state.unknown'])
+
+  for (const state of ['expired', 'locked', 'unknown']) {
+    const { tree } = renderPairing({ pairing: pairingSnapshot({ state }) })
+    const text = textOf(tree)
+    assert.ok(text.includes(EN['pair.state.' + state]), state)
+    assert.ok(text.includes(EN['pair.state.deadHint']), state)
+    assert.ok(!text.includes(EN['pair.state.usedHint']), `${state} must not claim the device paired`)
+  }
+})
+
+test('an unrecognized host state is not trusted as a live code', () => {
+  /* A newer host could report a state this bundle does not know. Painting it as
+     live would invite a scan that may fail; `unknown` is the honest floor. */
+  const { tree, bundle } = renderPairing({ pairing: pairingSnapshot({ state: 'rotated-out' }) })
+  const { EN } = bundle.internals
+  assert.ok(textOf(tree).includes(EN['pair.state.unknown']))
+  assert.equal(findAll(tree, (node) => propsOf(node).className === 'drc-code drc-mono').length, 0)
+})
+
+test('the status route is a READ of one pair id, never a second mint', () => {
+  /* Byte-level guard: the hook must ask `pairing/<id>` with the GET default, and
+     must never post a refresh (a POST there would mint a new code). */
+  assert.match(clientSource, /const PAIRING_STATUS_PATH = 'pairing'/)
+  assert.match(
+    clientSource,
+    /requestJson\(PAIRING_STATUS_PATH \+ '\/' \+ encodeURIComponent\(current\.pairId\)\)/,
+    'the refresh must name the pair and take the default method',
+  )
+})
+
 
 test('the symbol is styled with theme tokens, a card-width cap and a real quiet zone', () => {
   /* Source level, because there is no layout engine here. The quiet zone is

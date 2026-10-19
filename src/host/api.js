@@ -83,6 +83,16 @@ const BODY_TIMEOUT_MS = 10_000
 /** Accepted device id shape: the store's prefix plus a base64url body. */
 const DEVICE_ID_PATTERN = new RegExp(`^${DEVICE_ID_PREFIX}[A-Za-z0-9_-]{1,80}$`)
 
+/**
+ * Accepted pairing id shape: `pair_` plus a base64url body (`pairing.js` mints
+ * 12 characters; the bound is generous so the two cannot drift).
+ *
+ * The pattern is what keeps a caller-supplied id from being echoed back as a
+ * free-form string by the status route: a refused id is a `400`, and only an
+ * id of the documented shape is ever answered or repeated in a response.
+ */
+const PAIR_ID_PATTERN = /^pair_[A-Za-z0-9_-]{1,80}$/
+
 /** Longest device name the panel may set. */
 const MAX_DEVICE_NAME_LENGTH = 80
 
@@ -592,6 +602,38 @@ export function startAdminApi(options) {
     }
   }
 
+  /**
+   * GET /pairing/:pairId — what became of one minted code.
+   *
+   * The panel holds the code and a local countdown, which cannot tell a code that
+   * is still waiting from one the phone already redeemed; a redeemed code kept
+   * counting down as though it were usable. This read answers exactly that
+   * question, on demand (the panel's 「刷新」 button) rather than on a poll: the
+   * code lives 120 s, and a timer that watched it would be a second mechanism for
+   * a fact one click already provides.
+   *
+   * `state` is `pairing.js#state`'s five-value vocabulary. `unknown`/`expired`/
+   * `locked` are ANSWERS (200), not errors: the id was well-formed, the host simply
+   * no longer has a live pair for it. Only a malformed id is a `400`, because that
+   * is the caller's typo and must not look like "no such code".
+   *
+   * ### What this route must never do
+   *
+   * Spend a failure budget. `pairing.state()` is a pure read, so refreshing cannot
+   * burn the very code the panel is showing. And the response carries the STATE
+   * only — never the code, never the label: this is a status probe, not a way to
+   * retrieve a credential.
+   *
+   * @param {string} pairId
+   * @returns {{ status: number, data: { pairId: string, state: string } }}
+   */
+  function pairingStatus(pairId) {
+    if (!PAIR_ID_PATTERN.test(pairId)) {
+      throw adminError('admin/invalid-pair', 'that is not a pairing id')
+    }
+    return { status: 200, data: { pairId, state: pairing.state(pairId) } }
+  }
+
   /** POST /pairing/reset — clear one address's brute-force budget. */
   function resetPairingSource(body) {
     const source = typeof body.source === 'string' ? body.source.trim() : ''
@@ -819,6 +861,14 @@ export function startAdminApi(options) {
             respond(res, resetPairingSource(body))
             return
           }
+          if (tail.length === 1) {
+            /* The status probe for one minted code (`GET /pairing/:pairId`).
+               Listed after `reset` so the one reserved segment cannot be read as
+               a pair id. */
+            requireMethod(method, ['GET'])
+            respond(res, pairingStatus(tail[0]))
+            return
+          }
           throw adminError('admin/not-found', 'there is no such endpoint')
         }
         case 'settings': {
@@ -933,6 +983,7 @@ export function startAdminApi(options) {
       case 'admin/bad-request':
       case 'admin/invalid-json':
       case 'admin/invalid-device':
+      case 'admin/invalid-pair':
       case 'admin/invalid-name':
       case 'admin/invalid-source':
       case 'admin/invalid-settings':

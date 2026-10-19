@@ -937,6 +937,64 @@ test('creating a pairing code returns it once and audits nothing about it', asyn
   }
 })
 
+test('the pairing status route reports what became of one code', async () => {
+  /* 2026-10-19: the panel's card could not tell a waiting code from a redeemed one,
+     so 「已用的配对码」 kept counting down as if it were still good. This route is
+     the answer the card's 「刷新」 button asks for — and it carries the STATE only,
+     never the code. */
+  const runtime = makeRuntime()
+  const host = await startAdminHost({ runtime })
+  try {
+    const minted = runtime.pairing.create({ label: 'phone' })
+    const read = () => send({
+      port: host.port,
+      path: `${ADMIN_API_PREFIX}/pairing/${minted.pairId}`,
+      headers: { host: loopbackHost(host.port) },
+    })
+
+    const before = await read()
+    assert.equal(before.status, 200)
+    assert.deepEqual(JSON.parse(before.body).data, { pairId: minted.pairId, state: 'pending' })
+
+    runtime.pairing.redeem(minted.pairId, minted.code)
+
+    const after = await read()
+    assert.equal(after.status, 200)
+    assert.equal(JSON.parse(after.body).data.state, 'used')
+    assert.ok(!after.body.includes(minted.code), 'the status read never hands the code back')
+    assert.ok(!after.body.includes('phone'), 'nor the label: this is a state probe')
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('the pairing status route answers unknown for a well-formed id it never minted', async () => {
+  const runtime = makeRuntime()
+  const host = await startAdminHost({ runtime })
+  try {
+    const res = await send({
+      port: host.port,
+      path: `${ADMIN_API_PREFIX}/pairing/pair_neverminted`,
+      headers: { host: loopbackHost(host.port) },
+    })
+    assert.equal(res.status, 200, 'a well-formed id is a question, not an error')
+    assert.deepEqual(JSON.parse(res.body).data, { pairId: 'pair_neverminted', state: 'unknown' })
+
+    /* A malformed id is the caller's typo and must not look like "no such code". */
+    const bad = await send({
+      port: host.port,
+      path: `${ADMIN_API_PREFIX}/pairing/not-a-pair-id`,
+      headers: { host: loopbackHost(host.port) },
+    })
+    assert.equal(bad.status, 400)
+    assert.equal(JSON.parse(bad.body).error.code, 'admin/invalid-pair')
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
 test('a failed pairing is audited as pair_failed', async () => {
   /* `research/official-connection-fence.md` §7.1: 爆破不可见 — the user cannot
      notice someone guessing unless a failed attempt leaves a trace. */
@@ -1573,8 +1631,8 @@ test('with a Cordis context the disposer belongs to ctx.effect, so API dispose i
 test('the admin API paths are not device actions, so classify never labels them', () => {
   /* The API runs on the official port; the gateway never proxies it. If these
      paths were classified as actions, a probe would be attributed to whatever
-     device sent it. */
-  assert.equal(classify('POST', `${ADMIN_API_PREFIX}/devices/dev_1/revoke`), 'unknown')
+     device sent it — and a write on them is 未识别动作, which is not recorded. */
+  assert.equal(classify('POST', `${ADMIN_API_PREFIX}/devices/dev_1/revoke`), null)
   assert.equal(classify('GET', `${ADMIN_API_PREFIX}/devices`), null)
 })
 

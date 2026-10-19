@@ -153,6 +153,7 @@ function pairingError(code, message) {
  *   redeem: (pairId: unknown, code: unknown, options?: { source?: string }) => { pairId: string, label: string | null, createdAt: number, expiresAt: number },
  *   sweep: () => number,
  *   pending: () => number,
+ *   state: (pairId: unknown) => 'pending' | 'used' | 'locked' | 'expired' | 'unknown',
  *   resetSource: (source: unknown) => boolean,
  *   sourceCount: () => number,
  * }}
@@ -451,6 +452,37 @@ export function createPairingStore(options = {}) {
   }
 
   /**
+   * What one pair's id currently means — the panel's 「已使用」 answer.
+   *
+   * The panel mints a code, shows it and counts down locally; without this read
+   * it cannot tell "waiting to be scanned" from "the phone already paired", so a
+   * redeemed code kept counting down as if it were still good (2026-10-19 user
+   * report: 已用的配对码显示已使用). Three rules make this accessor safe:
+   *
+   *   - It SPENDS NO BUDGET. Asking the host "did my code work?" is not a guess,
+   *     so neither the per-pair nor the per-source counter moves. Otherwise the
+   *     panel refreshing itself could burn a code it is showing.
+   *   - It does NOT sweep. `sweep()` deletes expired entries, which would turn an
+   *     aged-out code into `unknown` and lose the difference between 「过期」 and
+   *     「宿主不认识」.
+   *   - `used` WINS over `expired`. A pair that was redeemed and THEN aged out is
+   *     still a pair that worked; reporting 「过期」 for it would tell the user the
+   *     device was never added.
+   *
+   * @param {unknown} pairId
+   * @returns {'pending' | 'used' | 'locked' | 'expired' | 'unknown'}
+   */
+  function state(pairId) {
+    if (typeof pairId !== 'string') return 'unknown'
+    const entry = entries.get(pairId)
+    if (entry === undefined) return 'unknown'
+    if (entry.usedAt !== null) return 'used'
+    if (isPairLockedOut(entry)) return 'locked'
+    if (now() >= entry.expiresAt) return 'expired'
+    return 'pending'
+  }
+
+  /**
    * Forget an address's failure history.
    *
    * Exists so a legitimate user who mistyped a few codes on a shared LAN address
@@ -478,5 +510,5 @@ export function createPairingStore(options = {}) {
     return sourceFailures.size
   }
 
-  return { create, redeem, sweep, pending, resetSource, sourceCount }
+  return { create, redeem, sweep, pending, state, resetSource, sourceCount }
 }

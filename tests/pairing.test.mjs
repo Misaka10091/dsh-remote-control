@@ -457,3 +457,85 @@ test('the lockout limits are configurable so a test need not run 20 rounds', () 
   assertCode(() => pairing.redeem('pair_nope', 'AAAAAAAA', { source }), 'pairing/source-locked')
   assertCode(() => pairing.redeem(second.pairId, second.code, { source }), 'pairing/source-locked')
 })
+
+/* ------------------------------------------------------------------ *
+ * The state read — what the panel's 「刷新」 button asks
+ * (2026-10-19: 已用的配对码显示已使用)
+ * ------------------------------------------------------------------ */
+
+test('state reports pending, used, locked, expired and unknown', () => {
+  const pairing = createPairingStore({ now: () => 0, maxAttempts: 2 })
+  const live = pairing.create()
+  assert.equal(pairing.state(live.pairId), 'pending', 'a fresh code is waiting')
+
+  pairing.redeem(live.pairId, live.code)
+  assert.equal(pairing.state(live.pairId), 'used', 'a redeemed code says so')
+
+  /* A pair burned by wrong guesses is `locked`, not `expired`: they are different
+     stories and the panel words them differently. */
+  const burned = pairing.create()
+  assert.throws(() => pairing.redeem(burned.pairId, 'AAAAAAAA'))
+  assert.equal(pairing.state(burned.pairId), 'pending', 'one failed guess does not burn it')
+  assert.throws(() => pairing.redeem(burned.pairId, 'AAAAAAAA'))
+  assert.equal(pairing.state(burned.pairId), 'locked')
+
+  /* An id this store never minted. */
+  assert.equal(pairing.state('pair_nope'), 'unknown')
+})
+
+test('state says expired for an untouched code past its TTL, and never for a used one', () => {
+  const { pairing, clock } = makePairing()
+  const pair = pairing.create()
+
+  clock.now = pair.expiresAt - 1
+  assert.equal(pairing.state(pair.pairId), 'pending', 'still live one millisecond before expiry')
+
+  clock.now = pair.expiresAt
+  assert.equal(pairing.state(pair.pairId), 'expired')
+
+  /* A second, distinct pair (the helper's entropy is a single byte, so advancing it
+     is what makes the id different). */
+  clock.advance()
+  const redeemed = pairing.create()
+  assert.notEqual(redeemed.pairId, pair.pairId)
+  pairing.redeem(redeemed.pairId, redeemed.code)
+  /* `used` WINS over `expired`: a pair that was redeemed and then aged out is still
+     a pair that WORKED, and 「过期」 would tell the user the device was never added. */
+  clock.now = redeemed.expiresAt + 1
+  assert.equal(pairing.state(redeemed.pairId), 'used')
+})
+
+test('state does not sweep, so an aged-out code keeps its own answer', () => {
+  /* `sweep()` deletes expired entries; if the state read swept, 「过期」 would
+     collapse into 「宿主不认识」 the moment anything else triggered a sweep. */
+  const { pairing, clock } = makePairing()
+  const pair = pairing.create()
+  clock.now = pair.expiresAt + 1
+
+  assert.equal(pairing.state(pair.pairId), 'expired')
+  pairing.sweep()
+  assert.equal(pairing.state(pair.pairId), 'unknown', 'only an explicit sweep forgets it')
+})
+
+test('state spends no failure budget and cannot burn the code it describes', () => {
+  /* The panel refreshing itself must never be what kills a live code: asking
+     "did my code work?" is not a guess. */
+  const { pairing } = makePairing()
+  const pair = pairing.create()
+
+  for (let index = 0; index < 50; index += 1) {
+    assert.equal(pairing.state(pair.pairId), 'pending')
+    assert.equal(pairing.state('pair_nope'), 'unknown')
+  }
+  assert.equal(pairing.pending(), 1, 'the code is still offerable')
+  assert.equal(pairing.sourceCount(), 0, 'and no address was charged for the reads')
+  assert.ok(pairing.redeem(pair.pairId, pair.code), 'the real device still pairs')
+})
+
+test('state answers for a non-string pairId without throwing', () => {
+  const { pairing } = makePairing()
+  pairing.create()
+  for (const pairId of [undefined, null, 0, {}, [], '']) {
+    assert.equal(pairing.state(pairId), 'unknown', String(pairId))
+  }
+})

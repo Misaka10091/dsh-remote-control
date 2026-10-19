@@ -192,6 +192,26 @@ window.__ModuleLoader__.load({
     const DEFAULT_PAIR_PATH = '/remote-control/pair'
 
     /**
+     * The pairing status route, below the admin API base (`GET /pairing/:pairId`).
+     *
+     * The panel holds the code and a local countdown, so it cannot tell a code
+     * that is still waiting from one the phone already redeemed. This read answers
+     * that on demand — the card's 「刷新」 button — instead of on a timer: the code
+     * lives 120 s, and a poll watching it would be a second mechanism for a fact
+     * one click already provides (`prd.md`: no auto-refresh).
+     */
+    const PAIRING_STATUS_PATH = 'pairing'
+
+    /**
+     * The states the host reports for one pair (`pairing.js#state`).
+     *
+     * A state outside this list is rendered as `unknown` instead of being trusted:
+     * the browser half must be unable to paint an arbitrary host string as if it
+     * were one of its own state names.
+     */
+    const PAIR_STATES = ['pending', 'used', 'locked', 'expired', 'unknown']
+
+    /**
      * Address book bounds.
      *
      * MIRRORED from `src/host/constants.js` and not authoritative: the browser half
@@ -316,6 +336,15 @@ window.__ModuleLoader__.load({
       'pair.loopbackHint': '此链接里的 127.0.0.1 需要换成这台机器的局域网 IP，手机才能打开。',
       'pair.publicHint': '这条链接用的是你选定的公网地址；能否打开取决于你自己的端口映射或反向代理，本插件不检测可达性。',
       'pair.cancel': '取消',
+      'pair.refresh': '刷新',
+      'pair.refreshing': '刷新中…',
+      'pair.newCode': '生成新码',
+      'pair.state.used': '已使用',
+      'pair.state.expired': '已过期',
+      'pair.state.locked': '已作废',
+      'pair.state.unknown': '已失效',
+      'pair.state.usedHint': '设备已经完成配对，可以在「设备」里看到它。',
+      'pair.state.deadHint': '这个配对码已经不能用了，生成新码继续。',
       'devices.heading': '已授权设备',
       'devices.empty': '还没有配对设备',
       'devices.lastSeen': '最后在线 {when}',
@@ -433,6 +462,15 @@ window.__ModuleLoader__.load({
       'pair.loopbackHint': 'Replace 127.0.0.1 in this link with this machine LAN address so a phone can open it.',
       'pair.publicHint': 'This link uses the public address you selected. Whether it opens depends on your own port forwarding or reverse proxy — this plugin does not check reachability.',
       'pair.cancel': 'Cancel',
+      'pair.refresh': 'Refresh',
+      'pair.refreshing': 'Refreshing…',
+      'pair.newCode': 'New code',
+      'pair.state.used': 'Used',
+      'pair.state.expired': 'Expired',
+      'pair.state.locked': 'Burned',
+      'pair.state.unknown': 'No longer valid',
+      'pair.state.usedHint': 'The device finished pairing; it is listed under Devices.',
+      'pair.state.deadHint': 'This code can no longer be used. Generate a new one to continue.',
       'devices.heading': 'Paired devices',
       'devices.empty': 'No paired devices yet',
       'devices.lastSeen': 'Last seen {when}',
@@ -938,6 +976,27 @@ window.__ModuleLoader__.load({
       const groups = []
       for (let index = 0; index < code.length; index += 4) groups.push(code.slice(index, index + 4))
       return groups
+    }
+
+    /**
+     * The state label for the pairing card, or `null` while the code is still live.
+     *
+     * `pending` maps to `null` and not to a string: a code that is simply waiting
+     * already says so with its countdown, and a 「等待配对」 badge would be a second
+     * claim about the same fact.
+     *
+     * @param {unknown} state One of {@link PAIR_STATES}.
+     * @param {(key: string) => string} t
+     * @returns {string | null}
+     */
+    function pairingStateLabel(state, t) {
+      switch (state) {
+        case 'used': return t('pair.state.used')
+        case 'expired': return t('pair.state.expired')
+        case 'locked': return t('pair.state.locked')
+        case 'unknown': return t('pair.state.unknown')
+        default: return null
+      }
     }
 
     /**
@@ -2081,6 +2140,10 @@ window.__ModuleLoader__.load({
       '.drc-pairCard{display:flex;flex-wrap:wrap;gap:14px;align-items:flex-start;padding:12px;border:1px solid var(--dsw-alias-border-l1);border-radius:12px;background:var(--dsw-alias-bg-layer-1)}',
       '.drc-pairQr{display:flex;flex:0 0 auto;flex-direction:column;align-items:center;gap:6px;max-width:100%}',
       '.drc-pairMain{display:flex;flex:1 1 214px;flex-direction:column;gap:8px;min-width:0}',
+      /* The one line a dead code shows (已使用 / 已过期 / 已作废 / 已失效): a state, not
+         a warning banner — the code simply has no life left, and the useful next
+         action sits right below it. */
+      '.drc-pairState{margin:0;font-size:15px;font-weight:600;letter-spacing:.02em;color:var(--dsw-alias-label-primary)}',
       /* The symbol. `176px` leaves the right column ~374px inside the 640px modal
          (640 − 32 body padding − 24 card padding − 196 symbol column − 14 gap), so
          the code, the countdown and the link all fit on one row each. The quiet zone
@@ -2482,30 +2545,42 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The pairing flow: mint a code, count down, forget it.
+     * The pairing flow: mint a code, count down, forget it — and, on request, ask
+     * the host what the code became.
      *
      * Nothing is cached across a panel close — a code that outlived its card
      * would be a credential with no visible lifetime. Host-side, a pair is a
      * 120 s one-shot either way, so a stale card could only mislead.
      *
+     * `state` exists because the countdown alone cannot tell a code that is still
+     * waiting from one the phone already redeemed: both are "inside the TTL", and
+     * a redeemed code kept counting down as though it were still good (2026-10-19
+     * user report: 已用的配对码显示已使用). `refresh` is the manual re-read — the
+     * host answers `pending` / `used` / `locked` / `expired` / `unknown`, and this
+     * half never polls it: 点一次看一次.
+     *
      * @returns {{
      *   current: object | null,
      *   remainingMs: number,
+     *   state: string,
      *   busy: boolean,
      *   failure: object | null,
      *   start: () => Promise<void>,
+     *   refresh: () => Promise<void>,
      *   clear: () => void,
      * }}
      */
     function usePairing() {
       const [current, setCurrent] = useState(null)
       const [remainingMs, setRemainingMs] = useState(0)
+      const [state, setState] = useState('pending')
       const [busy, setBusy] = useState(false)
       const [failure, setFailure] = useState(null)
 
       const clear = useCallback(() => {
         setCurrent(null)
         setRemainingMs(0)
+        setState('pending')
         setFailure(null)
       }, [])
 
@@ -2516,13 +2591,38 @@ window.__ModuleLoader__.load({
           const data = await requestJson('pairing', { method: 'POST', body: {} })
           setCurrent(data !== null && typeof data === 'object' ? data : null)
           setRemainingMs(data !== null && typeof data === 'object' && Number.isFinite(data.ttlMs) ? data.ttlMs : 0)
+          /* A brand-new code is pending by construction; nothing to ask the host. */
+          setState('pending')
         } catch (error) {
           setCurrent(null)
+          setState('pending')
           setFailure(describeFailure(error))
         } finally {
           setBusy(false)
         }
       }, [])
+
+      /**
+       * Ask the host what this code became. Never optimistic, never a retry.
+       *
+       * A failure keeps the previous state and shows the classified notice: the
+       * card is still the user's only evidence of the code, so blanking it on a
+       * transient read failure would look like the pairing itself failed.
+       */
+      const refresh = useCallback(async () => {
+        if (current === null || typeof current.pairId !== 'string' || current.pairId === '') return
+        setBusy(true)
+        try {
+          const data = await requestJson(PAIRING_STATUS_PATH + '/' + encodeURIComponent(current.pairId))
+          const reported = data !== null && typeof data === 'object' ? data.state : null
+          setState(PAIR_STATES.includes(reported) ? reported : 'unknown')
+          setFailure(null)
+        } catch (error) {
+          setFailure(describeFailure(error))
+        } finally {
+          setBusy(false)
+        }
+      }, [current])
 
       useEffect(() => {
         if (current === null) return undefined
@@ -2535,15 +2635,18 @@ window.__ModuleLoader__.load({
           const left = Math.max(0, expiresAt - Date.now())
           setRemainingMs(left)
           /* The card removes itself when the host stops honouring the code: a
-             visible countdown at zero would invite a scan that must fail. */
-          if (left === 0) setCurrent(null)
+             visible countdown at zero would invite a scan that must fail. A code
+             the host has already reported as used is NOT swept away here: 「已使用」
+             is an answer the user asked for, and it must survive the TTL long
+             enough to be read. */
+          if (left === 0 && state === 'pending') setCurrent(null)
         }
         tick()
         const timer = setInterval(tick, COUNTDOWN_INTERVAL_MS)
         return () => clearInterval(timer)
-      }, [current])
+      }, [current, state])
 
-      return { current, remainingMs, busy, failure, start, clear }
+      return { current, remainingMs, state, busy, failure, start, refresh, clear }
     }
 
     /* ------------------------------------------------------------------ *
@@ -3032,6 +3135,11 @@ window.__ModuleLoader__.load({
      * value and this renders `pair.tooLong` in place of the symbol, with the text
      * code and the link untouched (`prd.md` R4).
      *
+     * A code the host reports as used (or burned, or gone) is replaced by a
+     * one-line STATE and 「生成新码」: the symbol and the code are only removed once
+     * they can no longer pair anything, because showing a dead code as if it were
+     * live invites a scan that must fail (2026-10-19: 已用的配对码显示已使用).
+     *
      * @param {object} props
      * @param {(key: string, params?: object) => string} props.t
      * @param {object} props.pairing The `usePairing` result.
@@ -3048,6 +3156,15 @@ window.__ModuleLoader__.load({
       const listening = gateway !== null && typeof gateway === 'object' && gateway.listening === true
       const url = current === null ? null : pairingUrl(current, addressText, documentBase(), mode)
       const seconds = Math.max(0, Math.ceil(pairing.remainingMs / 1000))
+      /* `null` while the code is live, a label once the host reports otherwise. An
+         ABSENT state means "nobody has asked yet" (a pair minted in this session
+         starts `pending`); an unrecognized one is rendered as `unknown` rather than
+         trusted, because every known state past `pending` means the code is dead. */
+      const reported = pairing.state
+      const state = reported === undefined || reported === null
+        ? 'pending'
+        : (PAIR_STATES.includes(reported) ? reported : 'unknown')
+      const stateLabel = pairingStateLabel(state, t)
 
       /* Encoded from the SAME `url` the copy button offers, so the symbol and the
          text can never disagree about which link is being paired. Pure and
@@ -3118,28 +3235,56 @@ window.__ModuleLoader__.load({
               onClick: () => { void pairing.start() },
             }, t('pair.add')),
           )
-          : h('div', { className: 'drc-pairCard' },
-            qrNode === null ? null : h('div', { className: 'drc-pairQr' }, qrNode),
-            h('div', { className: 'drc-pairMain' },
-              /* One line says how to pair, then the two things you can pair with:
-                 the code you can type and the link you can send. */
-              h('p', { className: 'drc-hint' }, qr !== null && qr.ok === false ? t('pair.tooLong') : t('pair.qrHint')),
-              h('div', { className: 'drc-code drc-mono' },
-                pairingCodeGroups(typeof current.code === 'string' ? current.code : '').map((group, index) => (
-                  h('span', { className: 'drc-codeGroup', key: 'g' + String(index) }, group)
-                )),
-              ),
-              h('div', { className: 'drc-row' },
-                h('span', { className: 'drc-hint' }, t('pair.expires', { seconds })),
-                h('div', { className: 'drc-deviceActions' },
+          : stateLabel !== null
+            /* The code is dead: say what happened and offer the only useful action.
+               No symbol, no code, no link — every one of them would be an invitation
+               to a scan that must fail. */
+            ? h('div', { className: 'drc-pairCard' },
+              h('div', { className: 'drc-pairMain' },
+                h('p', { className: 'drc-pairState', role: 'status' }, stateLabel),
+                h('p', { className: 'drc-hint' }, t(state === 'used' ? 'pair.state.usedHint' : 'pair.state.deadHint')),
+                h('div', { className: 'drc-row' },
                   h('button', {
                     type: 'button',
-                    className: 'drc-button',
-                    onClick: () => { void copy('code', String(current.code ?? '')) },
-                  }, copied === 'code' ? t('pair.copied') : t('pair.copy')),
+                    className: 'drc-button drc-buttonPrimary',
+                    disabled: pairing.busy === true,
+                    onClick: () => { void pairing.start() },
+                  }, t('pair.newCode')),
                   h('button', { type: 'button', className: 'drc-button', onClick: pairing.clear }, t('pair.cancel')),
                 ),
               ),
+            )
+            : h('div', { className: 'drc-pairCard' },
+              qrNode === null ? null : h('div', { className: 'drc-pairQr' }, qrNode),
+              h('div', { className: 'drc-pairMain' },
+                /* One line says how to pair, then the two things you can pair with:
+                   the code you can type and the link you can send. */
+                h('p', { className: 'drc-hint' }, qr !== null && qr.ok === false ? t('pair.tooLong') : t('pair.qrHint')),
+                h('div', { className: 'drc-code drc-mono' },
+                  pairingCodeGroups(typeof current.code === 'string' ? current.code : '').map((group, index) => (
+                    h('span', { className: 'drc-codeGroup', key: 'g' + String(index) }, group)
+                  )),
+                ),
+                h('div', { className: 'drc-row' },
+                  h('span', { className: 'drc-hint' }, t('pair.expires', { seconds })),
+                  h('div', { className: 'drc-deviceActions' },
+                    /* 必须手动问一次：is this code still waiting, or did the phone
+                       already take it? The countdown cannot tell the two apart, and
+                       the host is the only authority. */
+                    h('button', {
+                      type: 'button',
+                      className: 'drc-button',
+                      disabled: pairing.busy === true,
+                      onClick: () => { void pairing.refresh() },
+                    }, pairing.busy === true ? t('pair.refreshing') : t('pair.refresh')),
+                    h('button', {
+                      type: 'button',
+                      className: 'drc-button',
+                      onClick: () => { void copy('code', String(current.code ?? '')) },
+                    }, copied === 'code' ? t('pair.copied') : t('pair.copy')),
+                    h('button', { type: 'button', className: 'drc-button', onClick: pairing.clear }, t('pair.cancel')),
+                  ),
+                ),
               url === null ? null : h('div', { className: 'drc-field' },
                 h('span', { className: 'drc-label' }, t('pair.link')),
                 h('div', { className: 'drc-inline' },
@@ -4288,6 +4433,9 @@ window.__ModuleLoader__.load({
         legacyPairingUrl,
         urlHostname,
         pairingCodeGroups,
+        pairingStateLabel,
+        PAIR_STATES,
+        PAIRING_STATUS_PATH,
         parsePort,
         formatRelative,
         deviceSource,
