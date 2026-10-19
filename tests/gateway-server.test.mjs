@@ -940,7 +940,16 @@ test('a client that disconnects before the upstream answers does not pin the ups
 
 test('the request path throttles lastSeenAt instead of writing per request', async () => {
   /* Gap B, end to end: the gateway records activity, and 20 requests inside one
-     interval must not be 20 fsyncs. `activity.stats` is the evidence. */
+     interval must not be 20 fsyncs. `activity.stats` is the evidence.
+
+     The assertion is `persisted` well below `recorded`, NOT `persisted === 1`.
+     A wall-clock interval cannot be pinned from a black-box test: these 20
+     requests are sequential round trips, so a loaded machine can straddle the
+     interval and legitimately write a second time. Measured: `persisted === 1`
+     went red in roughly one full-suite run in thirteen for exactly that reason.
+     The throttle's actual promise is "a burst is not a write per request", and
+     that is what is asserted here. The exact one-write boundary is covered
+     deterministically in `gateway-activity.test.mjs`, which injects the clock. */
   const upstream = await startUpstream()
   const { gateway, token, stop } = await startGatewayUnderTest({
     officialPort: upstream.port,
@@ -956,9 +965,13 @@ test('the request path throttles lastSeenAt instead of writing per request', asy
       assert.equal(res.status, 200)
     }
 
-    assert.equal(gateway.activity.stats.recorded, 20, 'every authorized device request was noted')
-    assert.equal(gateway.activity.stats.persisted, 1, 'but only one write reached the disk')
-    assert.ok(gateway.activity.stats.coalesced >= 19)
+    const { recorded, persisted, coalesced } = gateway.activity.stats
+    assert.equal(recorded, 20, 'every authorized device request was noted')
+    assert.ok(
+      persisted < 5,
+      `20 requests must not cost 20 writes; disk writes = ${String(persisted)}`,
+    )
+    assert.ok(coalesced >= 15, `most requests must coalesce; coalesced = ${String(coalesced)}`)
   } finally {
     await stop()
   }
