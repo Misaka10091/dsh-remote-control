@@ -55,7 +55,11 @@
 
 7. **浮层用 portal，不用定位或层级。** 座位的祖先容器带 `overflow`（侧栏）和可能的 `transform` 包含块，锚定在座位里的弹层一定被裁切，`z-index` 救不回来——2026-10-19 的真实 GUI 事故就是这么来的。规则：`createPortal` 到 `document.body`（`react-dom` 已在客户端 baseline 白名单），容器 `position:fixed;inset:0` + `align-items/justify-content:center`，卡片 `max-height:min(…,calc(100vh - 2*padding))` 且正文 `overflow-y:auto` 内部滚动（这样 1024×700 与 601×1731 都不会溢出）。**降级路径不许抛**：没有 `document` → 什么都不渲染（读它本身会 `ReferenceError`）；有 `document` 但没有 `body` 或没有 `react-dom` → 原位渲染（难看但能用）。源码级测试守住这三条，因为 DOM 渲染在这里测不了。
 
-8. **模态只留显式关闭路径。** 关闭按钮 + `Esc` 两条；遮罩**不绑**处理器（不是"绑了再 return 早退"——不存在的监听器才不会被事件顺序打败）。打开时把焦点移进面板（容器 `tabIndex:-1`），关闭时归还触发按钮；`role="dialog"` + `aria-modal="true"` + `aria-labelledby` 指向**可见**标题，不用会漂移的重复 `aria-label`。不做 focus trap 可以，但必须写进已知限制，别在报告里假装做了。
+8. **模态只留显式关闭路径，且 `aria-modal` 必须配焦点陷阱。** 关闭按钮 + `Esc` 两条；遮罩**不绑**处理器（不是"绑了再 return 早退"——不存在的监听器才不会被事件顺序打败）。打开时把焦点移进面板（容器 `tabIndex:-1`），关闭时归还触发按钮；`role="dialog"` + `aria-modal="true"` + `aria-labelledby` 指向**可见**标题，不用会漂移的重复 `aria-label`。`aria-modal` 是对读屏器的承诺「外面是不可用的」，所以 `Tab` / `Shift+Tab` 必须在面板内循环（只拦两个边界，中间的浏览器顺序不动）；不写陷阱就别写 `aria-modal`。陷阱的 focusable 过滤要加 `node.tabIndex !== -1`，否则 roving tabindex 的 tab 会被算进循环边界，而浏览器其实跳过它。
+
+9. **枚举常量只能有一个来源：客户端从宿主读，不要抄一份。** 审计动作闭集 `AUDIT_EVENTS` 经 `GET /state` 的 `audit.actions` 到达面板，`src/client.js` 里没有任何动作字面量，用「闭集里相邻两个动作名不得同时以引号字面量出现」守（单个名字不够——`unknown` 本身也是合法失败类型）。抄一份的代价不是多几行：漂移的表现是下拉里出现一个永远 400 的选项，或一个永远筛不出来的动作，而这两种从宿主和客户端两侧都看不出来。同理，页大小不在客户端写第二遍——不传 `limit`，由宿主常量决定。
+
+10. **tab 切换不许丢操作状态。** 只渲染当前 section 会在每次切换时卸载其余 section，而它们持有草稿、`busy`、结果提示与吊销确认：请求可能仍在飞，切回来却是干净表单。做法是「访问过就保持挂载」——非当前 panel 用 `hidden` 隐藏（同时移出无障碍树与 Tab 顺序）而不卸载；未访问过的仍不挂载，避免打开面板就预先挂四个 section 的副作用。跨 tab 要保留的操作状态（例如配对倒计时）放在 `Panel` 层而不是 section 里，否则它跟着 section 一起被卸载。
 
 ---
 

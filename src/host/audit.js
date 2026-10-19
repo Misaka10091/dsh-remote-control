@@ -73,7 +73,14 @@ import {
 } from 'node:fs'
 import path from 'node:path'
 
-import { AUDIT_FILE_MODE, AUDIT_FILE_PREFIX, AUDIT_RETENTION_DAYS } from './constants.js'
+import {
+  AUDIT_CURSOR_SEPARATOR,
+  AUDIT_EVENTS_MAX_PAGE,
+  AUDIT_EVENTS_PAGE_SIZE,
+  AUDIT_FILE_MODE,
+  AUDIT_FILE_PREFIX,
+  AUDIT_RETENTION_DAYS,
+} from './constants.js'
 
 /**
  * The closed set of audit events (`design.md` §6, plus stage 4's `pair_failed`).
@@ -307,6 +314,146 @@ export function buildAuditLine(input) {
   return line
 }
 
+/* ------------------------------------------------------------------ *
+ * The read side: one projection, one cursor grammar
+ *
+ * `record()` refuses free text at WRITE time, which is why a well-behaved process
+ * cannot put a message body in the trail. That is not enough for the READ side: a
+ * day file is plain text that a user — or any process running as that user — can
+ * edit, and the detail endpoint feeds both an HTTP response and the panel's DOM.
+ * So every line goes through {@link projectAuditRecord} before it is returned,
+ * which rebuilds the record field by field from a whitelist instead of trusting
+ * the parse. A hand-added `"meta": { "text": "secret" }`, a `"text"` field or a
+ * `"token"` field simply has nowhere to land: the projection never copies it.
+ *
+ * This is deliberately NOT the same shape as the write path's `sanitizeMeta`.
+ * The write path VALIDATES a caller's identifiers; the read path IGNORES
+ * everything the caller could have written. Sharing one implementation would
+ * couple "what may be written" to "what may be shown", and the read side needs to
+ * be the stricter of the two by construction, not by agreement.
+ * ------------------------------------------------------------------ */
+
+/**
+ * Shape of a paging cursor: `<ts>.<seq>` (`prd.md` constraint 5).
+ *
+ * Both halves are decimal and bounded to 15 digits so `Number.parseInt` cannot
+ * silently round: 15 digits is below `Number.MAX_SAFE_INTEGER` (16 digits), so a
+ * parsed cursor is always exact.
+ */
+const AUDIT_CURSOR_PATTERN = new RegExp(
+  '^([0-9]{1,15})\\' + AUDIT_CURSOR_SEPARATOR + '([0-9]{1,15})$',
+)
+
+/**
+ * How many line numbers one day contributes to the `seq` half of a cursor.
+ *
+ * `seq` has to be a TOTAL order over every record in the trail, not merely within
+ * one file: the read path sorts by `(ts, seq)` and resumes by comparing the same
+ * pair, so two records that tie on `ts` must still compare in the order they were
+ * returned or paging repeats one and skips the other. A plain line number would
+ * only be total WITHIN a file; multiplying the day ordinal by this stride makes
+ * `seq` monotonic across the whole trail while keeping the documented two-part
+ * cursor. A day file with more than a million lines would exceed it — at ~60 bytes
+ * a line that is 60 MB in one UTC day, which is far beyond anything this trail
+ * produces.
+ */
+const AUDIT_CURSOR_DAY_STRIDE = 1_000_000
+
+/**
+ * Project one parsed audit line onto the four fields the panel may ever see.
+ *
+ * `prd.md` D5 and `design.md` §2.2: `ts`, `event`, `deviceId`, `ip` — never
+ * `meta`, never anything else. Every field is re-validated against the SAME
+ * predicates the write path uses (`DEVICE_ID_PATTERN`, `IP_PATTERN`,
+ * `isAuditEvent`), so an edited file cannot smuggle a token-shaped value into the
+ * `ip` slot either.
+ *
+ * `ts` is re-serialized from the parsed instant instead of being copied. That
+ * matters twice: it normalizes an edited spelling (`+00:00`, a date-only value) to
+ * the one form every other line uses, and it means no free-form string ever
+ * travels from the file to the UI.
+ *
+ * @param {unknown} parsed The result of `JSON.parse` for one line.
+ * @returns {{ ts: string, event: string, deviceId?: string, ip?: string } | null}
+ *   `null` when the line is not a usable record (unknown event, unparsable `ts`).
+ */
+export function projectAuditRecord(parsed) {
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+  if (!isAuditEvent(parsed.event)) return null
+  if (typeof parsed.ts !== 'string' || parsed.ts === '') return null
+  const at = Date.parse(parsed.ts)
+  if (!Number.isFinite(at)) return null
+  const record = { ts: new Date(at).toISOString(), event: parsed.event }
+  if (typeof parsed.deviceId === 'string' && DEVICE_ID_PATTERN.test(parsed.deviceId)) {
+    record.deviceId = parsed.deviceId
+  }
+  if (typeof parsed.ip === 'string' && IP_PATTERN.test(parsed.ip)) record.ip = parsed.ip
+  return record
+}
+
+/**
+ * Parse a paging cursor, or `null` when the text is not one.
+ *
+ * Exported so the API layer can answer a malformed cursor with `400` BEFORE it is
+ * handed to the reader — one grammar, two callers, instead of two spellings that
+ * drift (`quality-guidelines.md` §24).
+ *
+ * @param {unknown} text
+ * @returns {{ ts: number, seq: number } | null}
+ */
+export function parseAuditCursor(text) {
+  if (typeof text !== 'string') return null
+  const match = text.match(AUDIT_CURSOR_PATTERN)
+  if (match === null) return null
+  const ts = Number.parseInt(match[1], 10)
+  const seq = Number.parseInt(match[2], 10)
+  if (!Number.isSafeInteger(ts) || !Number.isSafeInteger(seq)) return null
+  return { ts, seq }
+}
+
+/**
+ * Whether a page size is inside the supported range.
+ *
+ * One predicate, so the API's query-string parser and the reader's own guard
+ * cannot disagree about what `200` means.
+ *
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isAuditLimit(value) {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= AUDIT_EVENTS_MAX_PAGE
+}
+
+/**
+ * Parse the `limit` query parameter, or `null` when it is not acceptable.
+ *
+ * An absent value is {@link AUDIT_EVENTS_PAGE_SIZE}, not `null`: the panel sends
+ * no `limit` at all so the page size has exactly one definition.
+ *
+ * @param {unknown} text
+ * @returns {number | null}
+ */
+export function parseAuditLimit(text) {
+  if (text === undefined || text === null || text === '') return AUDIT_EVENTS_PAGE_SIZE
+  if (typeof text !== 'string') return null
+  /* Decimal digits only: `Number('0x10')` is 16 and `Number('')` is 0, so the
+     conversion must not be used as the validator. */
+  if (!/^[0-9]{1,3}$/.test(text)) return null
+  const value = Number.parseInt(text, 10)
+  return isAuditLimit(value) ? value : null
+}
+
+/**
+ * Render a cursor for the caller.
+ *
+ * @param {number} at Epoch milliseconds.
+ * @param {number} seq The record's total-order sequence number.
+ * @returns {string}
+ */
+function cursorText(at, seq) {
+  return String(at) + AUDIT_CURSOR_SEPARATOR + String(seq)
+}
+
 /**
  * Create the audit writer bound to one directory.
  *
@@ -325,6 +472,8 @@ export function buildAuditLine(input) {
  *   record: (entry: { event: string, deviceId?: string, ip?: string, meta?: object }) => object | null,
  *   prune: (at?: number) => { scanned: number, deleted: string[] },
  *   exportAll: () => { body: string, files: string[], lines: number },
+ *   readEvents: (options?: { limit?: number, before?: string, action?: string }) => { events: object[], nextBefore: string | null },
+ *   summarize: () => object,
  *   encodeLine: (line: object) => string,
  *   stats: { written: number, failures: number, pruned: number },
  * }}
@@ -606,13 +755,136 @@ export function createAudit(options = {}) {
   }
 
   /**
+   * Read one page of the trail, newest first (`prd.md` R5, `design.md` §2.2).
+   *
+   * ## Why paging is a cursor and not an offset
+   *
+   * The trail is append-only, so an offset would shift under the reader every time
+   * a request is recorded — the panel would see one event twice and miss another.
+   * The cursor is the `(ts, seq)` pair of the LAST record returned, and the next
+   * page asks for records strictly older than it. `limit + 1` records are examined
+   * so `nextBefore` is `null` exactly when there is nothing left, which is what
+   * lets the panel swap 「加载更多」 for 「没有更多了」 without a second request.
+   *
+   * ## Why the whole window is scanned
+   *
+   * Stopping as soon as `limit` records are collected would be cheaper, but a
+   * day file is editable text: a line in an older file can carry a newer `ts`. The
+   * scan therefore covers every retained day file and sorts, so the answer is a
+   * function of the DATA rather than of where the scan happened to stop. Thirty
+   * day files is the whole bound (`AUDIT_RETENTION_DAYS`), and the reader does no
+   * writes.
+   *
+   * ## What it never returns
+   *
+   * {@link projectAuditRecord} rebuilds each record from four fields, so `meta` —
+   * and anything else a hand-edited line added — cannot reach the caller. An
+   * unparsable or unusable line is skipped, exactly like `summarize`'s
+   * `invalidLines`, so one bad line never fails a page.
+   *
+   * @param {object} [options]
+   * @param {number} [options.limit] Page size, 1..`AUDIT_EVENTS_MAX_PAGE`; defaults to `AUDIT_EVENTS_PAGE_SIZE`.
+   * @param {string} [options.before] Cursor of the last record the caller already has.
+   * @param {string} [options.action] Member of {@link AUDIT_EVENTS}, or absent for every event.
+   * @returns {{ events: Array<{ ts: string, event: string, deviceId?: string, ip?: string }>, nextBefore: string | null }}
+   * @throws {Error & { code: string }} `audit/invalid-limit`, `audit/invalid-action`, `audit/invalid-cursor`.
+   */
+  function readEvents(options = {}) {
+    const limit = options.limit === undefined || options.limit === null
+      ? AUDIT_EVENTS_PAGE_SIZE
+      : options.limit
+    if (!isAuditLimit(limit)) {
+      throw auditError('audit/invalid-limit', 'the page size is outside the supported range')
+    }
+    const action = options.action === undefined || options.action === null || options.action === ''
+      ? null
+      : options.action
+    if (action !== null && !isAuditEvent(action)) {
+      throw auditError('audit/invalid-action', 'the action filter is not a member of the closed set')
+    }
+    const beforeText = options.before === undefined || options.before === null ? '' : options.before
+    if (typeof beforeText !== 'string') {
+      throw auditError('audit/invalid-cursor', 'the paging cursor is not a string')
+    }
+    const before = beforeText === '' ? null : parseAuditCursor(beforeText)
+    if (beforeText !== '' && before === null) {
+      throw auditError('audit/invalid-cursor', 'the paging cursor could not be parsed')
+    }
+
+    let names
+    try {
+      names = readdirSync(baseDir)
+    } catch {
+      /* A missing directory is "no history yet", not a failure. */
+      return { events: [], nextBefore: null }
+    }
+
+    /* Oldest first, so `seq` grows with time; the sort below then decides the
+       order and `seq` only has to break ties. */
+    const days = names.filter((name) => dayStartOf(name) !== null).sort()
+    const found = []
+    for (const name of days) {
+      const dayStart = dayStartOf(name)
+      if (dayStart === null) continue
+      const seqBase = Math.floor(dayStart / DAY_MS) * AUDIT_CURSOR_DAY_STRIDE
+      let raw
+      try {
+        raw = readFileSync(path.join(baseDir, name), 'utf8')
+      } catch {
+        /* An unreadable day file is skipped; the rest of the page is still worth
+           returning, and the gap is visible as a missing day. */
+        continue
+      }
+      const lines = raw.split('\n')
+      for (let index = 0; index < lines.length; index += 1) {
+        const trimmed = lines[index].trim()
+        if (trimmed === '') continue
+        let parsed
+        try {
+          parsed = JSON.parse(trimmed)
+        } catch {
+          /* a truncated or hand-edited line: skipped, never relayed */
+          continue
+        }
+        const record = projectAuditRecord(parsed)
+        if (record === null) continue
+        if (action !== null && record.event !== action) continue
+        found.push({ at: Date.parse(record.ts), seq: seqBase + index + 1, record })
+      }
+    }
+
+    /* Newest first, and `seq` breaks a same-millisecond tie in the SAME direction
+       the cursor will compare it — that is what makes paging lossless. */
+    found.sort((left, right) => (right.at - left.at) || (right.seq - left.seq))
+
+    const page = []
+    let nextBefore = null
+    for (const entry of found) {
+      if (before !== null && !(entry.at < before.ts || (entry.at === before.ts && entry.seq < before.seq))) {
+        continue
+      }
+      if (page.length >= limit) {
+        /* One more record than the page can hold: report the cursor of the last
+           one actually returned, so the next call resumes exactly here. */
+        const last = page[page.length - 1]
+        nextBefore = cursorText(last.at, last.seq)
+        break
+      }
+      page.push(entry)
+    }
+
+    return { events: page.map((entry) => entry.record), nextBefore }
+  }
+
+  /**
    * A read-side count per event, for the panel's summary row.
    *
    * Deliberately COUNTS and timespans, never event details: the panel's job here
    * is "how much activity has been recorded, and over what window", and shipping
-   * the events themselves would put the trail into a JSON response the browser
-   * parses — a second copy of the data, in a place with a different lifetime.
-   * The full trail has exactly one reader-facing path: the loopback export.
+   * the events themselves would duplicate what {@link readEvents} already answers
+   * with a page size, a cursor and a projection. The two paths stay separate: this
+   * one is a counter over the whole window, that one is a bounded page of
+   * projected records.
    *
    * @returns {{
    *   retentionDays: number,
@@ -701,6 +973,7 @@ export function createAudit(options = {}) {
     record,
     prune,
     exportAll,
+    readEvents,
     summarize,
     encodeLine,
     stats,

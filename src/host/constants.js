@@ -246,6 +246,37 @@ export const AUDIT_RETENTION_DAYS = 30
 export const AUDIT_PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000
 
 /**
+ * Events one audit-detail page carries by default (`prd.md` R5, `design.md` §2.1).
+ *
+ * The panel omits `limit` on its first request on purpose, so THIS number — not a
+ * copy in `src/client.js` — decides how many records the first screen shows. A
+ * second literal is how a "50" in the UI and a "20" on the server end up
+ * disagreeing with no test noticing.
+ */
+export const AUDIT_EVENTS_PAGE_SIZE = 50
+
+/**
+ * Hard cap on one audit-detail page.
+ *
+ * The bound is a denial-of-service bound, not a UX one: every record costs a
+ * `JSON.parse` and an object projection, and this API is loopback-only but
+ * reachable by any local script. Beyond 200 the panel would also have to scroll a
+ * list nobody can read.
+ */
+export const AUDIT_EVENTS_MAX_PAGE = 200
+
+/**
+ * Separator between the two halves of an audit paging cursor.
+ *
+ * A cursor is `"<ts>.<seq>"` — epoch milliseconds plus the record's line number
+ * inside its day file (`prd.md` constraint 5). A bare timestamp is NOT enough: two
+ * events can share one millisecond, and a timestamp-only cursor then either
+ * repeats or swallows the second one depending on which side of the page
+ * boundary it lands.
+ */
+export const AUDIT_CURSOR_SEPARATOR = '.'
+
+/**
  * Route prefix the admin API claims on the OFFICIAL `dsh web` server.
  *
  * Deliberately not under `/api`: `/api` is the connection plugin's prefix

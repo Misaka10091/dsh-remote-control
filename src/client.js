@@ -169,8 +169,37 @@ window.__ModuleLoader__.load({
     const PUBLIC_LABEL_MAX = 40
     const ADDRESS_TEXT_MAX = 253
 
+    /** Id of the port input in the header config bar, so its label is a real `htmlFor` target. */
+    const PORT_INPUT_ID = 'drc-port'
+
     /** Id of the panel's heading, targeted by `aria-labelledby` on the dialog. */
     const TITLE_ID = 'drc-panel-title'
+
+    /**
+     * The four panel tabs, in the order `prd.md` R1 names them.
+     *
+     * `key` is used three ways: the tab state value, the id suffix of the tab
+     * (`drc-tab-<key>`) and the id suffix of its panel (`drc-panel-<key>`). Keeping
+     * one value for all three is what makes the ARIA wiring impossible to get
+     * half-right — a tab that controls a panel id it did not derive cannot exist
+     * here.
+     *
+     * These are LAYOUT keys and have nothing to do with the audit action closed set.
+     * That one lives on the host (`AUDIT_EVENTS`) and reaches this half through
+     * `GET /state` as `audit.actions`; see {@link auditActionsOf}.
+     */
+    const TABS = [
+      { key: 'pairing', labelKey: 'tabs.pairing' },
+      { key: 'access', labelKey: 'tabs.access' },
+      { key: 'devices', labelKey: 'tabs.devices' },
+      { key: 'audit', labelKey: 'tabs.audit' },
+    ]
+
+    /** The tab keys in tablist order; roving focus wraps over exactly this list. */
+    const TAB_KEYS = TABS.map((tab) => tab.key)
+
+    /** Audit-detail route, below the admin API base (host: `GET /audit/events`). */
+    const AUDIT_EVENTS_PATH = 'audit/events'
 
     /**
      * Failure kinds the panel distinguishes.
@@ -203,7 +232,7 @@ window.__ModuleLoader__.load({
     const ZH = {
       'panel.title': '远程控制',
       'panel.subtitle': '配对设备后可在此接入同一会话',
-      'panel.entry': '设备与审计',
+      'panel.entry': '远程连接',
       'panel.close': '关闭',
       'panel.retry': '重试',
       'panel.loading': '正在读取设备状态…',
@@ -218,7 +247,8 @@ window.__ModuleLoader__.load({
       'access.gatewayDisabled': '未启用，没有监听端口。',
       'access.gatewayNotListening': '已启用，但当前没有在监听。重启 dsh 后生效。',
       'access.gatewayListening': '正在监听 {port} 端口，已建立 {live} 条远程连接。',
-      'address.heading': '接入地址',
+      'point.heading': '配对地址',
+      'address.heading': '公网地址',
       'address.modeLan': '局域网',
       'address.modePublic': '公网',
       'address.lanEmpty': '没有可用的网卡地址。',
@@ -227,6 +257,8 @@ window.__ModuleLoader__.load({
       'address.address': '地址',
       'address.add': '添加',
       'address.delete': '删除',
+      'address.inUse': '使用中',
+      'address.goManage': '去「接入」添加',
       'address.invalid': '地址只能填 host、host:port 或 http(s)://host[:port]，不能带路径、查询、锚点、用户名，端口需在 1 到 65535 之间。',
       'address.tooMany': '最多只能保存 {max} 条公网地址。',
       'address.publicHint': '公网地址需要你自己做端口映射或 TLS 反向代理；本插件不检测可达性，链接打不开不代表配对有问题。',
@@ -279,6 +311,20 @@ window.__ModuleLoader__.load({
       'audit.event.revoke': '吊销',
       'audit.event.pair_failed': '配对失败',
       'audit.event.unknown': '未识别动作',
+      'tabs.pairing': '配对',
+      'tabs.access': '接入',
+      'tabs.devices': '设备',
+      'tabs.audit': '审计',
+      'status.listening': '监听 {port} · {live} 条连接 · {devices} 台设备',
+      'status.disabled': '远程接入未启用',
+      'audit.detail.heading': '最近事件',
+      'audit.detail.filter': '动作',
+      'audit.detail.all': '全部',
+      'audit.detail.loading': '正在读取审计明细…',
+      'audit.detail.shown': '已显示 {count} 条',
+      'audit.detail.loadMore': '加载更多',
+      'audit.detail.loadingMore': '加载中…',
+      'audit.detail.noMore': '没有更多了',
       'error.loopback.title': '管理面板仅本机可用',
       'error.loopback.body': '设备管理只能在这台机器上操作。远程设备即使已完成配对，也只获得会话访问权，不获得管理权——这是有意设计，不是故障。',
       'error.crossOrigin.title': '请求来源被拒绝',
@@ -303,7 +349,7 @@ window.__ModuleLoader__.load({
     const EN = {
       'panel.title': 'Remote Control',
       'panel.subtitle': 'Pair a device to reach this session from another machine',
-      'panel.entry': 'Devices and audit',
+      'panel.entry': 'Remote access',
       'panel.close': 'Close',
       'panel.retry': 'Retry',
       'panel.loading': 'Reading device status…',
@@ -318,7 +364,8 @@ window.__ModuleLoader__.load({
       'access.gatewayDisabled': 'Disabled, nothing is listening.',
       'access.gatewayNotListening': 'Enabled, but nothing is listening right now. Restart dsh to apply it.',
       'access.gatewayListening': 'Listening on port {port} with {live} live remote connection(s).',
-      'address.heading': 'Access address',
+      'point.heading': 'Pairing address',
+      'address.heading': 'Public addresses',
       'address.modeLan': 'LAN',
       'address.modePublic': 'Public',
       'address.lanEmpty': 'No local network address is available.',
@@ -327,6 +374,8 @@ window.__ModuleLoader__.load({
       'address.address': 'Address',
       'address.add': 'Add',
       'address.delete': 'Delete',
+      'address.inUse': 'In use',
+      'address.goManage': 'Add one in 接入',
       'address.invalid': 'An address is a host, host:port or http(s)://host[:port] — no path, query, fragment or userinfo, with a port between 1 and 65535.',
       'address.tooMany': 'At most {max} public addresses can be saved.',
       'address.publicHint': 'A public address needs your own port forwarding or TLS reverse proxy. This plugin never checks reachability, so a link that will not open is not a pairing fault.',
@@ -379,6 +428,20 @@ window.__ModuleLoader__.load({
       'audit.event.revoke': 'Revoked',
       'audit.event.pair_failed': 'Pairing failed',
       'audit.event.unknown': 'Unrecognized action',
+      'tabs.pairing': 'Pairing',
+      'tabs.access': 'Access',
+      'tabs.devices': 'Devices',
+      'tabs.audit': 'Audit',
+      'status.listening': 'Listening on {port} · {live} connection(s) · {devices} device(s)',
+      'status.disabled': 'Remote access is off',
+      'audit.detail.heading': 'Recent events',
+      'audit.detail.filter': 'Action',
+      'audit.detail.all': 'All actions',
+      'audit.detail.loading': 'Reading audit details…',
+      'audit.detail.shown': '{count} shown',
+      'audit.detail.loadMore': 'Load more',
+      'audit.detail.loadingMore': 'Loading…',
+      'audit.detail.noMore': 'No more records',
       'error.loopback.title': 'The management panel is local-only',
       'error.loopback.body': 'Devices can only be managed on this machine. A paired remote device gets session access, never administration — that is the design, not a fault.',
       'error.crossOrigin.title': 'Request origin refused',
@@ -764,9 +827,11 @@ window.__ModuleLoader__.load({
      * @param {{ fragment?: string, pairPath?: string, port?: number | null } | null} pairing
      * @param {string | null} addressText Effective address, or null for none.
      * @param {string} fallbackHref Page base, used only by the legacy fallback.
+     * @param {'lan' | 'public'} [mode] Which kind of address `addressText` is: a public
+     *   one is used as written, a LAN one gets the gateway port when it names none.
      * @returns {string | null} null when the inputs cannot form a URL.
      */
-    function pairingUrl(pairing, addressText, fallbackHref) {
+    function pairingUrl(pairing, addressText, fallbackHref, mode) {
       if (pairing === null || typeof pairing !== 'object') return null
       const fragment = typeof pairing.fragment === 'string' ? pairing.fragment : ''
       const pairPath = typeof pairing.pairPath === 'string' && pairing.pairPath !== ''
@@ -777,7 +842,18 @@ window.__ModuleLoader__.load({
       if (address !== null) {
         const scheme = address.scheme === null ? 'http' : address.scheme
         const gatewayPort = Number.isInteger(pairing.port) && pairing.port > 0 ? pairing.port : null
-        const port = address.port === null ? gatewayPort : address.port
+        /* The MODE decides whether the gateway port is implied, because the two kinds
+           of address are different animals:
+             - LAN  `192.168.9.77` means "this host, on the gateway port" — the port is
+               part of what the user is pointing at, so it is filled in;
+             - public `https://dsh.example.de` means "whatever my proxy serves" — the
+               port is 443 (or a port the user typed) and is not ours to guess. Appending
+               3090 produced `https://host:3090/...`, a URL the proxy does not serve
+               (2026-10-19, reported from a live panel).
+           An explicit port always wins, in both modes. */
+        const port = address.port !== null
+          ? address.port
+          : (mode === 'public' ? null : gatewayPort)
         return scheme + '://' + address.host + (port === null ? '' : ':' + port) + pairPath + '#' + fragment
       }
 
@@ -920,6 +996,197 @@ window.__ModuleLoader__.load({
       }
       if (typeof device.ua === 'string' && device.ua !== '') return { labelKey: 'devices.client', value: device.ua }
       return null
+    }
+
+    /* ------------------------------------------------------------------ *
+     * Tabs and audit detail — the pure half
+     *
+     * Everything below is a plain function of its arguments, which is the only
+     * reason any of it can be verified: the browser half has no DOM environment, so
+     * the default-tab rule, the roving-focus arithmetic, the paging request shape
+     * and the four rendered fields are tested by calling them.
+     * ------------------------------------------------------------------ */
+
+    /**
+     * The tab the panel opens on (`prd.md` R2, `design.md` §1.1).
+     *
+     * `pairing` only when remote access is enabled AND the gateway is actually
+     * listening, because that is the only state in which a pairing code can be
+     * minted and used; otherwise `access`, which is the screen whose switch has to
+     * be turned on first. "Enabled" is the SETTING and "listening" is the
+     * LISTENER's truth — a panel that opened on an unusable pairing screen would
+     * invert the whole point of the change.
+     *
+     * There is no persistence: the panel unmounts when it closes, so a re-open
+     * re-evaluates this against the state of that moment (PRD constraint 4).
+     *
+     * @param {object | null} settings
+     * @param {object | null} gateway
+     * @returns {'pairing' | 'access'}
+     */
+    function preferredTab(settings, gateway) {
+      const enabled = settings !== null && typeof settings === 'object' && settings.enabled === true
+      const listening = gateway !== null && typeof gateway === 'object' && gateway.listening === true
+      return enabled && listening ? 'pairing' : 'access'
+    }
+
+    /**
+     * The index one navigation key moves focus to, or `null` for any other key.
+     *
+     * The WAI-ARIA tabs contract, in one function: `ArrowRight`/`ArrowLeft` wrap,
+     * `Home`/`End` jump to the ends. Extracted from the component so the wrap
+     * arithmetic is testable — an off-by-one there is invisible until a keyboard
+     * user hits the last tab and focus disappears.
+     *
+     * @param {string} key
+     * @param {number} index Current index.
+     * @param {number} count Number of tabs.
+     * @returns {number | null}
+     */
+    function tabIndexAfterKey(key, index, count) {
+      if (!Number.isInteger(count) || count <= 0) return null
+      const current = Number.isInteger(index) && index >= 0 && index < count ? index : 0
+      if (key === 'ArrowRight') return (current + 1) % count
+      if (key === 'ArrowLeft') return (current - 1 + count) % count
+      if (key === 'Home') return 0
+      if (key === 'End') return count - 1
+      return null
+    }
+
+    /**
+     * The audit actions the panel may offer in its filter.
+     *
+     * Taken from `GET /state` → `audit.actions`, which is the host's closed set
+     * (`design.md` §3). This half must NEVER carry its own list: a second literal
+     * drifts, and the drift shows up as a dropdown entry the server answers with
+     * `400`, or a missing entry whose events can never be filtered to.
+     *
+     * An older host that does not report `actions` yields an empty list, so the
+     * filter shows only 「全部」 rather than inventing names.
+     *
+     * @param {object | null} state The `GET /state` payload.
+     * @returns {string[]}
+     */
+    function auditActionsOf(state) {
+      if (state === null || typeof state !== 'object') return []
+      const audit = state.audit
+      if (audit === null || typeof audit !== 'object' || !Array.isArray(audit.actions)) return []
+      return audit.actions.filter((name) => typeof name === 'string' && name !== '')
+    }
+
+    /**
+     * Keep only the four fields an audit row may ever render.
+     *
+     * The HOST already projects (`src/host/audit.js#projectAuditRecord`), and this
+     * is the second half of the same rule rather than a duplicate of it: the panel
+     * must be unable to render a field it did not enumerate, whatever a future host
+     * (or a hand-edited file that the host's projection was later loosened for)
+     * sends. A `meta` — the one field `prd.md` D5 forbids outright — has nowhere to
+     * land here, because the object is rebuilt instead of filtered.
+     *
+     * @param {unknown} record
+     * @returns {{ ts: string, event: string, deviceId?: string, ip?: string } | null}
+     */
+    function normalizeAuditEvent(record) {
+      if (record === null || typeof record !== 'object' || Array.isArray(record)) return null
+      if (typeof record.ts !== 'string' || record.ts === '') return null
+      if (typeof record.event !== 'string' || record.event === '') return null
+      const clean = { ts: record.ts, event: record.event }
+      if (typeof record.deviceId === 'string' && record.deviceId !== '') clean.deviceId = record.deviceId
+      if (typeof record.ip === 'string' && record.ip !== '') clean.ip = record.ip
+      return clean
+    }
+
+    /**
+     * Fold one fetched page into the list on screen.
+     *
+     * A first page (`before` absent) REPLACES, which is what makes the filter switch
+     * a reset: re-filtering must not leave the previous action's records above the
+     * first matching one. A later page APPENDS — 「加载更多」 adds to what the user is
+     * reading. Duplicates are not removed here on purpose: the host's cursor is what
+     * guarantees one record per page (`ts` + line number), and a client-side dedupe
+     * key would have to invent one field — two genuine events can share a
+     * millisecond, an action, a device and an address.
+     *
+     * @param {Array<object>} current
+     * @param {Array<object>} page
+     * @param {string | null | undefined} before
+     * @returns {Array<object>}
+     */
+    function appendAuditPage(current, page, before) {
+      const kept = Array.isArray(current) ? current : []
+      const incoming = (Array.isArray(page) ? page : [])
+        .map((record) => normalizeAuditEvent(record))
+        .filter((record) => record !== null)
+      return typeof before === 'string' && before !== '' ? kept.concat(incoming) : incoming
+    }
+
+    /**
+     * The admin path for one page of audit detail.
+     *
+     * `limit` is deliberately NOT sent: the host's `AUDIT_EVENTS_PAGE_SIZE` is the
+     * page size, so the first screen shows however many records the server defines
+     * as a page. A literal `50` here would be a second definition of the same
+     * number, and the two would drift silently.
+     *
+     * @param {string} [action] Member of the host's closed set, or '' for every action.
+     * @param {string} [before] Cursor of the last record already shown.
+     * @returns {string} Path below the admin API base.
+     */
+    function auditEventsQuery(action, before) {
+      const parts = []
+      if (typeof action === 'string' && action !== '') parts.push('action=' + encodeURIComponent(action))
+      if (typeof before === 'string' && before !== '') parts.push('before=' + encodeURIComponent(before))
+      return parts.length === 0 ? AUDIT_EVENTS_PATH : AUDIT_EVENTS_PATH + '?' + parts.join('&')
+    }
+
+    /**
+     * Format one audit instant for the detail list (`prd.md` R5).
+     *
+     * Same local day as `nowMs` → `HH:MM:SS`; any other day → `MM-DD HH:MM:SS`, so
+     * a list spanning midnight does not silently read as "all today". The full
+     * instant goes in the row's `title`, so the exact UTC value is still one hover
+     * away without cluttering the column.
+     *
+     * Local time is deliberate: the reader is looking at their own clock, and the
+     * trail's `ts` is the only field here that is stored in UTC.
+     *
+     * @param {string} iso
+     * @param {number} nowMs
+     * @returns {{ label: string, iso: string }} Both empty when the instant is unusable.
+     */
+    function formatAuditTime(iso, nowMs) {
+      const at = typeof iso === 'string' ? Date.parse(iso) : Number.NaN
+      if (!Number.isFinite(at)) return { label: '', iso: '' }
+      const pad = (value) => String(value).padStart(2, '0')
+      const instant = new Date(at)
+      const clock = pad(instant.getHours()) + ':' + pad(instant.getMinutes()) + ':' + pad(instant.getSeconds())
+      const now = new Date(Number.isFinite(nowMs) ? nowMs : Date.now())
+      const sameDay = instant.getFullYear() === now.getFullYear()
+        && instant.getMonth() === now.getMonth()
+        && instant.getDate() === now.getDate()
+      const label = sameDay ? clock : pad(instant.getMonth() + 1) + '-' + pad(instant.getDate()) + ' ' + clock
+      return { label, iso: instant.toISOString() }
+    }
+
+    /**
+     * The name to show for an audit row's device.
+     *
+     * Resolved from the device list the panel already has, so 「刚才那台手机」 is
+     * recognizable without cross-referencing ids. A record whose device was revoked
+     * and pruned keeps its id prefix instead of becoming blank — the id is the only
+     * thing left that identifies it, and a vanished id would read as "no device".
+     *
+     * @param {string} [deviceId]
+     * @param {object[]} [devices]
+     * @returns {string} The name, an 8-character id prefix, or an em dash.
+     */
+    function deviceNameOf(deviceId, devices) {
+      if (typeof deviceId !== 'string' || deviceId === '') return '—'
+      const list = Array.isArray(devices) ? devices : []
+      const found = list.find((device) => device !== null && typeof device === 'object' && device.id === deviceId)
+      const name = found !== undefined && typeof found.name === 'string' ? found.name.trim() : ''
+      return name === '' ? deviceId.slice(0, 8) : name
     }
 
     /* ------------------------------------------------------------------ *
@@ -1710,15 +1977,39 @@ window.__ModuleLoader__.load({
       '.drc-panelTitles{display:flex;flex:1;flex-direction:column;gap:2px;min-width:0}',
       '.drc-panelTitle{margin:0;color:var(--dsw-alias-label-primary);font-size:15px;font-weight:600;line-height:22px}',
       '.drc-panelSubtitle{margin:0;color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}',
+      '.drc-configBar{display:flex;flex-wrap:wrap;align-items:center;gap:8px 16px;padding:10px 14px;border-bottom:1px solid var(--dsw-alias-border-l1)}',
+      '.drc-configGroup{display:flex;align-items:center;gap:8px;min-width:0}',
+      '.drc-configLabel{color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px;white-space:nowrap}',
       '.drc-close{flex:none;display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;border:none;border-radius:50%;background:none;color:var(--dsw-alias-label-secondary);font:inherit;font-size:16px;line-height:1;cursor:pointer}',
       '.drc-close:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
       '.drc-close:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:2px}',
-      '.drc-body{display:flex;flex-direction:column;gap:16px;padding:16px 16px 20px;overflow-y:auto}',
-      /* Every section after the first is separated by a hairline instead of air
-         alone: the panel is one scroll column with four unrelated blocks, and at
-         14px gaps they read as one continuous form. */
+      /* The body scrolls INSIDE the card, and `min-height:0` is what lets a flex
+         child actually shrink below its content and scroll instead of pushing the
+         card past its `max-height`. There is exactly ONE scrolling layer here (plus
+         the audit detail list, which caps itself) — two nested scrollers fight over
+         the wheel and the outer one never reaches the bottom. */
+      '.drc-body{display:flex;flex:1 1 auto;flex-direction:column;gap:12px;min-height:0;padding:12px 16px 18px;overflow-y:auto}',
+      /* The status strip sits OUTSIDE the scrolling body on purpose: 「一眼看到当前
+        状态」 has to hold while the user scrolls a tab, so it cannot be part of what
+         scrolls away. */
+      '.drc-statusStrip{display:flex;flex-wrap:wrap;gap:4px 8px;padding:8px 16px;border-bottom:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}',
+      '.drc-tabs{display:flex;gap:4px;padding:8px 14px 0;border-bottom:1px solid var(--dsw-alias-border-l1)}',
+      '.drc-tab{box-sizing:border-box;height:30px;padding:0 10px;border:none;border-bottom:2px solid transparent;border-radius:8px 8px 0 0;background:none;color:var(--dsw-alias-label-secondary);font:inherit;font-size:13px;cursor:pointer}',
+      '.drc-tab:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
+      '.drc-tab:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:-2px}',
+      /* The selected tab is marked by weight, colour AND a rule — not by colour
+         alone, which is indistinguishable in a high-contrast theme. */
+      '.drc-tabActive{color:var(--dsw-alias-label-primary);font-weight:600;border-bottom-color:var(--dsw-alias-brand-primary)}',
+      /* One panel element per tab so every tab's `aria-controls` resolves to
+         something real; only the active one carries content. `[hidden]` needs an
+         explicit rule because the UA's `display:none` loses to this class. */
+      '.drc-panelBody{display:flex;flex-direction:column;gap:14px}',
+      '.drc-panelBody[hidden]{display:none}',
       '.drc-section{display:flex;flex-direction:column;gap:10px}',
-      '.drc-body > .drc-section + .drc-section{border-top:1px solid var(--dsw-alias-border-l1);padding-top:14px}',
+      /* Every section after the first is separated by a hairline instead of air
+         alone: a tab can hold two unrelated blocks, and at a 14px gap they read as
+         one continuous form. */
+      '.drc-panelBody > .drc-section + .drc-section{border-top:1px solid var(--dsw-alias-border-l1);padding-top:14px}',
       '.drc-sectionTitle{margin:0;color:var(--dsw-alias-label-secondary);font-size:11px;font-weight:600;letter-spacing:.04em;text-transform:uppercase}',
       '.drc-row{display:flex;align-items:center;justify-content:space-between;gap:10px}',
       '.drc-field{display:flex;flex-direction:column;gap:2px;min-width:0}',
@@ -1769,6 +2060,7 @@ window.__ModuleLoader__.load({
          the copy button underneath it, so the button floated alone on its own
          line and read as belonging to the next section. */
       '.drc-inline{display:flex;align-items:center;gap:6px;min-width:0}',
+      '.drc-emptyAction{display:flex;flex-direction:column;align-items:flex-start;gap:8px}',
       '.drc-linkInput{box-sizing:border-box;flex:1;width:auto;min-width:0;height:28px;padding:0 8px;border:1px dashed var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-link);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px}',
       '.drc-devices{display:flex;flex-direction:column;margin:0;padding:0;list-style:none}',
       '.drc-device{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 0;border-bottom:1px solid var(--dsw-alias-border-l1)}',
@@ -1820,6 +2112,25 @@ window.__ModuleLoader__.load({
       '.drc-auditItem{display:flex;align-items:baseline;justify-content:space-between;gap:8px;box-sizing:border-box;min-width:0;padding:6px 9px;border:1px solid var(--dsw-alias-border-l1);border-radius:8px;background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-secondary);font-size:12px;line-height:18px}',
       '.drc-auditItem > span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
       '.drc-auditValue{flex:none;color:var(--dsw-alias-label-primary);font-variant-numeric:tabular-nums}',
+      /* Audit detail: four fixed columns per row (time, action, device, address).
+         A list and not a `<table>`: two columns are short and one is an ellipsised
+         name, so table semantics would only make a screen reader announce headers
+         before every cell. The list caps its own height so the panel keeps ONE
+         scrolling layer above it. */
+      /* Single scrolling owner: `.drc-body` (the modal's content column). The list
+         used to cap itself at 260px with its own `overflow-y:auto`, which meant a
+         nested scrollbar inside a scrolling panel — a trackpad scroll would move the
+         inner list until it hit its end and then move the outer one, and the 「加载更多」
+         button sat in a second scroll context. One scrollbar, at the panel level. */
+      '.drc-auditEvents{display:flex;flex-direction:column;margin:0;padding:0;list-style:none}',
+      '.drc-auditEvent{display:grid;grid-template-columns:auto auto minmax(0,1fr) auto;gap:8px;align-items:baseline;padding:5px 2px;border-bottom:1px solid var(--dsw-alias-border-l1);font-size:12px;line-height:18px}',
+      '.drc-auditEvent:last-child{border-bottom:none}',
+      '.drc-auditEventTime{color:var(--dsw-alias-label-secondary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-variant-numeric:tabular-nums;white-space:nowrap}',
+      '.drc-auditEventAction{white-space:nowrap;color:var(--dsw-alias-label-primary)}',
+      '.drc-auditEventDevice{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-secondary)}',
+      '.drc-auditEventIp{white-space:nowrap;color:var(--dsw-alias-label-secondary);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}',
+      /* The filter is a narrow control in a row, not a full-width field. */
+      '.drc-selectInline{width:auto;min-width:132px}',
       /* The switch is the only thing in the panel that animates. Respect the
          preference instead of assuming a 120ms slide is harmless: for vestibular
          disorders a small moving object is the worst case, not the mildest. */
@@ -2243,26 +2554,29 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * The enable switch and the port field.
+     * The panel's top configuration: the master switch and the listener port.
      *
-     * Both take effect on the next plugin load, and the panel says so rather than
-     * implying a live re-bind: `src/host/api.js#updateSettings` answers
-     * `requiresReload`, and a UI that quietly disagreed with that would have the
-     * user waiting for a listener that will never appear.
+     * Both are panel-wide facts, so both live ABOVE the tabs: the switch decides
+     * whether anything is reachable at all, and the address a pairing link uses
+     * depends on the port it must name. Leaving the port inside a tab made two
+     * adjacent settings answer the same question from different places — the review
+     * that produced this layout put it as "端口同理，应当是顶部配置".
+     *
+     * The component owns its drafts, and it is mounted OUTSIDE the tab panels, so a
+     * half-typed port survives every tab switch for free.
      *
      * @param {object} props
      * @param {(key: string, params?: object) => string} props.t
      * @param {{ enabled: boolean, port: number } | null} props.settings
-     * @param {object | null} props.gateway
      * @param {(patch: object) => Promise<{ ok: boolean, requiresReload?: boolean, failure: object | null }>} props.updateSettings
      */
-    function AccessSection({ t, settings, gateway, updateSettings }) {
+    function ConfigBar({ t, settings, updateSettings }) {
       const [portDraft, setPortDraft] = useState(null)
       const [busy, setBusy] = useState(false)
       const [outcome, setOutcome] = useState(null)
 
-      const enabled = settings !== null && typeof settings === 'object' && settings.enabled === true
       const known = settings !== null && typeof settings === 'object'
+      const enabled = known && settings.enabled === true
       const portText = portDraft !== null
         ? portDraft
         : (known && Number.isInteger(settings.port) ? String(settings.port) : '')
@@ -2272,7 +2586,7 @@ window.__ModuleLoader__.load({
         setOutcome(null)
         const result = await updateSettings(patch)
         setBusy(false)
-        setOutcome(result.ok
+        setOutcome(result.ok === true
           ? { tone: 'ok', requiresReload: result.requiresReload === true }
           : { tone: 'error', failure: result.failure })
       }
@@ -2293,55 +2607,59 @@ window.__ModuleLoader__.load({
         void commit({ port: value })
       }
 
-      let listeningKey = 'access.gatewayDisabled'
-      let listeningParams
-      if (enabled) {
-        const listening = gateway !== null && typeof gateway === 'object' && gateway.listening === true
-        if (listening) {
-          listeningKey = 'access.gatewayListening'
-          listeningParams = {
-            port: gateway.port === null || gateway.port === undefined ? '?' : gateway.port,
-            live: Number.isInteger(gateway.liveConnections) ? gateway.liveConnections : 0,
-          }
+      let outcomeNode = null
+      if (outcome !== null) {
+        if (outcome.tone === 'invalid') {
+          outcomeNode = h(Notice, { tone: 'error', title: t('access.invalidPort') })
+        } else if (outcome.tone === 'ok') {
+          /* The reload sentence appears only when the server said the listener
+             configuration changed: an address save is live immediately, and telling
+             the user to restart for it is a false instruction (`design.md` §2.3). */
+          outcomeNode = h(Notice, {
+            tone: 'ok',
+            title: t('access.saved'),
+            body: outcome.requiresReload === true ? t('access.reloadRequired') : undefined,
+          })
         } else {
-          listeningKey = 'access.gatewayNotListening'
+          outcomeNode = h(FailureNotice, { failure: outcome.failure === null ? { kind: 'unknown' } : outcome.failure, t })
         }
       }
 
-      return h('section', { className: 'drc-section' },
-        h('h3', { className: 'drc-sectionTitle' }, t('access.heading')),
-        h('div', { className: 'drc-row' },
-          h('div', { className: 'drc-field' },
-            h('span', { className: 'drc-label' }, t('access.enable')),
-            h('p', { className: 'drc-hint' }, t('access.enableHint')),
-          ),
+      return h('div', { className: 'drc-configBar' },
+        h('div', { className: 'drc-configGroup' },
           h('button', {
             type: 'button',
             className: 'drc-switch',
             role: 'switch',
             'aria-checked': enabled,
             'aria-label': t('access.enable'),
+            /* The explanation is a tooltip, not a paragraph: the switch is one control
+               in a dense row, and the status line below already states the effect. */
+            title: t('access.enableHint'),
             disabled: busy || known !== true,
             onClick: onToggle,
           }, h('span', { className: 'drc-knob' })),
+          h('span', { className: 'drc-configLabel' }, t('access.enable')),
         ),
-        h('p', { className: 'drc-hint' }, t(listeningKey, listeningParams)),
-        h('div', { className: 'drc-row' },
-          h('label', { className: 'drc-field' },
-            h('span', { className: 'drc-label' }, t('access.port')),
-            h('input', {
-              className: 'drc-input drc-mono',
-              type: 'text',
-              inputMode: 'numeric',
-              value: portText,
-              'aria-label': t('access.port'),
-              disabled: busy || known !== true,
-              onChange: (event) => {
-                setOutcome(null)
-                setPortDraft(event.target.value)
-              },
-            }),
-          ),
+        h('div', { className: 'drc-configGroup' },
+          h('label', { className: 'drc-configLabel', htmlFor: PORT_INPUT_ID }, t('access.port')),
+          h('input', {
+            id: PORT_INPUT_ID,
+            className: 'drc-input drc-mono',
+            type: 'text',
+            inputMode: 'numeric',
+            value: portText,
+            disabled: busy || known !== true,
+            onChange: (event) => {
+              setOutcome(null)
+              setPortDraft(event.target.value)
+            },
+            onKeyDown: (event) => {
+              if (event.key !== 'Enter') return
+              event.preventDefault()
+              onSavePort()
+            },
+          }),
           h('button', {
             type: 'button',
             className: 'drc-button',
@@ -2349,54 +2667,27 @@ window.__ModuleLoader__.load({
             onClick: onSavePort,
           }, t('access.save')),
         ),
-        outcome === null ? null : (outcome.tone === 'invalid'
-          ? h(Notice, { tone: 'error', title: t('access.invalidPort') })
-          : (outcome.tone === 'ok'
-            /* The reload sentence is conditional now: it appears only when the
-               server said the listener configuration changed. An address save is
-               live immediately, and telling the user to restart for it is a false
-               instruction (`design.md` §2.3). */
-            ? h(Notice, {
-              tone: 'ok',
-              title: t('access.saved'),
-              body: outcome.requiresReload === true ? t('access.reloadRequired') : undefined,
-            })
-            : h(FailureNotice, { failure: outcome.failure === null ? { kind: 'unknown' } : outcome.failure, t }))),
+        outcomeNode,
       )
     }
 
     /**
-     * The address the pairing link is built from (`prd.md` R2/R3, `design.md` §3.2).
+     * Where the pairing link points: a LAN address or one saved public address.
      *
-     * Two modes, because they are two different facts:
-     *
-     *   - **LAN** — a dropdown over the IPv4 addresses the HOST enumerated
-     *     (`GET /state` → `addresses.lan`). The panel cannot enumerate them itself:
-     *     a browser sees one realm at a time and no interface list at all. The
-     *     default is the first entry, which `listLanAddresses` sorts private-first,
-     *     so the default is the address a phone can actually reach.
-     *   - **Public** — a user-maintained book of 0..8 addresses (home DDNS, a tunnel
-     *     hostname, `public.example.com:8443`), one of which is selected. Nothing is
-     *     probed: `prd.md` D3 rules out reachability checks and built-in tunnelling,
-     *     so the panel says plainly that the mapping is the user's job.
-     *
-     * Every change goes through the ONE writable field, `settings.access`, and is
-     * written as a whole object (`store.updateSettings` replaces it). No optimistic
-     * update: the props come back from the server's answer, so a rejected address
-     * can never appear saved (`quality-guidelines.md` forbidden pattern 7).
-     *
-     * A malformed address is caught HERE first so the user gets the message without
-     * a round trip — the server re-checks it and is the authority.
+     * This lives in the PAIRING tab on purpose. Choosing an access point is part of
+     * "pair a device", not part of administration: the link, the symbol and the
+     * address are one decision made in one place, and the user who is about to scan
+     * a code should not have to switch tabs to change what that code will contain.
+     * Maintaining the address BOOK is a different task with a different cadence and
+     * lives in the 接入 tab ({@link PublicBookSection}).
      *
      * @param {object} props
      * @param {(key: string, params?: object) => string} props.t
-     * @param {object | null} props.settings `state.settings`.
-     * @param {{ lan?: object[] } | null} props.addresses `state.addresses`.
+     * @param {{ enabled: boolean, port: number } | null} props.settings
+     * @param {{ lan?: object[] } | null} props.addresses
      * @param {(patch: object) => Promise<{ ok: boolean, failure: object | null }>} props.updateSettings
      */
-    function AddressSection({ t, settings, addresses, updateSettings }) {
-      const [labelDraft, setLabelDraft] = useState('')
-      const [addressDraft, setAddressDraft] = useState('')
+    function AccessPointSection({ t, settings, addresses, updateSettings, onManagePublic }) {
       const [busy, setBusy] = useState(false)
       const [outcome, setOutcome] = useState(null)
 
@@ -2424,14 +2715,9 @@ window.__ModuleLoader__.load({
         setOutcome(null)
         const result = await updateSettings({ access: next })
         setBusy(false)
-        if (result.ok !== true) {
-          setOutcome({ tone: 'error', failure: result.failure })
-          return false
-        }
-        /* No reload sentence: an address only shapes a link, so it is live the
-           moment it is stored (`design.md` §2.3). */
-        setOutcome({ tone: 'ok' })
-        return true
+        /* No reload sentence: an address only shapes a link, so it is live the moment
+           it is stored (`design.md` §2.3). */
+        setOutcome(result.ok === true ? { tone: 'ok' } : { tone: 'error', failure: result.failure })
       }
 
       const onMode = (mode) => {
@@ -2450,54 +2736,8 @@ window.__ModuleLoader__.load({
       }
 
       const onPickPublic = (id) => {
-        if (busy || known !== true) return
+        if (busy || known !== true || id === '') return
         void commit({ mode: 'public', lanAddress: access.lanAddress, public: publicRows, selectedPublicId: id })
-      }
-
-      const onDeletePublic = (id) => {
-        if (busy || known !== true) return
-        const rest = publicRows.filter((row) => row.id !== id)
-        /* Deleting the selected row moves the selection instead of leaving it
-           dangling; the store normalizes the same way, so the two cannot disagree. */
-        const nextSelected = id === selectedPublicId
-          ? (rest.length > 0 ? rest[0].id : null)
-          : selectedPublicId
-        void commit({
-          mode: 'public',
-          lanAddress: access.lanAddress,
-          public: rest,
-          selectedPublicId: nextSelected,
-        })
-      }
-
-      const onAdd = async () => {
-        if (busy || known !== true) return
-        const parsed = parseAddress(addressDraft)
-        if (parsed === null) {
-          setOutcome({ tone: 'invalid' })
-          return
-        }
-        if (publicRows.length >= PUBLIC_ADDRESS_MAX) {
-          setOutcome({ tone: 'tooMany' })
-          return
-        }
-        const id = newPublicId(publicRows)
-        const saved = await commit({
-          mode: 'public',
-          lanAddress: access.lanAddress,
-          public: publicRows.concat([{
-            id,
-            label: labelDraft.trim().slice(0, PUBLIC_LABEL_MAX),
-            address: formatAddress(parsed),
-          }]),
-          /* A newly added address becomes the selected one: the user just typed it,
-             so it is the address they mean right now. */
-          selectedPublicId: id,
-        })
-        if (saved) {
-          setLabelDraft('')
-          setAddressDraft('')
-        }
       }
 
       /** A segment of the LAN/public switch. */
@@ -2515,24 +2755,179 @@ window.__ModuleLoader__.load({
         ? effective
         : (lan.length > 0 ? lan[0].address : '')
 
-      const publicPanel = h('div', { className: 'drc-section' },
+      const lanPicker = lan.length === 0
+        ? h('p', { className: 'drc-hint' }, t('address.lanEmpty'))
+        : h('select', {
+          className: 'drc-select',
+          value: lanValue,
+          'aria-label': t('point.heading'),
+          disabled: busy || known !== true,
+          onChange: (event) => onPickLan(event.target.value),
+        }, lan.map((entry) => h('option', {
+          key: entry.address + '|' + String(entry.iface ?? ''),
+          value: entry.address,
+        }, typeof entry.iface === 'string' && entry.iface !== ''
+          ? entry.address + ' · ' + entry.iface
+          : entry.address)))
+
+      /* One dropdown rather than a radio per row: this is a choice, not a book. The
+         address is what the user is comparing, so it rides along in the option text.
+         An empty book is a dead end from here — the mode is already `public` and there
+         is nothing to pick — so the empty state offers the one action that unblocks it
+         instead of a sentence that only describes the problem. */
+      const publicPicker = publicRows.length === 0
+        ? h('div', { className: 'drc-emptyAction' },
+          h('p', { className: 'drc-hint' }, t('address.publicEmpty')),
+          typeof onManagePublic === 'function'
+            ? h('button', {
+              type: 'button',
+              className: 'drc-button',
+              onClick: () => onManagePublic(),
+            }, t('address.goManage'))
+            : null,
+        )
+        : h('select', {
+          className: 'drc-select',
+          value: selectedPublicId,
+          'aria-label': t('point.heading'),
+          disabled: busy || known !== true,
+          onChange: (event) => onPickPublic(event.target.value),
+        }, publicRows.map((row) => h('option', { key: row.id, value: row.id },
+          row.label === '' ? row.address : row.label + ' · ' + row.address)))
+
+      let outcomeNode = null
+      if (outcome !== null) {
+        outcomeNode = outcome.tone === 'ok'
+          ? h(Notice, { tone: 'ok', title: t('access.saved') })
+          : h(FailureNotice, { failure: outcome.failure === null ? { kind: 'unknown' } : outcome.failure, t })
+      }
+
+      return h('section', { className: 'drc-section' },
+        h('h3', { className: 'drc-sectionTitle' }, t('point.heading')),
+        h('div', {
+          className: 'drc-segments',
+          role: 'group',
+          'aria-label': t('point.heading'),
+        },
+          segment('lan', 'address.modeLan'),
+          segment('public', 'address.modePublic'),
+        ),
+        access.mode === 'public' ? publicPicker : lanPicker,
+        stale ? h('p', { className: 'drc-hint' }, t('address.staleHint', { address: access.lanAddress })) : null,
+        outcomeNode,
+      )
+    }
+
+    /**
+     * The public address book: add, label, delete.
+     *
+     * The 接入 tab owns the LIST; the pairing tab owns the CHOICE. Splitting them
+     * keeps the frequent action (pick an address, scan a code) away from the rare
+     * one (edit the book), and it means a delete cannot leave the pairing tab
+     * pointing at nothing: the selection moves here exactly the way the store's
+     * normalizer moves it.
+     *
+     * @param {object} props
+     * @param {(key: string, params?: object) => string} props.t
+     * @param {{ enabled: boolean, port: number } | null} props.settings
+     * @param {(patch: object) => Promise<{ ok: boolean, failure: object | null }>} props.updateSettings
+     */
+    function PublicBookSection({ t, settings, updateSettings }) {
+      const [labelDraft, setLabelDraft] = useState('')
+      const [addressDraft, setAddressDraft] = useState('')
+      const [busy, setBusy] = useState(false)
+      const [outcome, setOutcome] = useState(null)
+
+      const known = settings !== null && typeof settings === 'object'
+      const access = accessOf(settings)
+      const publicRows = access.public
+      const activeId = publicRows.some((row) => row.id === access.selectedPublicId)
+        ? access.selectedPublicId
+        : (publicRows.length > 0 ? publicRows[0].id : '')
+
+      const commit = async (next) => {
+        setBusy(true)
+        setOutcome(null)
+        const result = await updateSettings({ access: next })
+        setBusy(false)
+        if (result.ok !== true) {
+          setOutcome({ tone: 'error', failure: result.failure })
+          return false
+        }
+        setOutcome({ tone: 'ok' })
+        return true
+      }
+
+      const onDeletePublic = (id) => {
+        if (busy || known !== true) return
+        const rest = publicRows.filter((row) => row.id !== id)
+        void commit({
+          mode: access.mode,
+          lanAddress: access.lanAddress,
+          public: rest,
+          selectedPublicId: id === activeId ? (rest.length > 0 ? rest[0].id : null) : activeId,
+        })
+      }
+
+      const onAdd = async () => {
+        if (busy || known !== true) return
+        const parsed = parseAddress(addressDraft)
+        if (parsed === null) {
+          setOutcome({ tone: 'invalid' })
+          return
+        }
+        if (publicRows.length >= PUBLIC_ADDRESS_MAX) {
+          setOutcome({ tone: 'tooMany' })
+          return
+        }
+        const id = newPublicId(publicRows)
+        const saved = await commit({
+          mode: access.mode,
+          lanAddress: access.lanAddress,
+          public: publicRows.concat([{
+            id,
+            label: labelDraft.trim().slice(0, PUBLIC_LABEL_MAX),
+            address: formatAddress(parsed),
+          }]),
+          /* A newly added address becomes the selected one: the user just typed it,
+             so it is the address they mean right now. */
+          selectedPublicId: id,
+        })
+        if (saved) {
+          setLabelDraft('')
+          setAddressDraft('')
+        }
+      }
+
+      let outcomeNode = null
+      if (outcome !== null) {
+        if (outcome.tone === 'invalid') {
+          outcomeNode = h(Notice, { tone: 'error', title: t('address.invalid') })
+        } else if (outcome.tone === 'tooMany') {
+          outcomeNode = h(Notice, { tone: 'error', title: t('address.tooMany', { max: PUBLIC_ADDRESS_MAX }) })
+        } else if (outcome.tone === 'ok') {
+          outcomeNode = h(Notice, { tone: 'ok', title: t('access.saved') })
+        } else {
+          outcomeNode = h(FailureNotice, {
+            failure: outcome.failure === null ? { kind: 'unknown' } : outcome.failure,
+            t,
+          })
+        }
+      }
+
+      return h('section', { className: 'drc-section' },
+        h('h3', { className: 'drc-sectionTitle' }, t('address.heading')),
         publicRows.length === 0
           ? h('p', { className: 'drc-hint' }, t('address.publicEmpty'))
           : h('ul', { className: 'drc-publicList' },
             publicRows.map((row) => h('li', { className: 'drc-publicRow', key: row.id },
-              h('input', {
-                className: 'drc-radio',
-                type: 'radio',
-                name: 'drc-public-address',
-                checked: row.id === selectedPublicId,
-                'aria-label': row.label === '' ? row.address : row.label,
-                disabled: busy || known !== true,
-                onChange: () => onPickPublic(row.id),
-              }),
               h('div', { className: 'drc-publicMain' },
                 h('span', { className: 'drc-publicLabel' }, row.label === '' ? row.address : row.label),
                 row.label === '' ? null : h('span', { className: 'drc-publicAddress' }, row.address),
               ),
+              row.id === activeId
+                ? h('span', { className: 'drc-deviceMeta' }, t('address.inUse'))
+                : null,
               h('button', {
                 type: 'button',
                 className: 'drc-button drc-buttonDanger',
@@ -2583,51 +2978,6 @@ window.__ModuleLoader__.load({
           }, t('address.add')),
         ),
         h('p', { className: 'drc-hint' }, t('address.publicHint')),
-      )
-
-      const lanPanel = lan.length === 0
-        ? h('p', { className: 'drc-hint' }, t('address.lanEmpty'))
-        : h('select', {
-          className: 'drc-select',
-          value: lanValue,
-          'aria-label': t('address.heading'),
-          disabled: busy || known !== true,
-          onChange: (event) => onPickLan(event.target.value),
-        }, lan.map((entry) => h('option', {
-          key: entry.address + '|' + String(entry.iface ?? ''),
-          value: entry.address,
-        }, typeof entry.iface === 'string' && entry.iface !== ''
-          ? entry.address + ' · ' + entry.iface
-          : entry.address)))
-
-      let outcomeNode = null
-      if (outcome !== null) {
-        if (outcome.tone === 'invalid') {
-          outcomeNode = h(Notice, { tone: 'error', title: t('address.invalid') })
-        } else if (outcome.tone === 'tooMany') {
-          outcomeNode = h(Notice, { tone: 'error', title: t('address.tooMany', { max: PUBLIC_ADDRESS_MAX }) })
-        } else if (outcome.tone === 'ok') {
-          outcomeNode = h(Notice, { tone: 'ok', title: t('access.saved') })
-        } else {
-          outcomeNode = h(FailureNotice, {
-            failure: outcome.failure === null ? { kind: 'unknown' } : outcome.failure,
-            t,
-          })
-        }
-      }
-
-      return h('section', { className: 'drc-section' },
-        h('h3', { className: 'drc-sectionTitle' }, t('address.heading')),
-        h('div', {
-          className: 'drc-segments',
-          role: 'group',
-          'aria-label': t('address.heading'),
-        },
-          segment('lan', 'address.modeLan'),
-          segment('public', 'address.modePublic'),
-        ),
-        access.mode === 'public' ? publicPanel : lanPanel,
-        stale ? h('p', { className: 'drc-hint' }, t('address.staleHint', { address: access.lanAddress })) : null,
         outcomeNode,
       )
     }
@@ -2659,7 +3009,7 @@ window.__ModuleLoader__.load({
       const [copyFailed, setCopyFailed] = useState(false)
       const current = pairing.current
       const listening = gateway !== null && typeof gateway === 'object' && gateway.listening === true
-      const url = current === null ? null : pairingUrl(current, addressText, documentBase())
+      const url = current === null ? null : pairingUrl(current, addressText, documentBase(), mode)
       const seconds = Math.max(0, Math.ceil(pairing.remainingMs / 1000))
 
       /* Encoded from the SAME `url` the copy button offers, so the symbol and the
@@ -3031,6 +3381,303 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * The always-visible status line (`prd.md` R3, `design.md` §1.3).
+     *
+     * One line, present on every tab: without it the user has to visit 接入 to learn
+     * whether anything is listening, which is exactly the scrolling the tabs exist to
+     * remove. It is plain text with no state colour — "not enabled" is a fact, not an
+     * error, and colouring it red would make the ordinary off state look broken.
+     *
+     * "Enabled but not listening" reuses the access section's own sentence
+     * (`access.gatewayNotListening`) instead of a second wording: two different
+     * sentences for one condition is how a user ends up believing they are two
+     * different problems.
+     *
+     * @param {object} props
+     * @param {(key: string, params?: object) => string} props.t
+     * @param {object | null} props.settings
+     * @param {object | null} props.gateway
+     * @param {{ active?: number } | null} props.devices The `GET /state` device counts.
+     */
+    function StatusStrip({ t, settings, gateway, devices }) {
+      const enabled = settings !== null && typeof settings === 'object' && settings.enabled === true
+      if (!enabled) return h('div', { className: 'drc-statusStrip' }, t('status.disabled'))
+      const listening = gateway !== null && typeof gateway === 'object' && gateway.listening === true
+      if (!listening) return h('div', { className: 'drc-statusStrip' }, t('access.gatewayNotListening'))
+      const port = gateway.port === null || gateway.port === undefined ? '?' : gateway.port
+      const live = Number.isInteger(gateway.liveConnections) ? gateway.liveConnections : 0
+      const active = devices !== null && typeof devices === 'object' && Number.isInteger(devices.active)
+        ? devices.active
+        : 0
+      return h('div', { className: 'drc-statusStrip' }, t('status.listening', { port, live, devices: active }))
+    }
+
+    /**
+     * The tab bar, with the full WAI-ARIA tabs contract (`design.md` §1.2).
+     *
+     * `role="tablist"` + one `role="tab"` per entry, `aria-selected` on exactly one,
+     * `aria-controls` pointing at the panel id derived from the same key, and a
+     * roving `tabIndex` so the whole bar is ONE stop in the page's Tab order. The
+     * arrows wrap and `Home`/`End` jump — via {@link tabIndexAfterKey}, which is
+     * where the arithmetic is tested.
+     *
+     * Focus follows selection because the tabs are `button`s that the panel's focus
+     * trap already knows about: nothing here can become a way OUT of the modal.
+     *
+     * @param {object} props
+     * @param {(key: string, params?: object) => string} props.t
+     * @param {string} props.current Key of the selected tab.
+     * @param {(key: string) => void} props.onSelect
+     */
+    function TabList({ t, current, onSelect }) {
+      const refs = useRef([])
+
+      /** Select one tab index and move focus to it. */
+      const select = (index) => {
+        const key = TAB_KEYS[index]
+        if (key === undefined) return
+        onSelect(key)
+        /* The node exists already, so focusing it does not wait for the re-render;
+           the container is read defensively because it is empty before the first
+           ref commit (and a non-React harness may hand back anything). */
+        const list = Array.isArray(refs.current) ? refs.current : []
+        const node = list[index]
+        if (node !== null && node !== undefined && typeof node.focus === 'function') node.focus()
+      }
+
+      const onKeyDown = (index) => (event) => {
+        const next = tabIndexAfterKey(event.key, index, TABS.length)
+        if (next === null) return
+        event.preventDefault()
+        select(next)
+      }
+
+      return h('div', { className: 'drc-tabs', role: 'tablist', 'aria-label': t('panel.title') },
+        TABS.map((tab, index) => h('button', {
+          key: tab.key,
+          ref: (node) => {
+            if (!Array.isArray(refs.current)) refs.current = []
+            refs.current[index] = node
+          },
+          type: 'button',
+          role: 'tab',
+          /* The id is DERIVED from the key, here and in the panel — one value, so a
+             tab cannot point at a panel that does not exist. */
+          id: 'drc-tab-' + tab.key,
+          className: tab.key === current ? 'drc-tab drc-tabActive' : 'drc-tab',
+          'aria-selected': tab.key === current,
+          'aria-controls': 'drc-panel-' + tab.key,
+          tabIndex: tab.key === current ? 0 : -1,
+          onClick: () => { select(index) },
+          onKeyDown: onKeyDown(index),
+        }, t(tab.labelKey))))
+    }
+
+    /**
+     * One audit detail row: time, action, device, address (`prd.md` R5).
+     *
+     * The four cells are built from the four projected fields and nothing else, which
+     * is the DOM half of `prd.md` D5: a record's `meta` has no slot to be rendered
+     * into, even if a future host leaked it into the JSON. The full instant lives on
+     * the time cell's `title` so the exact UTC value stays reachable.
+     *
+     * @param {object} props
+     * @param {(key: string, params?: object) => string} props.t
+     * @param {{ ts: string, event: string, deviceId?: string, ip?: string }} props.event
+     * @param {object[]} [props.devices]
+     * @param {number} [props.now] Injectable clock; defaults to `Date.now()`. The
+     *   panel passes nothing — it exists so a test can decide what 「今天」 means,
+     *   the same way every host module takes its clock as a parameter.
+     */
+    function AuditEventRow({ t, event, devices, now }) {
+      const time = formatAuditTime(event.ts, Number.isFinite(now) ? now : Date.now())
+      const ip = typeof event.ip === 'string' && event.ip !== '' ? event.ip : '—'
+      return h('li', { className: 'drc-auditEvent' },
+        h('span', { className: 'drc-auditEventTime', title: time.iso }, time.label),
+        h('span', { className: 'drc-auditEventAction' }, t('audit.event.' + event.event)),
+        h('span', { className: 'drc-auditEventDevice', title: typeof event.deviceId === 'string' ? event.deviceId : undefined }, deviceNameOf(event.deviceId, devices)),
+        h('span', { className: 'drc-auditEventIp' }, ip),
+      )
+    }
+
+    /**
+     * The recent-events list.
+     *
+     * Split from the fetching component so the rendered fields can be asserted
+     * without a DOM or a network: this is a pure function of `events`.
+     *
+     * @param {object} props
+     * @param {(key: string, params?: object) => string} props.t
+     * @param {object[]} props.events
+     * @param {object[]} [props.devices]
+     */
+    function AuditEventList({ t, events, devices }) {
+      return h('ul', { className: 'drc-auditEvents' },
+        events.map((event, index) => h(AuditEventRow, {
+          key: 'e' + String(index),
+          t,
+          event,
+          devices,
+        })),
+      )
+    }
+
+    /**
+     * The audit tab's detail block: filter, list, and 「加载更多」 (`prd.md` R5–R7).
+     *
+     * Three deliberate choices:
+     *
+     *   - **No `limit` on the wire.** The host's page size is the page size; a
+     *     literal here would be a second definition of the same number.
+     *   - **The filter resets paging.** Changing it re-requests page 1 and REPLACES
+     *     the list ({@link appendAuditPage}), because appending a filtered page below
+     *     unfiltered rows would show records the filter excludes.
+     *   - **The action list comes from the host** (`state.audit.actions`, via
+     *     {@link auditActionsOf}); this component never names an action.
+     *
+     * Failure is rendered through `FailureNotice`, so 403 / network / server each say
+     * something different (`quality-guidelines.md` required pattern 4), and the retry
+     * is explicit — a request re-issued on a timer would be the automatic retry the
+     * spec forbids.
+     *
+     * @param {object} props
+     * @param {(key: string, params?: object) => string} props.t
+     * @param {string[]} props.actions The host's known actions (`GET /state`).
+     * @param {object[]} [props.devices] For the device-name column.
+     */
+    function AuditEventsSection({ t, actions, devices }) {
+      const [action, setAction] = useState('')
+      const [events, setEvents] = useState([])
+      const [nextBefore, setNextBefore] = useState(null)
+      const [phase, setPhase] = useState('loading')
+      const [failure, setFailure] = useState(null)
+
+      /** Aborting on unmount is what makes "the tab closed" mean "no request in flight". */
+      const inFlight = useRef(null)
+      const disposed = useRef(false)
+      /** Monotonic token: a superseded page must not overwrite a newer result. */
+      const token = useRef(0)
+
+      const fetchPage = useCallback(async (before) => {
+        const previous = inFlight.current
+        if (previous !== null) previous.abort('superseded')
+        const mine = token.current + 1
+        token.current = mine
+
+        let controller = null
+        if (typeof AbortController === 'function') {
+          controller = new AbortController()
+          inFlight.current = controller
+        }
+        const signal = controller === null ? undefined : controller.signal
+        const appending = typeof before === 'string' && before !== ''
+        setPhase(appending ? 'appending' : 'loading')
+        try {
+          const data = await requestJson(auditEventsQuery(action, before), { signal })
+          if (disposed.current || token.current !== mine) return
+          const page = data !== null && typeof data === 'object' && Array.isArray(data.events) ? data.events : []
+          setEvents((current) => appendAuditPage(current, page, before))
+          setNextBefore(
+            data !== null && typeof data === 'object'
+              && typeof data.nextBefore === 'string' && data.nextBefore !== ''
+              ? data.nextBefore
+              : null,
+          )
+          setFailure(null)
+          setPhase('ready')
+        } catch (error) {
+          if (disposed.current || token.current !== mine) return
+          /* The rows already on screen are KEPT: an empty list on a transient error
+             would read as "no audit records", which is the reassuring-and-wrong
+             state the spec forbids. */
+          setFailure(describeFailure(error))
+          setPhase('error')
+        } finally {
+          if (inFlight.current === controller) inFlight.current = null
+        }
+      }, [action])
+
+      useEffect(() => {
+        disposed.current = false
+        void fetchPage(null)
+        return () => {
+          disposed.current = true
+          const controller = inFlight.current
+          inFlight.current = null
+          if (controller !== null) controller.abort('unmount')
+        }
+      }, [fetchPage])
+
+      /** Switching the filter restarts paging; see the note above. */
+      const changeAction = (value) => {
+        const next = typeof value === 'string' ? value : ''
+        if (next === action) return
+        setAction(next)
+        setEvents([])
+        setNextBefore(null)
+        setFailure(null)
+        setPhase('loading')
+      }
+
+      const options = Array.isArray(actions) ? actions : []
+
+      const filterRow = h('div', { className: 'drc-row' },
+        h('label', { className: 'drc-field' },
+          h('span', { className: 'drc-label' }, t('audit.detail.filter')),
+          h('select', {
+            className: 'drc-select drc-selectInline',
+            value: action,
+            'aria-label': t('audit.detail.filter'),
+            onChange: (event) => { changeAction(event.target.value) },
+          },
+            h('option', { value: '' }, t('audit.detail.all')),
+            options.map((name) => h('option', { key: name, value: name }, t('audit.event.' + name))),
+          ),
+        ),
+        phase === 'loading' && events.length === 0
+          ? null
+          : h('span', { className: 'drc-hint' }, t('audit.detail.shown', { count: events.length })),
+      )
+
+      let list = null
+      if (events.length > 0) {
+        list = h(AuditEventList, { t, events, devices })
+      } else if (failure === null) {
+        list = h('p', { className: 'drc-hint' },
+          phase === 'loading' ? t('audit.detail.loading') : t('audit.empty'))
+      }
+
+      /* 「没有更多了」 replaces the button rather than disabling it: a disabled button
+         that never re-enables reads as a failure, and `nextBefore === null` is a
+         successful end. */
+      let footer = null
+      if (events.length > 0) {
+        footer = nextBefore === null
+          ? h('p', { className: 'drc-hint' }, t('audit.detail.noMore'))
+          : h('div', { className: 'drc-row' },
+            h('button', {
+              type: 'button',
+              className: 'drc-button',
+              disabled: phase === 'appending',
+              onClick: () => { void fetchPage(nextBefore) },
+            }, phase === 'appending' ? t('audit.detail.loadingMore') : t('audit.detail.loadMore')),
+          )
+      }
+
+      return h('section', { className: 'drc-section' },
+        h('h3', { className: 'drc-sectionTitle' }, t('audit.detail.heading')),
+        filterRow,
+        list,
+        footer,
+        failure === null ? null : h(FailureNotice, {
+          failure,
+          t,
+          onRetry: () => { void fetchPage(null) },
+        }),
+      )
+    }
+
+    /**
      * The panel itself: a centred modal card inside a scrim.
      *
      * Mounted only while open, which is what bounds every subscription in the
@@ -3056,6 +3703,11 @@ window.__ModuleLoader__.load({
     function Panel({ t, onClose, panelRef }) {
       const status = useGatewayStatus()
       const pairing = usePairing()
+      /* `null` means "the user has not chosen yet", so the first screen follows the
+         state the host reports (`prd.md` R2) and a later open starts over: the panel
+         unmounts on close, so there is no cross-mount state to remember (PRD
+         constraint 4 — no localStorage, no module-level cache). */
+      const [tab, setTab] = useState(null)
 
       const snapshot = status.snapshot
       const state = snapshot.state !== null && typeof snapshot.state === 'object' ? snapshot.state : null
@@ -3075,9 +3727,40 @@ window.__ModuleLoader__.load({
       const lan = addresses !== null && Array.isArray(addresses.lan) ? addresses.lan : []
       const effective = effectiveAddress(access, lan)
 
-      const body = []
+      const activeTab = tab === null || !TAB_KEYS.includes(tab) ? preferredTab(settings, gateway) : tab
+      const auditActions = auditActionsOf(state)
+      const deviceCounts = state !== null && state.devices !== null && typeof state.devices === 'object'
+        ? state.devices
+        : null
+
+      /* Which panels have been shown at least once. A panel that has been visited is
+         kept MOUNTED and merely `hidden`, because the sections hold live state:
+         `ConfigBar` a half-typed port, `PublicBookSection` an unsaved
+         address row, `DeviceRow` a revoke confirmation, `AuditEventsSection` a page cursor.
+         Rendering only the active tab unmounted all of it on every switch — a request
+         in flight would land on a component that no longer existed, and coming back
+         showed a pristine form with no sign of what had just happened (`prd.md`
+         constraint 4). Keeping them mounted costs one subtree per visited tab; none of
+         these sections polls on a timer, so a hidden panel does no work. `hidden` is
+         what removes them from the accessibility tree and the tab order. */
+      const [visited, setVisited] = useState(null)
+      useEffect(() => {
+        /* Nothing is recorded until the first real snapshot arrives: the first render
+           sees an empty state, so `preferredTab` answers 接入, and marking that as
+           visited would mount the access panel behind everyone's back on every open. */
+        if (state === null) return
+        setVisited((previous) => (previous !== null && previous[activeTab] === true
+          ? previous
+          : { ...(previous ?? {}), [activeTab]: true }))
+      }, [activeTab, state])
+
+
+      /* Notices belong to the PANEL, not to a tab: a failed state read is why the
+         tabs have nothing to show, so hiding the explanation behind the tab the user
+         happened to be on would be the wrong half of the story. */
+      const notices = []
       if (snapshot.error !== null) {
-        body.push(h(FailureNotice, {
+        notices.push(h(FailureNotice, {
           key: 'failure',
           failure: snapshot.error,
           t,
@@ -3087,38 +3770,78 @@ window.__ModuleLoader__.load({
         }))
       }
       if (snapshot.phase === 'loading' && state === null) {
-        body.push(h('p', { className: 'drc-hint', key: 'loading' }, t('panel.loading')))
+        notices.push(h('p', { className: 'drc-hint', key: 'loading' }, t('panel.loading')))
       }
-      if (state !== null) {
-        body.push(h(AccessSection, {
-          key: 'access',
-          t,
-          settings,
-          gateway,
-          updateSettings: status.updateSettings,
-        }))
-        body.push(h(AddressSection, {
-          key: 'address',
-          t,
-          settings,
-          addresses,
-          updateSettings: status.updateSettings,
-        }))
-        body.push(h(PairingSection, {
-          key: 'pairing',
-          t,
-          pairing,
-          gateway,
-          addressText: effective,
-          mode: access.mode,
-        }))
-        body.push(h(DeviceSection, {
-          key: 'devices',
-          t,
-          devices: snapshot.devices,
-          onRevoke: status.revokeDevice,
-        }))
-        body.push(h(AuditSection, { key: 'audit', t, audit: snapshot.audit }))
+
+      /**
+       * The sections belonging to one tab.
+       *
+       * The four existing sections are MOVED, not rewritten: their behaviour,
+       * validation and strings are unchanged by this task (`implement.md` step 2).
+       *
+       * @param {string} key
+       * @returns {any}
+       */
+      const sectionsOf = (key) => {
+        if (state === null) {
+          /* Nothing has arrived yet, so every tab shows the same "reading" line rather
+             than a form built from `null`. */
+          return h('p', { className: 'drc-hint' }, t('panel.loading'))
+        }
+        switch (key) {
+          case 'pairing':
+            /* The access point belongs to pairing: it is what the link and the symbol
+               are built from, so choosing it is the first step of pairing a device. */
+            return [
+              h(AccessPointSection, {
+                key: 'point',
+                t,
+                settings,
+                addresses,
+                updateSettings: status.updateSettings,
+                /* The empty public book is a dead end on this tab; the shortcut hands
+                   the user to the tab that can fix it instead of leaving them there. */
+                onManagePublic: () => setTab('access'),
+              }),
+              h(PairingSection, {
+                key: 'pairing',
+                t,
+                pairing,
+                gateway,
+                addressText: effective,
+                mode: access.mode,
+              }),
+            ]
+          case 'access':
+            /* 接入 is now ONLY the public address book: the master switch and the port
+               moved to the configuration row above the tabs, and the LAN/public choice
+               moved to 配对. One tab, one job. */
+            return h(PublicBookSection, {
+              key: 'book',
+              t,
+              settings,
+              updateSettings: status.updateSettings,
+            })
+          case 'devices':
+            return h(DeviceSection, {
+              key: 'devices',
+              t,
+              devices: snapshot.devices,
+              onRevoke: status.revokeDevice,
+            })
+          case 'audit':
+            return [
+              h(AuditSection, { key: 'audit', t, audit: snapshot.audit }),
+              h(AuditEventsSection, {
+                key: 'audit-events',
+                t,
+                actions: auditActions,
+                devices: snapshot.devices,
+              }),
+            ]
+          default:
+            return null
+        }
       }
 
       return h('div', { className: 'drc-overlay' },
@@ -3149,7 +3872,31 @@ window.__ModuleLoader__.load({
               onClick: onClose,
             }, '×'),
           ),
-          h('div', { className: 'drc-body' }, body),
+          /* Header → configuration → status → tabs → panels. The configuration row
+             holds the two panel-wide settings (master switch, listener port); the
+             status line is a FACT that must stay visible on every tab; the tab bar
+             sits between it and the content it selects. */
+          h(ConfigBar, { t, settings, updateSettings: status.updateSettings }),
+          h(StatusStrip, { t, settings, gateway, devices: deviceCounts }),
+          h(TabList, { t, current: activeTab, onSelect: (key) => setTab(key) }),
+          h('div', { className: 'drc-body' },
+            notices,
+            /* One panel element per tab so every tab's `aria-controls` resolves. A panel
+               that has been visited keeps its subtree (see `visited`) and is hidden
+               instead of unmounted, so switching tabs no longer throws away a draft, a
+               pending request or a revoke confirmation. */
+            TAB_KEYS.map((key) => {
+              const mounted = key === activeTab || (visited !== null && visited[key] === true)
+              return h('div', {
+                key,
+                className: 'drc-panelBody',
+                role: 'tabpanel',
+                id: 'drc-panel-' + key,
+                'aria-labelledby': 'drc-tab-' + key,
+                hidden: key !== activeTab,
+              }, mounted ? sectionsOf(key) : null)
+            }),
+          ),
         ),
       )
     }
@@ -3200,7 +3947,16 @@ window.__ModuleLoader__.load({
           const root = panelRef.current
           if (root === null) return
           const focusable = [...root.querySelectorAll('button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])')]
-            .filter((node) => node.disabled !== true && node.getAttribute('aria-hidden') !== 'true')
+            /* `tabIndex !== -1` is not redundant now that the panel contains a
+               tablist: the four tab buttons are `button`s, and the three that are
+               not selected carry a ROVING `tabIndex:-1` on purpose. A `button`
+               query matches them anyway, so without this they would be counted as
+               stops the browser never stops at — and if a roving tab ever landed at
+               the cycle's edge, the trap would focus it and Tab would appear to do
+               nothing. */
+            .filter((node) => node.disabled !== true
+              && node.getAttribute('aria-hidden') !== 'true'
+              && node.tabIndex !== -1)
           if (focusable.length === 0) return
           const first = focusable[0]
           const last = focusable[focusable.length - 1]
@@ -3473,6 +4229,9 @@ window.__ModuleLoader__.load({
         API_BASE,
         TITLE_ID,
         FAILURE_KINDS,
+        TABS,
+        TAB_KEYS,
+        AUDIT_EVENTS_PATH,
         ZH,
         EN,
         adminUrl,
@@ -3494,16 +4253,33 @@ window.__ModuleLoader__.load({
         interpolate,
         fallbackTranslate,
         attachmentName,
+        preferredTab,
+        tabIndexAfterKey,
+        auditActionsOf,
+        normalizeAuditEvent,
+        appendAuditPage,
+        auditEventsQuery,
+        formatAuditTime,
+        deviceNameOf,
         encodeQr,
         qrPathData,
         qrViewBox,
         /**
-         * The pairing card itself, so a test can render it with a stub React and
-         * assert the SVG really is in the tree (`prd.md` acceptance 4). The browser
-         * half has no DOM, so a component can only be exercised as a function that
-         * returns an element tree — which is exactly what it is.
+         * The presentational pieces whose OUTPUT is the contract: the tab bar (the
+         * ARIA wiring and roving tabindex), the status strip (three states of one
+         * line), the audit rows (four fields, never `meta`), and the pairing card.
+         * A test calls them as plain functions and inspects the returned element
+         * tree — the browser half has no DOM, so structure and data flow are what can
+         * be proven, never pixels.
          */
         PairingSection,
+        TabList,
+        StatusStrip,
+        AuditEventRow,
+        AuditEventList,
+        AuditEventsSection,
+        /** The whole shell, so a test can prove the tab graph exists in one tree. */
+        Panel,
         /** Whether the portal path is available in this module table (source-level tests). */
         hasPortal: () => createPortal !== null,
       },

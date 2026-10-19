@@ -111,15 +111,18 @@ formatAddress(parsed)           // 规范化回字符串（存盘用）
 
 ### 3.3 配对链接
 
-`pairingUrl(pairing, addressText, fallbackHref)`：
+`pairingUrl(pairing, addressText, fallbackHref, mode)`：
 
 ```
-pairingUrl(pairing, addressText, fallbackHref)
+pairingUrl(pairing, addressText, fallbackHref, mode)
   effective = effectiveAddress(...)                     // §1.2
   if effective !== null:
       base = parseAddress(effective)
       scheme = base.scheme ?? 'http'
-      port   = base.port ?? gateway.port ?? ''
+      // 端口：地址里写死的永远优先；否则由 MODE 决定要不要补网关端口
+  //   lan    → 补 gatewayPort（局域网地址就是「这台机器的这个端口」）
+  //   public → 不补（443/80 由用户的代理决定，插件不该猜）
+  port   = base.port ?? (mode === 'public' ? null : gatewayPort)
       return `${scheme}://${base.host}${port ? ':'+port : ''}${pairPath}#${fragment}`
   // 没有任何可用地址（网卡列表为空且未配置公网）→ 退回旧行为（页面 host）
   return legacyPairingUrl(pairing, fallbackHref)
@@ -135,7 +138,7 @@ pairingUrl(pairing, addressText, fallbackHref)
 | `tests/addresses.test.mjs`（新） | 枚举过滤/排序（注入 interfaces）；`parseAddress` 接受/拒绝矩阵（路径、查询、userinfo、端口 0/65536、IPv6 括号）；`effectiveAddress` 四象限（命中/回退/为空） |
 | `tests/store.test.mjs` | 缺 `access` 的旧文件加载成默认；非法条目被丢弃；`public` 超限截断；`updateSettings({access})` 落盘并可读回 |
 | `tests/admin-api.test.mjs` | `GET /state` 带 `addresses.lan`；`POST /settings` 非法 access → 400 且文件未变；只改 access 时 `requiresReload === false`，改端口时 `true` |
-| `tests/client.test.mjs` | `pairingUrl` 端口优先级（地址自带端口 > 网关端口）、`https` 保留、无地址时回退；`effectiveAddress` 回退规则；源码级：`createPortal` 存在、不存在 `pointerdown` 外点关闭、`aria-modal` 存在 |
+| `tests/client.test.mjs` | `pairingUrl` 端口规则（地址自带端口永远优先；公网模式不补端口；局域网模式补网关端口）、`https` 保留、无地址时回退；`effectiveAddress` 回退规则；源码级：`createPortal` 存在、不存在 `pointerdown` 外点关闭、`aria-modal` 存在 |
 
 ## 5. 兼容与回滚
 

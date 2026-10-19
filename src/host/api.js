@@ -53,9 +53,15 @@
  * connection reset. `headersSent` is checked before every head, so a late
  * failure destroys the response instead of throwing `ERR_HTTP_HEADERS_SENT`.
  */
-import { ADMIN_API_PREFIX, DEVICE_ID_PREFIX, PAIRING_ROUTE_PATH } from './constants.js'
+import { ADMIN_API_PREFIX, AUDIT_EVENTS_MAX_PAGE, DEVICE_ID_PREFIX, PAIRING_ROUTE_PATH } from './constants.js'
 import { listLanAddresses, validateAccess } from './addresses.js'
-import { dayKeyOf } from './audit.js'
+import {
+  AUDIT_EVENTS,
+  dayKeyOf,
+  isAuditEvent,
+  parseAuditCursor,
+  parseAuditLimit,
+} from './audit.js'
 import { isLoopback } from './loopback.js'
 import { checkOrigin } from './origin.js'
 
@@ -475,7 +481,12 @@ export function startAdminApi(options) {
         },
         pairing: { pending: pairing.pending() },
         gateway: gatewayState(),
-        audit: { retentionDays: auditRetentionDays() },
+        /* `actions` travels with the state read instead of with every page of
+           details (`design.md` §3): the panel's action filter is a `<select>` over
+           the host's closed set, and the client must NOT carry its own copy of that
+           list — a duplicated literal is how a dropdown ends up offering an action
+           the server answers with 400, or missing one it accepts. */
+        audit: { retentionDays: auditRetentionDays(), actions: AUDIT_EVENTS },
       },
     }
   }
@@ -667,6 +678,56 @@ export function startAdminApi(options) {
   }
 
   /**
+   * GET /audit/events — one page of the trail, projected and filtered
+   * (`prd.md` R4/R6, `design.md` §2.1).
+   *
+   * ## Filtering is the HOST's job, and that is a correctness decision
+   *
+   * `prd.md` D4: the filter runs here, before paging. Filtering in the browser
+   * would page over unfiltered records, so a page could arrive mostly — or
+   * entirely — empty while more matching records exist further back; 「加载更多」
+   * would then be a button that does nothing visible. It also means the panel never
+   * receives records it asked not to see.
+   *
+   * An unknown `action` is a `400`, not an empty list. Returning `[]` would tell a
+   * caller that a misspelt action has no events, which is indistinguishable from a
+   * real answer — the same "looks like it works" failure `quality-guidelines.md`
+   * §5 forbids.
+   *
+   * ## Validation uses the reader's own grammar
+   *
+   * `parseAuditLimit` / `parseAuditCursor` are the functions `readEvents` uses, so
+   * "what the endpoint accepts" and "what the reader accepts" cannot drift
+   * (`quality-guidelines.md` §24).
+   *
+   * @param {URLSearchParams} search
+   * @returns {{ status: number, data: { events: object[], nextBefore: string | null } }}
+   */
+  function auditEvents(search) {
+    const limit = parseAuditLimit(search.get('limit'))
+    if (limit === null) {
+      throw adminError(
+        'admin/invalid-argument',
+        `limit must be a whole number between 1 and ${String(AUDIT_EVENTS_MAX_PAGE)}`,
+      )
+    }
+    const action = search.get('action')
+    if (action !== null && action !== '' && !isAuditEvent(action)) {
+      throw adminError('admin/invalid-argument', 'that is not a known audit action')
+    }
+    const before = search.get('before')
+    if (before !== null && before !== '' && parseAuditCursor(before) === null) {
+      throw adminError('admin/invalid-argument', 'the before cursor is not valid')
+    }
+    const page = audit.readEvents({
+      limit,
+      before: before === null ? undefined : before,
+      action: action === null ? undefined : action,
+    })
+    return { status: 200, data: { events: page.events, nextBefore: page.nextBefore } }
+  }
+
+  /**
    * Dispatch one request.
    *
    * Every branch ends in a response. Nothing is `await`ed except the body read,
@@ -690,8 +751,14 @@ export function startAdminApi(options) {
     const method = typeof req?.method === 'string' ? req.method.toUpperCase() : 'GET'
 
     let pathname
+    let searchParams
     try {
-      pathname = new URL(req?.url ?? '/', 'http://localhost').pathname
+      const target = new URL(req?.url ?? '/', 'http://localhost')
+      pathname = target.pathname
+      /* Kept alongside the path: the audit-detail read takes `limit`, `before` and
+         `action` from the query string, and re-parsing the URL further down would
+         be a second chance to disagree with the dispatched path. */
+      searchParams = target.searchParams
     } catch {
       sendError(res, 400, 'admin/bad-request', 'The request target could not be parsed.')
       return
@@ -770,15 +837,21 @@ export function startAdminApi(options) {
             exportAudit(res)
             return
           }
+          if (tail.length === 1 && tail[0] === 'events') {
+            /* Loopback-only by the `guard` above, exactly like every other route
+               here: `design.md` §2.1 leaves the first statement of `handle`
+               untouched rather than re-implementing admission per endpoint. */
+            requireMethod(method, ['GET'])
+            respond(res, auditEvents(searchParams))
+            return
+          }
           throw adminError('admin/not-found', 'there is no such endpoint')
         }
         default:
           throw adminError('admin/not-found', 'there is no such endpoint')
       }
     } catch (error) {
-      const code = typeof error?.code === 'string' && error.code.startsWith('admin/')
-        ? error.code
-        : 'admin/internal'
+      const code = toAdminCode(error)
       const status = statusOf(code)
       /* A 5xx is our fault, so it gets a log line; a 4xx is the caller's, and
          logging it would let a loopback script fill the host's log. */
@@ -815,6 +888,29 @@ export function startAdminApi(options) {
   }
 
   /**
+   * Map a thrown error onto one of this API's stable codes.
+   *
+   * The audit reader re-validates its own arguments, because it is also called
+   * directly (by tests, and by an embedder). Should that ever reject something the
+   * endpoint's query parser accepted — exactly the drift the shared grammar exists
+   * to prevent — the answer is a `400` naming the argument, never a `500` that
+   * sends the user to the host log for their own typo.
+   *
+   * @param {unknown} error
+   * @returns {string}
+   */
+  function toAdminCode(error) {
+    const code = error !== null && typeof error === 'object' && typeof error.code === 'string'
+      ? error.code
+      : ''
+    if (code.startsWith('admin/')) return code
+    if (code === 'audit/invalid-limit' || code === 'audit/invalid-action' || code === 'audit/invalid-cursor') {
+      return 'admin/invalid-argument'
+    }
+    return 'admin/internal'
+  }
+
+  /**
    * Map a stable code onto its status.
    *
    * @param {string} code
@@ -834,6 +930,10 @@ export function startAdminApi(options) {
       case 'admin/invalid-name':
       case 'admin/invalid-source':
       case 'admin/invalid-settings':
+      /* A query parameter the reader would refuse: the caller's input, and the
+         documented answer is `400 admin/invalid-argument` rather than an empty
+         page (`prd.md` acceptance 6). */
+      case 'admin/invalid-argument':
       /* A malformed access address is the caller's input, not a server fault:
          reporting 500 would send the user to the host log for a typo. */
       case 'admin/invalid-access': return 400

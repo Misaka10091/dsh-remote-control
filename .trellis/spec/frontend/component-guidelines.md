@@ -51,8 +51,10 @@ function Entry({ wide = false }) { /* ... */ }
 ## Accessibility
 
 - 图标按钮必须有 `aria-label` 与 `title`。
-- 面板打开后焦点进入面板，`Esc` 关闭。
+- 面板打开后焦点进入面板，`Esc` 关闭，`Tab` 在面板内循环（`aria-modal` 的兑现方式，见 `quality-guidelines.md` 8）。
 - 二维码必须同时提供**纯文本配对码**（PRD D2），不能只靠扫码。
+- **Tab 模式**：`role="tablist"` / `"tab"` / `"tabpanel"`；`aria-selected` 唯一为真；选中项 `tabIndex:0`、其余 `-1`（roving）；`aria-controls` 与 `aria-labelledby` 用**同一个 key** 双向派生；`ArrowLeft/ArrowRight` 循环、`Home/End` 到首尾、焦点跟随；`Tab` 不拦截（模态的焦点陷阱才是唯一决定者）。非选中 panel 要 `hidden`，并显式写 `.drc-panelBody[hidden]{display:none}`——类选择器的 `display:flex` 会覆盖 UA 对 `hidden` 的默认样式。
+- **文字对比度按 AA 量，不按感觉调**：11–12px 提示文本用 `--dsw-alias-label-secondary`（本仓库实测 5.8:1），`label-tertiary` 只有 3.71:1 只能用于非文字图形。主题 token 的对比度要用真实计算色值量，不能假定。
 
 ## Common Mistakes
 

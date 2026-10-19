@@ -637,6 +637,45 @@ test('the pairing link is built from the selected address, not from the page', (
   )
 })
 
+test('a public address is used exactly as written, a LAN address gets the gateway port', () => {
+  /* Reported from a live panel (2026-10-19): the user typed `https://dsh-jiang.jneo.de`
+     and got `https://dsh-jiang.jneo.de:3090/...`, a URL their reverse proxy does not
+     serve. The two kinds of address answer different questions, so the MODE decides:
+       - LAN: "this host, on the gateway port" — the port is filled in;
+       - public: "whatever my proxy serves" — 443/80 is implied, the port is not ours
+         to guess. An explicit port still wins in both modes. */
+  const { pairingUrl } = loadClientBundle().bundle.internals
+  const pair = { fragment: 'p:c', port: 3090 }
+
+  assert.equal(
+    pairingUrl(pair, 'https://dsh-jiang.jneo.de', 'http://127.0.0.1:3080/', 'public'),
+    'https://dsh-jiang.jneo.de/remote-control/pair#p:c',
+  )
+  assert.equal(
+    pairingUrl(pair, 'home.example.com', 'http://127.0.0.1:3080/', 'public'),
+    'http://home.example.com/remote-control/pair#p:c',
+  )
+  /* An explicit port is respected even on a public address, with or without a scheme. */
+  assert.equal(
+    pairingUrl(pair, 'https://dsh.example.net:8443', 'http://127.0.0.1:3080/', 'public'),
+    'https://dsh.example.net:8443/remote-control/pair#p:c',
+  )
+  assert.equal(
+    pairingUrl(pair, 'dsh.example.net:8443', 'http://127.0.0.1:3080/', 'public'),
+    'http://dsh.example.net:8443/remote-control/pair#p:c',
+  )
+  /* LAN keeps the gateway port — that is the whole point of the dropdown. */
+  assert.equal(
+    pairingUrl(pair, '192.168.1.5', 'http://127.0.0.1:3080/', 'lan'),
+    'http://192.168.1.5:3090/remote-control/pair#p:c',
+  )
+  /* Omitting the mode keeps the pre-existing behaviour (LAN rules). */
+  assert.equal(
+    pairingUrl(pair, '192.168.1.5', 'http://127.0.0.1:3080/'),
+    'http://192.168.1.5:3090/remote-control/pair#p:c',
+  )
+})
+
 test('the pairing link falls back to the page host and its own port only', () => {
   const { pairingUrl } = loadClientBundle().bundle.internals
 
@@ -1287,36 +1326,45 @@ test('the modal card scrolls internally instead of overflowing the viewport', ()
   assert.ok(!/bottom:calc\(100% \+ 8px\)/.test(css), 'the popover anchor must be removed')
 })
 
-test('the address section offers both modes, a LAN list and a public book', () => {
-  /* `prd.md` R2/R3. Asserted at source level because the browser half has no DOM
-     test environment; the strings themselves are pinned by the dictionary parity
-     tests above. */
-  const section = /function AddressSection\(\{ t, settings, addresses, updateSettings \}\) \{([\s\S]*?)\n    \}/.exec(clientSource)
-  assert.ok(section !== null, 'AddressSection must be discoverable')
-  const body = section[1]
+test('the pairing tab owns the access point, the access tab owns the address book', () => {
+  /* `prd.md` R2/R3, reshaped after review: choosing an access point belongs to
+     pairing (it is what the symbol encodes), maintaining the public address book is
+     administration. Asserted at source level — the browser half has no DOM test
+     environment; the strings themselves are pinned by the dictionary parity tests. */
+  const point = /function AccessPointSection\(\{ t, settings, addresses, updateSettings, onManagePublic \}\) \{([\s\S]*?)\n    \}/.exec(clientSource)
+  assert.ok(point !== null, 'AccessPointSection must be discoverable')
+  const pointBody = point[1]
 
-  /* The mode switch writes `settings.access.mode`, not a local flag: anything
-     else would be state the host never hears about. */
-  assert.match(body, /mode,/)
-  assert.match(body, /segment\('lan', 'address\.modeLan'\)/)
-  assert.match(body, /segment\('public', 'address\.modePublic'\)/)
+  assert.match(pointBody, /segment\('lan', 'address\.modeLan'\)/)
+  assert.match(pointBody, /segment\('public', 'address\.modePublic'\)/)
   /* LAN: a select over the SERVER's list (the browser cannot enumerate NICs). */
-  assert.match(body, /addresses\.lan/)
-  assert.match(body, /h\('select'/)
-  assert.match(body, /t\('address\.lanEmpty'\)/)
-  /* Public: add with an optional label, delete, radio-select. */
-  assert.match(body, /t\('address\.add'\)/)
-  assert.match(body, /t\('address\.delete'\)/)
-  assert.match(body, /type: 'radio'/)
-  assert.match(body, /t\('address\.publicEmpty'\)/)
-  /* The honest hint. The plugin probes nothing (`prd.md` D3), so the only claim it
-     may make is that it makes no claim — asserted on the strings themselves in the
-     next test. */
-  assert.match(body, /t\('address\.publicHint'\)/)
-
+  assert.match(pointBody, /addresses\.lan/)
+  assert.match(pointBody, /h\('select'/)
+  assert.match(pointBody, /t\('address\.lanEmpty'\)/)
+  /* Public: a PICKER, not the book — no add form, no delete here. */
+  assert.match(pointBody, /t\('address\.publicEmpty'\)/)
+  assert.ok(!/t\('address\.add'\)/.test(pointBody), 'the pairing tab must not manage the book')
+  assert.ok(!/t\('address\.publicHint'\)/.test(pointBody), 'the reachability caveat belongs with the book')
+  /* An empty public book is a dead end on this tab, so the empty state carries the
+     one action that unblocks it: jump to the tab that can add an address. */
+  assert.match(pointBody, /t\('address\.goManage'\)/)
+  assert.match(pointBody, /onManagePublic\(\)/)
   /* Every write goes through the ONE documented field, and never optimistically:
      the value comes back from the server's answer. */
-  assert.match(body, /updateSettings\(\{ access: next \}\)/)
+  assert.match(pointBody, /updateSettings\(\{ access: next \}\)/)
+
+  const book = /function PublicBookSection\(\{ t, settings, updateSettings \}\) \{([\s\S]*?)\n    \}/.exec(clientSource)
+  assert.ok(book !== null, 'PublicBookSection must be discoverable')
+  const bookBody = book[1]
+
+  /* The book adds with an optional label, deletes, and marks the row in use. */
+  assert.match(bookBody, /t\('address\.add'\)/)
+  assert.match(bookBody, /t\('address\.delete'\)/)
+  assert.match(bookBody, /t\('address\.inUse'\)/)
+  assert.match(bookBody, /t\('address\.publicHint'\)/)
+  /* Selecting an address is NOT the book's job any more. */
+  assert.ok(!/type: 'radio'/.test(bookBody), 'the radio choice moved to the pairing tab')
+  assert.ok(!/drc-segments/.test(bookBody), 'the LAN/public switch moved to the pairing tab')
 })
 
 test('the pairing link hints match how the link was built', () => {
@@ -1329,7 +1377,7 @@ test('the pairing link hints match how the link was built', () => {
   assert.ok(section !== null, 'PairingSection must be discoverable')
   const body = section[1]
 
-  assert.match(body, /pairingUrl\(current, addressText, documentBase\(\)\)/, 'the link takes the effective address')
+  assert.match(body, /pairingUrl\(current, addressText, documentBase\(\), mode\)/, 'the link takes the effective address and its mode')
   assert.match(body, /t\('pair\.loopbackHint'\)/)
   assert.match(body, /t\('pair\.publicHint'\)/)
   /* One hint, chosen by branch — not two independent conditions. */
@@ -1604,3 +1652,468 @@ test('the QR strings exist in both languages and in the locale files', () => {
   assert.match(EN['pair.tooLong'], /text code/i)
   assert.match(ZH['pair.tooLong'], /文本码/)
 })
+
+/* ---------------------------------------------------------------------- *
+ * Panel tabs (`prd.md` R1–R3) and audit detail (R5–R7)
+ *
+ * Structure and data flow only: the tab bar's ARIA graph, the default-tab rule, the
+ * status strip's three states and the four fields of an audit row are all element
+ * trees returned by plain functions. Layout, real focus movement and the network
+ * are NOT covered here — `implement.md` step 5 checks those in a real browser.
+ * ---------------------------------------------------------------------- */
+
+test('the default tab follows whether pairing is usable right now', () => {
+  const { preferredTab } = loadClientBundle().bundle.internals
+
+  /* `prd.md` R2: a pairing code cannot be minted while nothing is listening, so the
+     access screen is the honest first screen. */
+  assert.equal(preferredTab({ enabled: true, port: 3090 }, { listening: true }), 'pairing')
+  assert.equal(preferredTab({ enabled: true, port: 3090 }, { listening: false }), 'access')
+  assert.equal(preferredTab({ enabled: false, port: 3090 }, { listening: false }), 'access')
+  /* The setting is not the listener's truth: a stale `enabled: false` must not win
+     over a gateway that is actually listening, and vice versa. */
+  assert.equal(preferredTab({ enabled: false, port: 3090 }, { listening: true }), 'access')
+  /* Nothing has arrived yet, and a host with no gateway at all. */
+  assert.equal(preferredTab(null, null), 'access')
+  assert.equal(preferredTab(undefined, undefined), 'access')
+  assert.equal(preferredTab('nope', 'nope'), 'access')
+})
+
+test('the chosen tab is never remembered across opens', () => {
+  /* `prd.md` constraint 4: the panel unmounts on close, so the tab is component
+     state and nothing else. A stored tab would re-open the panel on a screen whose
+     state may no longer exist — "pairing" with nothing listening, for instance. */
+  assert.ok(!/localStorage\.|sessionStorage\./.test(clientSource), 'no tab persistence')
+  assert.match(clientSource, /const \[tab, setTab\] = useState\(null\)/)
+  assert.match(clientSource, /preferredTab\(settings, gateway\)/)
+  /* `null` until the user chooses is what makes the FIRST screen follow the host
+     rather than a default frozen at mount. */
+  assert.match(clientSource, /tab === null \|\| !TAB_KEYS\.includes\(tab\)/)
+})
+
+test('the tab bar exposes the ARIA tabs contract in both directions', () => {
+  const { bundle } = loadClientBundle()
+  const { TabList, TABS, EN, fallbackTranslate } = bundle.internals
+
+  const tree = TabList({ t: fallbackTranslate, current: 'devices', onSelect: () => {} })
+
+  const lists = findAll(tree, (node) => propsOf(node).role === 'tablist')
+  assert.equal(lists.length, 1, 'one tablist')
+
+  const tabs = findAll(tree, (node) => propsOf(node).role === 'tab')
+  assert.equal(tabs.length, 4, 'four tabs, one per panel')
+  assert.deepEqual(
+    tabs.map((node) => propsOf(node).id),
+    ['drc-tab-pairing', 'drc-tab-access', 'drc-tab-devices', 'drc-tab-audit'],
+  )
+  assert.deepEqual(
+    tabs.map((node) => propsOf(node)['aria-controls']),
+    ['drc-panel-pairing', 'drc-panel-access', 'drc-panel-devices', 'drc-panel-audit'],
+  )
+  /* Exactly one selected — the whole point of `aria-selected`. */
+  const selected = tabs.filter((node) => propsOf(node)['aria-selected'] === true)
+  assert.equal(selected.length, 1)
+  assert.equal(propsOf(selected[0]).id, 'drc-tab-devices')
+  /* Roving tabindex: the bar is ONE stop in the page's Tab order. */
+  assert.deepEqual(tabs.map((node) => propsOf(node).tabIndex), [-1, -1, 0, -1])
+  /* Every tab is a real button, labelled from the dictionary and keyed. */
+  for (const node of tabs) {
+    assert.equal(node.type, 'button')
+    assert.equal(propsOf(node).type, 'button')
+    assert.equal(typeof propsOf(node).onKeyDown, 'function')
+    assert.equal(typeof propsOf(node).onClick, 'function')
+  }
+  assert.deepEqual(tabs.map((node) => textOf(node)), TABS.map((tab) => EN[tab.labelKey]))
+
+  /* The panel side is wired from the SAME key, and every panel element exists so
+     `aria-controls` always resolves; only the active one is visible. */
+  assert.match(clientSource, /'aria-labelledby': 'drc-tab-' \+ key/)
+  assert.match(clientSource, /id: 'drc-panel-' \+ key/)
+  assert.match(clientSource, /hidden: key !== activeTab/)
+})
+
+test('a visited tab stays mounted, so switching cannot discard a draft or a pending request', () => {
+  /* `prd.md` constraint 4 + review finding: rendering only the active section
+     unmounted the others on every switch, and those sections own live state — an
+     unsaved address row, a port draft, a revoke confirmation, a page cursor. The
+     panel keeps them mounted and marks them `hidden`, which is also what removes
+     them from the accessibility tree and the tab order. */
+  assert.match(clientSource, /const mounted = key === activeTab \|\| \(visited !== null && visited\[key\] === true\)/)
+  assert.match(clientSource, /\}, mounted \? sectionsOf\(key\) : null\)/)
+
+  /* A tab that has never been opened must NOT be mounted: laziness is what keeps a
+     fresh panel free of four pre-fetched sections. */
+  const visited = /const \[visited, setVisited\] = useState\(null\)/
+  assert.match(clientSource, visited ? visited : /$^/)
+  assert.match(clientSource, /previous\[activeTab\] === true/)
+})
+
+test('the audit detail list does not open a second scroll container', () => {
+  /* Review finding: the list capped itself at 260px with its own overflow while
+     `.drc-body` also scrolled, so wheel/trackpad input moved two independent
+     tracks. One scrollbar, at the panel level. */
+  const stylesheet = /const CSS = ([\s\S]*?)\]\.join\('\\n'\)/.exec(clientSource)
+  assert.ok(stylesheet !== null)
+  const css = stylesheet[1]
+  const list = /\.drc-auditEvents\{[^}]*\}/.exec(css)
+  assert.ok(list !== null, 'the detail list must have a rule')
+  assert.ok(!/overflow-y:auto/.test(list[0]), 'the detail list must not scroll on its own')
+  assert.ok(!/max-height/.test(list[0]), 'and must not cap its own height')
+  assert.match(css, /\.drc-body\{[^}]*overflow-y:auto/, 'the panel body remains the only scroller')
+})
+
+test('ArrowLeft/ArrowRight wrap, Home/End jump, and focus follows selection', () => {
+  const { tabIndexAfterKey } = loadClientBundle().bundle.internals
+
+  assert.equal(tabIndexAfterKey('ArrowRight', 0, 4), 1)
+  assert.equal(tabIndexAfterKey('ArrowRight', 3, 4), 0, 'the last tab wraps to the first')
+  assert.equal(tabIndexAfterKey('ArrowLeft', 0, 4), 3, 'and the first wraps backwards')
+  assert.equal(tabIndexAfterKey('ArrowLeft', 2, 4), 1)
+  assert.equal(tabIndexAfterKey('Home', 2, 4), 0)
+  assert.equal(tabIndexAfterKey('End', 1, 4), 3)
+  /* Only the documented keys move. `Tab` in particular must stay the browser's, or
+     the modal's focus trap stops being the only thing that decides where Tab goes. */
+  assert.equal(tabIndexAfterKey('Tab', 1, 4), null)
+  assert.equal(tabIndexAfterKey('ArrowUp', 1, 4), null)
+  assert.equal(tabIndexAfterKey('Escape', 1, 4), null)
+  assert.equal(tabIndexAfterKey('ArrowRight', 9, 4), 1, 'an out-of-range index starts from the first')
+  assert.equal(tabIndexAfterKey('ArrowRight', 0, 0), null)
+
+  /* The handler prevents the default (or the page would also scroll) and selects;
+     the selection moves focus itself, so a keyboard user is never left behind. */
+  const handler = /const onKeyDown = \(index\) => \(event\) => \{([\s\S]*?)\n      \}/.exec(clientSource)
+  assert.ok(handler !== null, 'the tab keydown handler must be discoverable')
+  assert.match(handler[1], /event\.preventDefault\(\)/)
+  assert.match(handler[1], /select\(next\)/)
+
+  const select = /const select = \(index\) => \{([\s\S]*?)\n      \}/.exec(clientSource)
+  assert.ok(select !== null, 'the tab selection helper must be discoverable')
+  assert.match(select[1], /onSelect\(key\)/)
+  assert.match(select[1], /\.focus\(\)/, 'focus must follow the selected tab')
+})
+
+test('the panel shell renders the status strip, the tabs and one visible panel', () => {
+  /* The whole shell in one tree: header, status strip, tab bar, and one panel body
+     per tab with exactly one visible. Called as a plain function with the stub React
+     and no DOM — the hooks return their initial values, so this is the "nothing has
+     loaded yet" state.
+     `findAll` only walks NATIVE elements (`node.type` a string), so the component
+     children are located by their function identity instead. */
+  const { bundle } = loadClientBundle()
+  const { Panel, TabList, StatusStrip, fallbackTranslate, EN } = bundle.internals
+
+  const tree = Panel({ t: fallbackTranslate, onClose: () => {}, panelRef: { current: null } })
+  const flatten = (nodes) => (Array.isArray(nodes) ? nodes.flat(Infinity) : [nodes]).filter((node) => node != null)
+
+  assert.equal(propsOf(tree).className, 'drc-overlay')
+  const card = flatten(tree.children)[0]
+  assert.equal(propsOf(card).role, 'dialog')
+  assert.equal(propsOf(card)['aria-modal'], 'true')
+
+  /* Status strip and tab bar live inside the dialog, above the scrolling body, so
+     neither scrolls away with a tab's content. */
+  const parts = flatten(card.children)
+  const strip = parts.find((node) => node.type === StatusStrip)
+  assert.ok(strip !== undefined, 'the status strip must be rendered by the shell')
+  /* Nothing has loaded: the strip is told about the null state rather than inventing
+     one, which is what makes "远程接入未启用" honest before the first read. */
+  assert.equal(strip.props.settings, null)
+  assert.equal(strip.props.gateway, null)
+
+  const tabs = parts.find((node) => node.type === TabList)
+  assert.ok(tabs !== undefined, 'the tab bar must be rendered by the shell')
+  /* No state yet, so the default tab is the access screen (R2's "otherwise"). */
+  assert.equal(tabs.props.current, 'access')
+  assert.equal(typeof tabs.props.onSelect, 'function')
+
+  const body = parts.find((node) => node.type === 'div' && propsOf(node).className === 'drc-body')
+  assert.ok(body !== undefined, 'the scrolling body must be present')
+  const panels = flatten(body.children).filter((node) => propsOf(node).role === 'tabpanel')
+  assert.equal(panels.length, 4, 'one panel per tab, so every aria-controls resolves')
+
+  /* Exactly one visible panel, and with nothing loaded it says so rather than
+     rendering a form from `null`. */
+  const visible = panels.filter((node) => propsOf(node).hidden !== true)
+  assert.equal(visible.length, 1)
+  assert.equal(propsOf(visible[0])['aria-labelledby'], 'drc-tab-access')
+  assert.ok(textOf(visible[0]).includes(EN['panel.loading']))
+})
+
+test('the modal focus trap still owns Tab, roving tabs included', () => {
+  /* A tab that is not selected carries `tabIndex:-1` but is still a `button`, so the
+     trap's query matches it. Counting it as a stop would put the cycle's edge on an
+     element the browser skips over — the tabs must not become a Tab-escape hatch. */
+  assert.match(clientSource, /if \(event\.key !== 'Tab'\) return/)
+  assert.match(clientSource, /node\.tabIndex !== -1/)
+  assert.match(clientSource, /const first = focusable\[0\]/)
+  assert.match(clientSource, /event\.shiftKey === true/)
+  /* Esc still closes the dialog, and the tabs bind no dismissal of their own. */
+  assert.match(clientSource, /event\.key === 'Escape'/)
+  assert.equal((clientSource.match(/setOpen\(false\)/g) ?? []).length, 2,
+    'still exactly two ways out: Esc and the close button')
+})
+
+test('the status strip reports the listener truth, on every tab', () => {
+  const { bundle } = loadClientBundle()
+  const { StatusStrip, fallbackTranslate, EN } = bundle.internals
+
+  const listening = StatusStrip({
+    t: fallbackTranslate,
+    settings: { enabled: true, port: 3090 },
+    gateway: { listening: true, port: 3090, liveConnections: 0 },
+    devices: { active: 2, total: 3 },
+  })
+  assert.equal(textOf(listening), 'Listening on 3090 · 0 connection(s) · 2 device(s)')
+  assert.equal(propsOf(listening).className, 'drc-statusStrip')
+
+  /* Enabled but nothing listening: the access section's OWN sentence, so one
+     condition never gets two different explanations. */
+  const notListening = StatusStrip({
+    t: fallbackTranslate,
+    settings: { enabled: true },
+    gateway: { listening: false },
+    devices: { active: 2 },
+  })
+  assert.equal(textOf(notListening), EN['access.gatewayNotListening'])
+
+  /* Off: plain text, no state colour — being off is a fact, not an error. */
+  const off = StatusStrip({ t: fallbackTranslate, settings: { enabled: false }, gateway: null, devices: null })
+  assert.equal(textOf(off), EN['status.disabled'])
+  assert.equal(propsOf(off).className, 'drc-statusStrip')
+
+  /* A gateway that has not reported its port yet degrades instead of throwing. */
+  const unknownPort = StatusStrip({
+    t: fallbackTranslate,
+    settings: { enabled: true },
+    gateway: { listening: true },
+    devices: null,
+  })
+  assert.equal(textOf(unknownPort), 'Listening on ? · 0 connection(s) · 0 device(s)')
+
+  /* And it lives OUTSIDE the scrolling body, which is what keeps it visible. */
+  const stripAt = clientSource.indexOf('h(StatusStrip,')
+  const bodyAt = clientSource.indexOf("h('div', { className: 'drc-body' }")
+  assert.ok(stripAt > 0 && bodyAt > 0 && stripAt < bodyAt, 'the status strip must not scroll away')
+})
+
+test('an audit row renders four fields, and never meta', () => {
+  const { bundle } = loadClientBundle()
+  const { AuditEventList, AuditEventRow, normalizeAuditEvent, fallbackTranslate, EN } = bundle.internals
+
+  const sameDay = new Date(2026, 9, 17, 17, 42, 3).toISOString()
+  const otherDay = new Date(2026, 9, 15, 9, 5, 0).toISOString()
+  const devices = [{ id: 'dev_known', name: 'Pixel · Chrome' }]
+  /* The row takes its clock as a parameter, so 「今天」 is a fixed instant here
+     instead of whatever day the suite happens to run on. */
+  const now = new Date(2026, 9, 17, 18, 0, 0).getTime()
+
+  const older = normalizeAuditEvent({ ts: otherDay, event: 'pair', deviceId: 'dev_gone', ip: '192.168.1.7' })
+  const newer = normalizeAuditEvent({ ts: sameDay, event: 'send_message', deviceId: 'dev_known', meta: { text: 'hunter2' } })
+
+  /* The row is rendered directly: a component element is not EXPANDED by the stub
+     React, so asserting on the list alone would only prove it produces elements. */
+  const rows = [older, newer].map((event) => AuditEventRow({ t: fallbackTranslate, event, devices, now }))
+  assert.deepEqual(rows.map((row) => row.type), ['li', 'li'])
+  for (const row of rows) {
+    assert.equal(findAll(row, (node) => node.type === 'span').length, 4, 'four cells: time, action, device, address')
+  }
+
+  /* The date appears only when the record is not from today. */
+  assert.equal(textOf(rows[0]), '10-15 09:05:00' + EN['audit.event.pair'] + 'dev_gone' + '192.168.1.7')
+  assert.equal(textOf(rows[1]), '17:42:03' + EN['audit.event.send_message'] + 'Pixel · Chrome' + '—')
+  /* The full instant stays reachable on the time cell's `title`. */
+  const timeCell = findAll(rows[1], (node) => propsOf(node).className === 'drc-auditEventTime')[0]
+  assert.equal(propsOf(timeCell).title, new Date(sameDay).toISOString())
+
+  /* The list is one keyed row per record, in the order the host returned them. */
+  const list = AuditEventList({ t: fallbackTranslate, events: [older, newer], devices })
+  assert.equal(list.type, 'ul')
+  assert.equal(propsOf(list).className, 'drc-auditEvents')
+  const children = list.children[0]
+  assert.equal(children.length, 2)
+  assert.deepEqual(children.map((node) => node.type), [AuditEventRow, AuditEventRow])
+  assert.deepEqual(children.map((node) => propsOf(node).key), ['e0', 'e1'])
+
+  /* The DOM half of `prd.md` D5: even a record that DOES carry `meta` renders only
+     the four projected fields — there is no slot for free text. */
+  const hostile = AuditEventRow({
+    t: fallbackTranslate,
+    event: { ts: sameDay, event: 'pair', deviceId: 'dev_1', ip: '10.0.0.1', meta: { text: 'hunter2' }, body: 'prompt' },
+  })
+  assert.ok(!textOf(hostile).includes('hunter2'), 'free text in meta must never be rendered')
+  assert.ok(!textOf(hostile).includes('prompt'))
+})
+
+test('the audit detail request names no page size and pages with the cursor', () => {
+  const { auditEventsQuery, AUDIT_EVENTS_PATH } = loadClientBundle().bundle.internals
+
+  assert.equal(AUDIT_EVENTS_PATH, 'audit/events')
+  assert.ok(!AUDIT_EVENTS_PATH.startsWith('/'), 'mount-relative, like every other admin path')
+  assert.equal(auditEventsQuery(), 'audit/events')
+  assert.equal(auditEventsQuery('', ''), 'audit/events')
+  assert.equal(auditEventsQuery('pair'), 'audit/events?action=pair')
+  assert.equal(auditEventsQuery('', '1792206283003.4'), 'audit/events?before=1792206283003.4')
+  assert.equal(auditEventsQuery('pair', '1.2'), 'audit/events?action=pair&before=1.2')
+  /* The page size has ONE definition, on the host (`AUDIT_EVENTS_PAGE_SIZE`), so the
+     panel never sends one. */
+  assert.ok(!/limit=/.test(auditEventsQuery('pair', '1.2')))
+  /* Values are data, not path syntax. */
+  assert.match(auditEventsQuery('a b', '1.2/3'), /action=a%20b/)
+  assert.match(auditEventsQuery('a b', '1.2/3'), /before=1\.2%2F3/)
+})
+
+test('loading more appends, and a filter change restarts the list', () => {
+  const { appendAuditPage, normalizeAuditEvent } = loadClientBundle().bundle.internals
+
+  const a = { ts: '2026-10-17T03:04:43.000Z', event: 'pair', deviceId: 'dev_a' }
+  const b = { ts: '2026-10-17T03:04:42.000Z', event: 'connect', deviceId: 'dev_b' }
+  const c = { ts: '2026-10-17T03:04:41.000Z', event: 'pair', deviceId: 'dev_c' }
+
+  assert.deepEqual(appendAuditPage([], [a], null), [a])
+  assert.deepEqual(appendAuditPage([a], [b], 'cursor'), [a, b], 'a later page is appended, not swapped')
+  assert.deepEqual(appendAuditPage([a, b], [c], null), [c],
+    'a first page replaces: that is what makes the filter switch a reset')
+  /* A record carrying anything extra is normalized on the way in. */
+  assert.deepEqual(normalizeAuditEvent({ ...a, meta: { text: 'hunter2' }, body: 'prompt' }), a)
+  assert.equal(normalizeAuditEvent({ event: 'pair' }), null, 'a record without a usable ts is not renderable')
+  assert.equal(normalizeAuditEvent(null), null)
+  /* Junk in the page is dropped rather than rendered as an empty row. */
+  assert.deepEqual(appendAuditPage([], [a, null, 42, { event: 'pair' }], null), [a])
+
+  /* The component resets paging state when the filter changes, and appends on
+     「加载更多」 — both are state transitions, so only the source can show them. */
+  assert.match(clientSource, /const changeAction = \(value\) => \{[\s\S]*?setEvents\(\[\]\)[\s\S]*?setNextBefore\(null\)/)
+  assert.match(clientSource, /setEvents\(\(current\) => appendAuditPage\(current, page, before\)\)/)
+  assert.match(clientSource, /void fetchPage\(nextBefore\)/)
+})
+
+test('the audit filter is built from the host action list, never a client copy', () => {
+  const { bundle } = loadClientBundle()
+  const { auditActionsOf, AuditEventsSection, fallbackTranslate, EN } = bundle.internals
+
+  /* Nothing to invent: no state, no `actions`, no valid entries. */
+  assert.deepEqual(auditActionsOf(null), [])
+  assert.deepEqual(auditActionsOf({}), [])
+  assert.deepEqual(auditActionsOf({ audit: null }), [])
+  assert.deepEqual(auditActionsOf({ audit: { actions: 'nope' } }), [])
+  assert.deepEqual(auditActionsOf({ audit: { actions: ['pair', '', 7, 'revoke'] } }), ['pair', 'revoke'])
+
+  /* The dropdown is 「全部」 plus the host's list, labelled from the dictionary. */
+  const tree = AuditEventsSection({ t: fallbackTranslate, actions: ['pair', 'revoke'], devices: [] })
+  const select = findAll(tree, (node) => node.type === 'select')
+  assert.equal(select.length, 1)
+  assert.equal(propsOf(select[0])['aria-label'], EN['audit.detail.filter'])
+  const options = findAll(select[0], (node) => node.type === 'option')
+  assert.deepEqual(options.map((node) => propsOf(node).value), ['', 'pair', 'revoke'])
+  assert.deepEqual(
+    options.map((node) => textOf(node)),
+    [EN['audit.detail.all'], EN['audit.event.pair'], EN['audit.event.revoke']],
+  )
+  /* First render, before any response: the loading line, not an empty list claim. */
+  assert.ok(textOf(tree).includes(EN['audit.detail.loading']))
+})
+
+test('the client half carries no copy of the audit action closed set', () => {
+  /* `design.md` §3. A duplicated literal drifts, and the drift shows up as a
+     dropdown entry the server answers with 400 or a missing entry that can never be
+     filtered to — so the list lives on the host and arrives through `GET /state`. */
+  const auditSource = readFileSync(path.join(repoRoot, 'src/host/audit.js'), 'utf8')
+  const block = /export const AUDIT_EVENTS = Object\.freeze\(\[([\s\S]*?)\]\)/.exec(auditSource)
+  assert.ok(block !== null, 'AUDIT_EVENTS must be discoverable in src/host/audit.js')
+  const events = [...block[1].matchAll(/'([a-z_]+)'/g)].map((match) => match[1])
+  assert.ok(events.length >= 5)
+
+  /* A copied array must contain at least one ADJACENT pair of the ordered list, so
+     checking every pair cannot be evaded by reordering. (A single name is not
+     enough: `unknown` is legitimately a failure kind, not an action list.) */
+  for (let index = 0; index + 1 < events.length; index += 1) {
+    const pattern = new RegExp(`'${events[index]}'\\s*,\\s*'${events[index + 1]}'`)
+    assert.equal(
+      pattern.test(clientSource),
+      false,
+      `the client must not hardcode the action pair ${events[index]}/${events[index + 1]}`,
+    )
+  }
+
+  /* And the intended data path is present instead. */
+  assert.match(clientSource, /auditActionsOf\(state\)/)
+  assert.match(clientSource, /Array\.isArray\(audit\.actions\)/)
+  assert.match(clientSource, /t\('audit\.event\.' \+ name\)/)
+})
+
+test('the tab, status and audit-detail strings exist in all four copies', () => {
+  const { bundle } = loadClientBundle()
+  const { ZH, EN, TABS } = bundle.internals
+  const zhFile = readJson('locale/zh.json')
+  const enFile = readJson('locale/en.json')
+
+  const keys = [
+    'tabs.pairing',
+    'tabs.access',
+    'tabs.devices',
+    'tabs.audit',
+    'status.listening',
+    'status.disabled',
+    'audit.detail.heading',
+    'audit.detail.filter',
+    'audit.detail.all',
+    'audit.detail.loading',
+    'audit.detail.shown',
+    'audit.detail.loadMore',
+    'audit.detail.loadingMore',
+    'audit.detail.noMore',
+  ]
+  for (const key of keys) {
+    assert.equal(typeof ZH[key], 'string', `zh.${key} is missing`)
+    assert.equal(typeof EN[key], 'string', `en.${key} is missing`)
+    assert.equal(zhFile[key], ZH[key], `locale/zh.json disagrees with the inline ZH for ${key}`)
+    assert.equal(enFile[key], EN[key], `locale/en.json disagrees with the inline EN for ${key}`)
+  }
+  /* Every tab names a label, or a tab renders as a raw key on screen. */
+  assert.deepEqual(TABS.map((tab) => tab.labelKey), ['tabs.pairing', 'tabs.access', 'tabs.devices', 'tabs.audit'])
+  for (const tab of TABS) assert.equal(typeof EN[tab.labelKey], 'string')
+})
+
+test('the panel puts its two global settings above the tabs, and each tab keeps one job', () => {
+  /* Review reshape: the master switch and the listener port are panel-wide facts, so
+     they live in a configuration row above the tablist; 配对 owns the access point,
+     接入 owns the address book alone. */
+  for (const name of ['ConfigBar', 'PublicBookSection', 'AccessPointSection', 'PairingSection', 'DeviceSection', 'AuditSection']) {
+    assert.match(clientSource, new RegExp(`h\\(${name}, \\{`), `${name} must still be rendered`)
+  }
+  /* Header → configuration → status → tabs. */
+  assert.match(clientSource, /h\(ConfigBar, \{ t, settings, updateSettings: status\.updateSettings \}\)/)
+  assert.match(clientSource, /h\(StatusStrip, \{ t, settings, gateway, devices: deviceCounts \}\)/)
+  assert.match(clientSource, /h\(TabList, \{ t, current: activeTab, onSelect: \(key\) => setTab\(key\) \}\)/)
+  /* Both global controls really are in that row, and nowhere else. */
+  const bar = /function ConfigBar\(\{ t, settings, updateSettings \}\) \{([\s\S]*?)\n    \}/.exec(clientSource)
+  assert.ok(bar !== null, 'ConfigBar must be discoverable')
+  assert.match(bar[1], /role: 'switch'/)
+  assert.match(bar[1], /t\('access\.port'\)/)
+  assert.match(bar[1], /t\('access\.save'\)/)
+  /* 配对 = access point + pairing card; 接入 = the book, and only the book. */
+  assert.match(clientSource, /case 'pairing':[\s\S]{0,800}?h\(AccessPointSection, \{/)
+  assert.match(clientSource, /h\(AccessPointSection, \{[\s\S]{0,900}?h\(PairingSection, \{/)
+  assert.match(clientSource, /case 'access':[\s\S]{0,400}?h\(PublicBookSection, \{/)
+  assert.match(clientSource, /case 'audit':[\s\S]{0,200}?h\(AuditEventsSection, \{/)
+
+  /* The tab shell's stylesheet: theme tokens only, and one scrolling layer. */
+  const stylesheet = /const CSS = ([\s\S]*?)\]\.join\('\\n'\)/.exec(clientSource)
+  assert.ok(stylesheet !== null)
+  const css = stylesheet[1]
+  for (const selector of ['.drc-tabs{', '.drc-tab{', '.drc-tabActive{', '.drc-statusStrip{', '.drc-panelBody{']) {
+    assert.ok(css.includes(selector), `${selector} must be defined`)
+  }
+  assert.match(css, /\.drc-panelBody\[hidden\]\{display:none\}/,
+    'a hidden panel must be display:none, or the class overrides the attribute')
+  assert.match(css, /\.drc-body\{[^}]*flex:1 1 auto/)
+  assert.match(css, /\.drc-body\{[^}]*min-height:0/, 'a flex child must be allowed to shrink to scroll')
+  assert.match(css, /\.drc-tabActive\{[^}]*var\(--dsw-alias-brand-primary\)/)
+  /* One scrolling layer: the panel body. The detail list used to cap itself at
+     260px with its own `overflow-y:auto`, which put a second scrollbar inside the
+     scrolling modal (review finding) — see the dedicated test below. */
+  const detailList = /\.drc-auditEvents\{[^}]*\}/.exec(css)
+  assert.ok(detailList !== null)
+  assert.ok(!/overflow/.test(detailList[0]), 'the detail list must not scroll on its own')
+})
+

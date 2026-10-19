@@ -27,7 +27,7 @@ import { createServer, request as httpRequest } from 'node:http'
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 
-import { createAudit, dayKeyOf } from '../src/host/audit.js'
+import { AUDIT_EVENTS, createAudit, dayKeyOf } from '../src/host/audit.js'
 import { startAdminApi } from '../src/host/api.js'
 import { classify } from '../src/host/classify.js'
 import { ADMIN_API_PREFIX, DEVICE_COOKIE_NAME } from '../src/host/constants.js'
@@ -508,6 +508,9 @@ test('the gateway refuses the admin prefix outright, so a paired device cannot r
       `${ADMIN_API_PREFIX}/devices`,
       `${ADMIN_API_PREFIX}/devices/dev_1/revoke`,
       `${ADMIN_API_PREFIX}/audit/export`,
+      /* The detail read is the newest route, and it carries the trail's records —
+         exactly the data a paired device must not be able to page through. */
+      `${ADMIN_API_PREFIX}/audit/events?limit=50`,
       '/remote-control/api',
     ]) {
       const res = await send({
@@ -1448,3 +1451,212 @@ test('the audit file the admin API writes is inside the runtime directory', asyn
     cleanupDir(runtime.dir)
   }
 })
+
+/* ------------------------------------------------------------------ *
+ * Audit detail — `GET /audit/events` (`prd.md` R4/R6/R7)
+ * ------------------------------------------------------------------ */
+
+/** The endpoint's path, with an optional query string. */
+function auditEventsPath(query = '') {
+  return query === '' ? `${ADMIN_API_PREFIX}/audit/events` : `${ADMIN_API_PREFIX}/audit/events?${query}`
+}
+
+/** GET one page as a loopback browser would, and parse the envelope. */
+async function getAuditEvents(port, query = '') {
+  const res = await send({
+    port,
+    path: auditEventsPath(query),
+    headers: { host: loopbackHost(port), 'sec-fetch-site': 'same-origin' },
+  })
+  return { res, payload: JSON.parse(res.body) }
+}
+
+/** Record `count` events one millisecond apart, oldest first. */
+function seedTrail(runtime, count, pattern = ['pair', 'connect']) {
+  for (let index = 0; index < count; index += 1) {
+    runtime.clock.now = AT + index
+    runtime.audit.record({
+      event: pattern[index % pattern.length],
+      deviceId: `dev_${String(index)}`,
+      ip: '192.168.1.7',
+    })
+  }
+  runtime.clock.now = AT
+}
+
+test('the audit detail endpoint pages the trail, each record exactly once', async () => {
+  /* `prd.md` acceptance 5 and constraint 5, end to end: the panel follows
+     `nextBefore` as an opaque cursor, so the endpoint must never repeat or skip a
+     record — including two records in the same millisecond. */
+  const runtime = makeRuntime()
+  seedTrail(runtime, 5, ['connect'])
+  const host = await startAdminHost({ runtime })
+  try {
+    const seen = []
+    const pages = []
+    let before
+    for (let guard = 0; guard < 20; guard += 1) {
+      const query = `limit=2${before === undefined ? '' : `&before=${encodeURIComponent(before)}`}`
+      const { res, payload } = await getAuditEvents(host.port, query)
+      assert.equal(res.status, 200, query)
+      assert.equal(payload.ok, true)
+      pages.push({ count: payload.data.events.length, nextBefore: payload.data.nextBefore })
+      seen.push(...payload.data.events)
+      if (payload.data.nextBefore === null) break
+      before = payload.data.nextBefore
+      /* The cursor really is `<ts>.<seq>`, not a bare timestamp. */
+      assert.match(before, /^\d+\.\d+$/)
+    }
+
+    assert.deepEqual(pages.map((page) => page.count), [2, 2, 1])
+    assert.equal(pages[pages.length - 1].nextBefore, null)
+    assert.deepEqual(seen.map((event) => event.deviceId), ['dev_4', 'dev_3', 'dev_2', 'dev_1', 'dev_0'])
+    assert.equal(new Set(seen.map((event) => event.deviceId)).size, 5)
+
+    /* And each record carries the four fields and nothing else. */
+    for (const event of seen) {
+      assert.deepEqual(Object.keys(event), ['ts', 'event', 'deviceId', 'ip'])
+    }
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('the audit detail filter is applied by the host, and pages stay full', async () => {
+  /* `prd.md` D4: filtering in the browser would page over unfiltered records, so a
+     page could arrive empty while matching records still exist further back. */
+  const runtime = makeRuntime()
+  seedTrail(runtime, 6, ['pair', 'connect', 'pair', 'revoke'])
+  const host = await startAdminHost({ runtime })
+  try {
+    const first = await getAuditEvents(host.port, 'action=pair&limit=2')
+    assert.equal(first.res.status, 200)
+    assert.equal(first.payload.data.events.length, 2, 'a full page of matching records')
+    for (const event of first.payload.data.events) assert.equal(event.event, 'pair')
+
+    const second = await getAuditEvents(
+      host.port,
+      `action=pair&limit=2&before=${encodeURIComponent(first.payload.data.nextBefore)}`,
+    )
+    assert.equal(second.res.status, 200)
+    assert.equal(second.payload.data.events.length, 1, 'every matching record, and only those')
+    assert.equal(second.payload.data.nextBefore, null)
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('a malformed audit detail argument is a 400, and nothing is written', async () => {
+  /* `prd.md` acceptance 6 / D4: an unknown action must NOT look like "no events",
+     and a bad cursor must not silently restart at the newest page. */
+  const runtime = makeRuntime()
+  seedTrail(runtime, 3, ['pair'])
+  const host = await startAdminHost({ runtime })
+  const file = path.join(runtime.dir, `audit-${dayKeyOf(AT)}.jsonl`)
+  try {
+    const before = readFileSync(file, 'utf8')
+    const invalid = [
+      'limit=0',
+      'limit=201',
+      'limit=abc',
+      'limit=2.5',
+      'limit=0x10',
+      'before=nope',
+      'before=1.2.3',
+      'action=tool_output',
+      'action=PAIR',
+    ]
+    for (const query of invalid) {
+      const { res, payload } = await getAuditEvents(host.port, query)
+      assert.equal(res.status, 400, query)
+      assert.equal(payload.ok, false, query)
+      assert.equal(payload.error.code, 'admin/invalid-argument', query)
+      /* Renderable and free of internals. */
+      assert.ok(payload.error.message.length > 0, query)
+      assert.ok(!payload.error.message.includes(runtime.dir), query)
+      assert.ok(!('data' in payload), 'a refused page carries no data at all')
+    }
+    assert.equal(readFileSync(file, 'utf8'), before, 'a refused read must not touch the trail')
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('the audit detail endpoint is loopback-only', async () => {
+  const runtime = makeRuntime()
+  seedTrail(runtime, 2, ['pair'])
+  const host = await startAdminHost({ runtime })
+  try {
+    for (const hostHeader of [`192.168.1.7:${String(host.port)}`, 'evil.example']) {
+      const res = await send({
+        port: host.port,
+        path: auditEventsPath('limit=50'),
+        headers: { host: hostHeader },
+      })
+      assert.equal(res.status, 403, hostHeader)
+      const payload = JSON.parse(res.body)
+      assert.equal(payload.error.code, 'admin/loopback-only', hostHeader)
+      assert.ok(!res.body.includes('192.168'), 'a refusal carries no audit data')
+      assert.ok(!res.body.includes('dev_'))
+    }
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('a hand-edited meta never reaches the audit detail response', async () => {
+  /* `prd.md` acceptance 7 + constraint 2. The WRITE path refuses free text, so the
+     only way this line exists is somebody editing the file — which is exactly the
+     threat the read-side projection is for. */
+  const runtime = makeRuntime()
+  mkdirSync(runtime.dir, { recursive: true })
+  writeFileSync(
+    path.join(runtime.dir, `audit-${dayKeyOf(AT)}.jsonl`),
+    '{"ts":"2026-10-17T03:04:43.000Z","event":"pair","deviceId":"dev_1","ip":"192.168.1.7",'
+      + '"meta":{"text":"secret"},"body":"a whole prompt"}\n',
+  )
+  const host = await startAdminHost({ runtime })
+  try {
+    const { res, payload } = await getAuditEvents(host.port, 'limit=50')
+    assert.equal(res.status, 200)
+    assert.equal(payload.data.events.length, 1)
+    assert.deepEqual(payload.data.events[0], {
+      ts: '2026-10-17T03:04:43.000Z',
+      event: 'pair',
+      deviceId: 'dev_1',
+      ip: '192.168.1.7',
+    })
+    for (const leak of ['secret', 'a whole prompt', 'meta', 'body']) {
+      assert.ok(!res.body.includes(leak), `${leak} must not appear in the response`)
+    }
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('the state read publishes the closed action set for the panel filter', async () => {
+  /* `design.md` §3: the panel's `<select>` is built from THIS list. A copy in the
+     client would drift, and the drift is invisible until a filter returns 400. */
+  const runtime = makeRuntime()
+  const host = await startAdminHost({ runtime })
+  try {
+    const res = await send({
+      port: host.port,
+      path: `${ADMIN_API_PREFIX}/state`,
+      headers: { host: loopbackHost(host.port) },
+    })
+    assert.equal(res.status, 200)
+    const data = JSON.parse(res.body).data
+    assert.deepEqual(data.audit.actions, AUDIT_EVENTS)
+    assert.equal(data.audit.retentionDays, 30)
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+

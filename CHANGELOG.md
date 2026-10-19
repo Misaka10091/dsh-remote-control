@@ -91,8 +91,7 @@ local audit trail. No relay, no third-party service.
   `tests/addresses.test.mjs`.
 - **Release automation** (`.github/`, `scripts/`; git-tracked, **not** in the npm
   package). `ci.yml` runs `npm run check:syntax`, `npm test` and `npm pack --dry-run`
-  on every push to `main`, every pull request and on demand, with no secrets.
-  `npm-publish.yml` runs on a `vX.Y.Z` tag (or manually against an existing tag) and
+  on every push to `main`, every pull request and on demand, with no secrets.  `npm-publish.yml` runs on a `vX.Y.Z` tag (or manually against an existing tag) and
   goes tag validation → checks → pack **once** → `npm publish` → GitHub Release
   carrying that same `.tgz`. Credentials come from GitHub OIDC (npm Trusted
   Publisher): no `NPM_TOKEN`, no repository secret. Re-running is safe — an npm
@@ -108,6 +107,34 @@ local audit trail. No relay, no third-party service.
   section in `CHANGELOG.md`. It emits the Release body (that section plus an install
   line using `--profile web`) and `dist_tag` (`latest` stable, `next` prerelease),
   and can be dry-run locally: `node scripts/prepare-release.mjs v0.1.0 <dir>`.
+- **Panel configuration moved above the tabs.** The master switch and the listener
+  port are panel-wide facts, so they sit in one row under the title (switch + port +
+  save) instead of inside a tab, and the live status line follows them. The tabs then
+  keep one job each: 配对 owns the access point (LAN/public choice) plus the code and
+  the symbol, 接入 owns the public address book alone (add, label, delete, mark the
+  one in use). An empty public book on the pairing tab offers a shortcut to 接入
+  instead of a dead end. The sidebar entry is now 「远程连接」.
+- **Panel tabs** (PRD R1–R3): 配对 / 接入 / 设备 / 审计 in one `role="tablist"`, with
+  `aria-selected` on exactly one tab, a roving `tabIndex`, `aria-controls` /
+  `aria-labelledby` derived from the same key in both directions, `ArrowLeft` /
+  `ArrowRight` wrapping, `Home` / `End` jumping and focus following selection. The
+  default tab is 配对 when remote access is enabled **and** the gateway is actually
+  listening, otherwise 接入 — derived from live state on every render until the user
+  picks one, never remembered across opens. A status line (「监听 3090 · 0 条连接 ·
+  2 台设备」, 「远程接入未启用」) stays visible above every tab. The sidebar entry is now
+  「远程连接」.
+- **Audit detail in the panel** (PRD R4–R7): `GET /remote-control/api/audit/events`
+  returns the newest records first, 50 per page (200 at most; the panel sends no
+  `limit`, so the number has one definition), optionally narrowed by `action`. The
+  filter runs **on the host, before paging** — in the browser it would page over
+  records the filter excludes, so 「加载更多」 could come back empty while matches
+  remained further back. An unknown `action` is `400 admin/invalid-argument`, never an
+  empty page. Loopback-only, refused by the gateway's admin-prefix fence.
+- **Recent audit events in the panel**: time (date only when the record is not from
+  today, full ISO on `title`), action, device name (an 8-character id prefix when the
+  device is gone) and source address, with 加载更多 / 没有更多了 and an action filter
+  whose options come from `GET /state`'s new `audit.actions` — the client keeps no copy
+  of the closed set.
 
 ### Changed
 
@@ -137,9 +164,13 @@ local audit trail. No relay, no third-party service.
   560 px to **640 px** (height cap 720 → 760) with the QR growing 152 → 176 px, so
   the pairing card, the user-agent line and the audit grid stop crowding.
 - The pairing link is `<scheme>://<address>[:port]/remote-control/pair#<pairId>:<code>`.
-  A port written into the address wins over the gateway port; a missing scheme
-  means `http`, and an `https://` address is your own proxy terminating TLS in front
-  of the plain-HTTP gateway. Switching addresses does not invalidate the pairing
+  A port written into the address always wins. Otherwise the **mode** decides: a LAN
+  address gets the gateway port (that is what the dropdown means), while a public
+  address is used exactly as written — `https://dsh.example.de` stays on 443 because
+  that is what your reverse proxy serves, and appending `:3090` produced a URL that
+  proxy does not answer (reported from a live panel). A missing scheme means `http`,
+  and an `https://` address is your own proxy terminating TLS in front of the
+  plain-HTTP gateway. Switching addresses does not invalidate the pairing
   code, because the code is independent of the link.
 - **Panel layout pass.** Pairing is one card in two columns — symbol on the left,
   the code / countdown / link on the right — instead of a single centred column that
@@ -152,6 +183,15 @@ local audit trail. No relay, no third-party service.
 - `npm run version` syncs `dsh.plugin.json`'s `version` from `package.json` (and
   stages it), so `npm version X.Y.Z --no-git-tag-version` can no longer leave the two
   manifests disagreeing. `check:syntax` also covers `scripts/prepare-release.mjs`.
+- **The device panel is four tabs instead of one long scroll column.** The pairing code
+  no longer sits two screens below the switch that enables it, and the audit tab shows
+  the trail itself rather than only counts plus an export. Section behaviour, validation
+  and strings are unchanged, the export still carries the whole trail, and the modal's
+  focus trap still owns `Tab`: the tabs are ordinary buttons with a roving `tabIndex`,
+  so they cannot become a way out of the dialog. A tab that has been visited is kept
+  mounted and hidden rather than unmounted, so switching no longer discards a port
+  draft, an unsaved address row, a revoke confirmation or a page cursor. The audit
+  detail list has no height cap of its own: `.drc-body` is the single scrolling owner.
 
 ### Fixed
 
@@ -175,6 +215,12 @@ local audit trail. No relay, no third-party service.
 
 ### Security notes
 
+- **The audit read path re-projects every line.** Writing refuses free text, but an
+  audit day file is plain text that the user (or any process running as them) can edit,
+  so `readEvents` rebuilds each record from `ts` / `event` / `deviceId` / `ip` and
+  re-validates all four against the write path's own predicates instead of trusting the
+  parse. A hand-written `"meta": {"text": …}` therefore has nowhere to land: the object
+  the response is built from never contains that key.
 - LAN transport is plain HTTP. A passive listener on the same segment can read
   session traffic. Use a TLS-terminating proxy or a private overlay such as
   Tailscale if that matters to you.

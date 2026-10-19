@@ -1,0 +1,6 @@
+{"file": ".trellis/spec/backend/index.md", "reason": "开发前清单：本次跨 host 只读端点与客户端"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "隐私边界、严格/宽松同源、常量单一来源"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "审计读接口的日志与敏感字段要求"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "单入口、apply 不抛、i18n 四份、模态与焦点约定"}
+{"file": ".trellis/spec/frontend/component-guidelines.md", "reason": "tab 组件与 aria 契约、主题 token"}
+{"file": ".trellis/tasks/10-19-panel-tabs-audit-detail/design.md", "reason": "端点形状、游标、投影规则、tab 无障碍契约"}

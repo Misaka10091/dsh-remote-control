@@ -22,9 +22,12 @@ import {
   createAudit,
   dayKeyOf,
   isAuditEvent,
+  parseAuditCursor,
+  parseAuditLimit,
+  projectAuditRecord,
   sanitizeMeta,
 } from '../src/host/audit.js'
-import { AUDIT_RETENTION_DAYS } from '../src/host/constants.js'
+import { AUDIT_EVENTS_MAX_PAGE, AUDIT_EVENTS_PAGE_SIZE, AUDIT_RETENTION_DAYS } from '../src/host/constants.js'
 import { cleanupDir, makeTempDir } from './helpers.mjs'
 
 /** A fixed instant: 2026-10-17T03:04:43.000Z, the same one the other suites use. */
@@ -552,3 +555,330 @@ test('appends accumulate instead of replacing, and each line stays intact', () =
     cleanupDir(dir)
   }
 })
+
+/* ------------------------------------------------------------------ *
+ * The read side: projection, ordering and lossless paging
+ *
+ * `prd.md` R4/R5, `design.md` §2.2. Three properties are load-bearing, and each
+ * gets its own assertion because each has a distinct failure mode:
+ *
+ *   1. the projection (a hand-edited file must not be able to add a key),
+ *   2. the ORDER (newest first, across day files),
+ *   3. the cursor (every record exactly once, including two in one millisecond).
+ * ------------------------------------------------------------------ */
+
+/** Write a hand-made day file, so a test can produce lines no writer would emit. */
+function writeDayFile(dir, at, lines) {
+  mkdirSync(dir, { recursive: true })
+  const body = lines
+    .map((line) => (typeof line === 'string' ? line : JSON.stringify(line)) + '\n')
+    .join('')
+  writeFileSync(path.join(dir, `audit-${dayKeyOf(at)}.jsonl`), body)
+}
+
+/** Append `count` events one millisecond apart, oldest first. */
+function seedEvents(audit, clock, count, event = 'connect') {
+  for (let index = 0; index < count; index += 1) {
+    clock.now = AT + index
+    audit.record({
+      event,
+      deviceId: `dev_${String(index)}`,
+      ip: '192.168.1.7',
+      meta: { sessionId: `s${String(index)}` },
+    })
+  }
+}
+
+/** Follow `nextBefore` to the end and return the concatenation plus every page. */
+function readAll(audit, options = {}) {
+  const pages = []
+  let before
+  /* A bounded loop: a cursor that never reaches `null` must fail the test rather
+     than hang the suite. */
+  for (let guard = 0; guard < 100; guard += 1) {
+    const page = audit.readEvents({ limit: options.limit, action: options.action, before })
+    pages.push(page)
+    if (page.nextBefore === null) return { pages, events: pages.flatMap((entry) => entry.events) }
+    before = page.nextBefore
+  }
+  throw new Error('paging never terminated')
+}
+
+test('readEvents returns the newest record first, projected onto four fields', () => {
+  const { audit, dir, clock } = makeAudit()
+  try {
+    seedEvents(audit, clock, 3)
+    const page = audit.readEvents({})
+    assert.deepEqual(page.events.map((event) => event.deviceId), ['dev_2', 'dev_1', 'dev_0'])
+    assert.equal(page.nextBefore, null, 'a short trail has nothing more to fetch')
+    /* `prd.md` D5: exactly the four documented fields, and NOT the `meta` the writer
+       stored beside them. */
+    assert.deepEqual(Object.keys(page.events[0]), ['ts', 'event', 'deviceId', 'ip'])
+    assert.deepEqual(page.events[0], {
+      ts: '2026-10-17T03:04:43.002Z',
+      event: 'connect',
+      deviceId: 'dev_2',
+      ip: '192.168.1.7',
+    })
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('a cursor pages the trail without repeating or skipping a record', () => {
+  const { audit, dir, clock } = makeAudit()
+  try {
+    seedEvents(audit, clock, 5)
+    const { pages, events } = readAll(audit, { limit: 2 })
+
+    assert.deepEqual(pages.map((page) => page.events.length), [2, 2, 1])
+    assert.deepEqual(pages.map((page) => page.nextBefore === null), [false, false, true],
+      'only the last page may say there is nothing more')
+    assert.deepEqual(events.map((event) => event.deviceId), ['dev_4', 'dev_3', 'dev_2', 'dev_1', 'dev_0'])
+    assert.equal(new Set(events.map((event) => event.deviceId)).size, 5, 'every record exactly once')
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('two records in the same millisecond are neither repeated nor skipped', () => {
+  /* `prd.md` constraint 5, and the reason the cursor is `ts.seq` rather than a bare
+     timestamp: three records share one instant, so a timestamp-only cursor puts all
+     three on one side of the boundary — the first page repeats one, or the second
+     page loses one, depending on the comparison. */
+  const { audit, dir } = makeAudit()
+  try {
+    const stamp = new Date(AT).toISOString()
+    writeDayFile(dir, AT, [
+      { ts: stamp, event: 'pair', deviceId: 'dev_a' },
+      { ts: stamp, event: 'connect', deviceId: 'dev_b' },
+      { ts: stamp, event: 'revoke', deviceId: 'dev_c' },
+    ])
+
+    const { pages, events } = readAll(audit, { limit: 1 })
+    assert.deepEqual(pages.map((page) => page.events.length), [1, 1, 1])
+    /* Newest first within one millisecond = the order they were appended in,
+       reversed; that is the ONLY order that lets the cursor resume. */
+    assert.deepEqual(events.map((event) => event.deviceId), ['dev_c', 'dev_b', 'dev_a'])
+    assert.deepEqual(events.map((event) => event.event), ['revoke', 'connect', 'pair'])
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('paging crosses a day boundary in one continuous order', () => {
+  const { audit, dir, clock } = makeAudit()
+  try {
+    clock.now = AT
+    audit.record({ event: 'pair', deviceId: 'dev_old1' })
+    audit.record({ event: 'connect', deviceId: 'dev_old2' })
+    clock.now = AT + 86_400_000
+    audit.record({ event: 'revoke', deviceId: 'dev_new1' })
+    audit.record({ event: 'disconnect', deviceId: 'dev_new2' })
+
+    const { events } = readAll(audit, { limit: 1 })
+    assert.deepEqual(events.map((event) => event.deviceId), ['dev_new2', 'dev_new1', 'dev_old2', 'dev_old1'])
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('the action filter is applied by the reader, before paging', () => {
+  /* `prd.md` D4/R6. Filtering after paging would hand back pages that are mostly —
+     or entirely — empty while matching records still exist further back, so the
+     panel's 「加载更多」 would appear to do nothing. */
+  const { audit, dir, clock } = makeAudit()
+  try {
+    const pattern = ['pair', 'connect', 'pair', 'revoke', 'pair', 'connect']
+    pattern.forEach((event, index) => {
+      clock.now = AT + index
+      audit.record({ event, deviceId: `dev_${String(index)}` })
+    })
+
+    const { pages, events } = readAll(audit, { limit: 2, action: 'pair' })
+    assert.deepEqual(events.map((event) => event.event), ['pair', 'pair', 'pair'])
+    assert.deepEqual(events.map((event) => event.deviceId), ['dev_4', 'dev_2', 'dev_0'])
+    assert.deepEqual(pages.map((page) => page.events.length), [2, 1], 'every page is full until the end')
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('an unknown action is refused, not answered with an empty page', () => {
+  /* An empty list would be indistinguishable from "that action never happened",
+     which is the reassuring-and-wrong answer `quality-guidelines.md` §5 forbids. */
+  const { audit } = makeAudit()
+  assert.throws(
+    () => audit.readEvents({ action: 'tool_output' }),
+    (error) => error.code === 'audit/invalid-action',
+  )
+})
+
+test('the read projection drops meta and every hand-added key', () => {
+  /* `prd.md` D5 + constraint 2: the writer already refuses free text, but a day file
+     is editable text, so the READ path re-projects every line. A record carrying
+     `meta: { text }`, a `body` and a 43-character token therefore comes back as four
+     fields with none of that in it. */
+  const { audit, dir } = makeAudit()
+  const token = 'A'.repeat(43)
+  try {
+    writeDayFile(dir, AT, [
+      `{"ts":"2026-10-17T03:04:43.000Z","event":"pair","deviceId":"dev_p1","ip":"192.168.1.7",`
+        + `"meta":{"text":"hunter2","sessionId":"sess_1"},"body":"a whole prompt","token":"${token}"}`,
+    ])
+
+    const page = audit.readEvents({})
+    assert.equal(page.events.length, 1)
+    assert.deepEqual(page.events[0], {
+      ts: '2026-10-17T03:04:43.000Z',
+      event: 'pair',
+      deviceId: 'dev_p1',
+      ip: '192.168.1.7',
+    })
+    const serialized = JSON.stringify(page)
+    for (const leak of ['hunter2', 'a whole prompt', token, 'meta', 'body', 'sessionId']) {
+      assert.ok(!serialized.includes(leak), `${leak} must not reach the reader`)
+    }
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('an unusable line is skipped, and an unusable field is dropped', () => {
+  const { audit, dir } = makeAudit()
+  const token = 'B'.repeat(43)
+  try {
+    writeDayFile(dir, AT, [
+      'not json at all',
+      '{"ts": 1760000000000, "event": "pair"}',
+      '{"ts": "not a date", "event": "pair"}',
+      '{"ts": "2026-10-17T03:04:43.000Z", "event": "tool_output"}',
+      `{"ts":"2026-10-17T03:04:44.000Z","event":"connect","ip":"${token}"}`,
+      `{"ts":"2026-10-17T03:04:45.000Z","event":"revoke","deviceId":"${token}"}`,
+      '[1,2,3]',
+      'null',
+    ])
+
+    const page = audit.readEvents({})
+    /* Only the two records with a usable `ts` and a closed-set `event` survive. */
+    assert.deepEqual(page.events.map((event) => event.event), ['revoke', 'connect'])
+    /* And the token-shaped values did not take the credential slots`. */
+    assert.ok(!('deviceId' in page.events[0]), 'a bare token is not a device id')
+    assert.ok(!('ip' in page.events[1]), 'a bare token is not an address')
+    assert.ok(!JSON.stringify(page).includes(token))
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('the page size is validated, and an absent one is the documented default', () => {
+  assert.equal(AUDIT_EVENTS_PAGE_SIZE, 50, 'prd.md R5 / design.md §2.1 fix this number')
+  assert.equal(AUDIT_EVENTS_MAX_PAGE, 200)
+  assert.equal(parseAuditLimit(undefined), 50)
+  assert.equal(parseAuditLimit(null), 50)
+  assert.equal(parseAuditLimit(''), 50)
+  assert.equal(parseAuditLimit('2'), 2)
+  assert.equal(parseAuditLimit('200'), 200)
+  /* `Number('0x10')` is 16 and `Number('')` is 0, so the conversion is never the
+     validator. */
+  for (const bad of ['0', '201', '-1', 'abc', '2.5', '0x10', ' 50 ', '1e3', '050x']) {
+    assert.equal(parseAuditLimit(bad), null, `${JSON.stringify(bad)} must be refused`)
+  }
+
+  const { audit, dir, clock } = makeAudit()
+  try {
+    seedEvents(audit, clock, 3)
+    for (const limit of [0, -1, 1.5, AUDIT_EVENTS_MAX_PAGE + 1, '50', null, undefined]) {
+      if (limit === null || limit === undefined) continue
+      assert.throws(
+        () => audit.readEvents({ limit }),
+        (error) => error.code === 'audit/invalid-limit',
+        String(limit),
+      )
+    }
+    assert.equal(audit.readEvents({ limit: AUDIT_EVENTS_MAX_PAGE }).events.length, 3)
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('the first page holds the documented 50 records and says more are coming', () => {
+  const { audit, dir, clock } = makeAudit()
+  try {
+    seedEvents(audit, clock, 55)
+    const first = audit.readEvents({})
+    assert.equal(first.events.length, AUDIT_EVENTS_PAGE_SIZE)
+    assert.notEqual(first.nextBefore, null)
+    assert.equal(first.events[0].deviceId, 'dev_54', 'newest first')
+
+    const second = audit.readEvents({ before: first.nextBefore })
+    assert.equal(second.events.length, 5)
+    assert.equal(second.nextBefore, null)
+    const all = first.events.concat(second.events)
+    assert.equal(new Set(all.map((event) => event.deviceId)).size, 55)
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('a malformed cursor is refused instead of silently restarting at the top', () => {
+  assert.deepEqual(parseAuditCursor('1792206283003.4'), { ts: 1792206283003, seq: 4 })
+  for (const bad of ['', 'nope', '1', '1.2.3', '.2', '1.', '1e3.2', '-1.2', ' 1.2', null, undefined, 42]) {
+    assert.equal(parseAuditCursor(bad), null, `${JSON.stringify(bad)} must be refused`)
+  }
+
+  const { audit, dir, clock } = makeAudit()
+  try {
+    seedEvents(audit, clock, 2)
+    assert.throws(
+      () => audit.readEvents({ before: 'nope' }),
+      (error) => error.code === 'audit/invalid-cursor',
+    )
+    /* An EMPTY cursor is "no cursor", not an error: that is what an absent query
+       parameter becomes, and the panel's first request sends none. */
+    assert.equal(audit.readEvents({ before: '' }).events.length, 2)
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('reading the trail writes nothing and never throws on a missing directory', () => {
+  const { audit, dir, clock } = makeAudit()
+  try {
+    seedEvents(audit, clock, 3)
+    const file = path.join(dir, `audit-${dayKeyOf(AT)}.jsonl`)
+    const before = readFileSync(file, 'utf8')
+    readAll(audit, { limit: 1 })
+    assert.equal(readFileSync(file, 'utf8'), before, 'the read path must not touch the trail')
+    assert.equal(audit.stats.written, 3, 'and must not count as a write')
+  } finally {
+    cleanupDir(dir)
+  }
+
+  const empty = createAudit({ baseDir: path.join(makeTempDir(), 'never-created'), now: () => AT })
+  try {
+    assert.deepEqual(empty.readEvents({}), { events: [], nextBefore: null })
+  } finally {
+    cleanupDir(path.dirname(empty.baseDir))
+  }
+})
+
+test('projectAuditRecord is pure, and normalizes ts to the documented spelling', () => {
+  /* Re-serializing rather than copying `ts` is what stops a hand-written spelling
+     from travelling to the UI, and it gives the reader a single value to parse. */
+  const record = projectAuditRecord({
+    ts: '2026-10-17T05:04:43.000+02:00',
+    event: 'pair',
+    deviceId: 'dev_1',
+    ip: '10.0.0.7',
+    meta: { text: 'hunter2' },
+  })
+  assert.deepEqual(record, { ts: '2026-10-17T03:04:43.000Z', event: 'pair', deviceId: 'dev_1', ip: '10.0.0.7' })
+
+  for (const bad of [null, '[1,2]', 'text', 42]) {
+    assert.equal(projectAuditRecord(bad), null, String(bad))
+  }
+  assert.equal(projectAuditRecord({ ts: '2026-10-17T03:04:43.000Z', event: 'nope' }), null)
+  assert.equal(projectAuditRecord({ event: 'pair' }), null, 'a record without ts cannot be ordered')
+})
+
