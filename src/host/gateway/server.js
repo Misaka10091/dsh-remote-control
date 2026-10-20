@@ -118,9 +118,9 @@ import {
   codeFor,
   isAllowed,
   messageFor,
-  peerAddress,
   statusFor,
 } from './auth.js'
+import { clientAddress } from '../loopback.js'
 import { createInnerAuth } from './inner-auth.js'
 import { createPairingRoute, isPairingPath } from './pairing-route.js'
 import { createProxy } from './proxy.js'
@@ -338,7 +338,7 @@ export async function startGateway(options) {
    * @param {Buffer} head Bytes already read past the request head.
    */
   function handleUpgrade(req, socket, head) {
-    const peer = peerAddress(socket)
+    const peer = clientAddress(req)
     let verdict
     try {
       verdict = authorize({ req, store, cookieName, key: jwtKey, isRevoked, now, upgrade: true })
@@ -409,7 +409,7 @@ export async function startGateway(options) {
    * @param {import('node:http').ServerResponse} res
    */
   function handle(req, res) {
-    const peer = peerAddress(req?.socket)
+    const peer = clientAddress(req)
 
     /* The admin API lives on the OFFICIAL loopback server (`api.js`), and this hop
        must refuse it explicitly: the gateway rewrites `Host` to the loopback

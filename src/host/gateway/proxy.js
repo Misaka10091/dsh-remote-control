@@ -97,6 +97,16 @@ const DROPPED_REQUEST_HEADERS = new Set([
   'x-client-ip',
   'x-cluster-client-ip',
   'true-client-ip',
+  /* Cloudflare's own forwarding metadata. A managed tunnel reaches this gateway
+     from loopback after the edge stamped these; a LAN client can also set them,
+     and no part of DSH is meant to read them, so they are dropped rather than
+     passed upstream. `cf-connecting-ip` is consumed by `loopback.js#clientAddress`
+     for audit/rate limiting and must not travel further. */
+  'cf-connecting-ip',
+  'cf-ray',
+  'cf-visitor',
+  'cf-ipcountry',
+  'cdn-loop',
 ])
 
 /** Response headers removed on the way back. */

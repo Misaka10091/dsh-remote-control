@@ -61,6 +61,7 @@ import { createAudit } from './host/audit.js'
 import { startAdminApi } from './host/api.js'
 import { createPairingStore } from './host/pairing.js'
 import { createStore } from './host/store.js'
+import { createTunnel } from './host/tunnel.js'
 import { startGateway } from './host/gateway/server.js'
 
 export const name = 'dsh-remote-control'
@@ -226,6 +227,10 @@ export function createRuntime(options = {}) {
  * @param {string} [config.host] Bind address overrides the all-interfaces default.
  * @param {number} [config.auditPruneIntervalMs] Retention sweep interval; injectable so a test need not wait.
  * @param {string} [config.baseDir] Runtime directory; defaults to `~/.dsh/remote-control`.
+ * @param {Function} [config.tunnelSpawnImpl] `child_process#spawn` for the
+ *   managed cloudflared process; injectable so tests never start a real binary.
+ * @param {typeof globalThis.fetch} [config.tunnelFetchImpl] Download transport for
+ *   the cloudflared binary; injectable for the same reason.
  * @param {(handle: object) => void} [config.onAdminApi] Receives the mounted API handle.
  * @returns {Promise<void> | undefined} A promise only while the listener is binding.
  */
@@ -236,6 +241,17 @@ export function apply(ctx, config = {}) {
        It must never be fatal (the request that triggered it was authorized), and
        it must never be silent (`quality-guidelines.md` §5). */
     onAuditError: (error) => logLine(ctx, 'warn', `[remote-control] audit: ${describeErrorCode(error)}`),
+  })
+
+  /* The managed Cloudflare Tunnel. It is created unconditionally and stays idle
+     while `settings.tunnel.enabled` is false, so the panel can turn it on and off
+     without a restart. It is DELIBERATELY not part of `createRuntime`: the runtime
+     is the transport-independent domain, and this controller owns a child process. */
+  const tunnel = createTunnel({
+    baseDir: runtime.store.baseDir,
+    logger: ctx?.logger,
+    ...(typeof config?.tunnelSpawnImpl === 'function' ? { spawnImpl: config.tunnelSpawnImpl } : {}),
+    ...(typeof config?.tunnelFetchImpl === 'function' ? { fetchImpl: config.tunnelFetchImpl } : {}),
   })
   const settings = runtime.store.getSettings()
   const devices = runtime.store.listDevices()
@@ -290,6 +306,12 @@ export function apply(ctx, config = {}) {
     return () => clearInterval(timer)
   }, 'remote-control: audit retention')
 
+  /* The tunnel's process outlives a settings write but must not outlive the
+     plugin: unloading or hot-reloading has to leave no `cloudflared` behind. One
+     effect for the whole controller, registered once — the controller's own
+     start/stop are idempotent, so a disposer per start would only add noise. */
+  registerEffect(ctx, () => () => tunnel.dispose(), 'remote-control: cloudflared tunnel')
+
   /* The running gateway, or null. The admin API reads it lazily through this
      closure rather than capturing a value, because the gateway may start after
      the API mounts, may stop while the panel is open, and may move to another
@@ -341,6 +363,71 @@ export function apply(ctx, config = {}) {
   }
 
   /**
+   * Reconcile the managed tunnel with the stored settings and the live listener.
+   *
+   * Four call sites and ONE rule: the tunnel runs iff `settings.tunnel.enabled` is
+   * true AND a gateway listener is live. Everything the panel can change funnels
+   * through here, so "remote access off but cloudflared still up" cannot be
+   * expressed.
+   *
+   * `live.port` is the BOUND port, not `settings.port` and not the profile
+   * override: with `config.port: 0` (every test) they differ, and the tunnel must
+   * target the port that is actually listening.
+   *
+   * Never throws out: the caller is a lifecycle hook or an API action, and a
+   * tunnel problem is reported as status, not as a failed plugin.
+   *
+   * @returns {Promise<object>} The tunnel status after the attempt.
+   */
+  function syncTunnel() {
+    try {
+      const current = runtime.store.getSettings().tunnel
+      if (current.enabled !== true || live === null) return tunnel.stop()
+      return tunnel.start({ settings: current, port: live.port })
+    } catch (error) {
+      /* A corrupt `devices.json` read must not be turned into a tunnel failure
+         report — the store problem is already fatal elsewhere. */
+      return Promise.reject(error)
+    }
+  }
+
+  /** Log a tunnel failure once, without pretending it is a gateway failure. */
+  function reportTunnel(status) {
+    if (status === null || typeof status !== 'object') return
+    if (status.state !== 'failed' || status.error === null || typeof status.error !== 'object') return
+    logLine(ctx, 'warn', `[remote-control] cloudflared is not running: ${String(status.error.code)}`)
+  }
+
+  /**
+   * Apply one tunnel settings change to the RUNNING process.
+   *
+   * Wired into `api.js` as `applyTunnelChange`, mirroring `applyListenerChange`:
+   * the admin API persists, this function makes the process agree. A tunnel that
+   * fails to start does NOT fail the settings write — the panel is shown `failed`
+   * plus the code, and the user can fix the token/path and retry without the
+   * setting being silently reverted (`prd.md` acceptance 2).
+   *
+   * @param {{ before?: object, after?: object }} change
+   * @returns {Promise<object>}
+   */
+  async function applyTunnelChange(change) {
+    const after = change?.after
+    if (after === null || typeof after !== 'object') return tunnel.describe()
+    if (after.enabled !== true || live === null) {
+      await tunnel.stop()
+      /* Adopt the saved settings even though nothing can run yet: the panel reads
+         `enabled`/`mode`/`publicUrl` back from this status, and a stale one would
+         show "off" the instant after the user turned it on. */
+      return tunnel.configure(after)
+    }
+    const status = change.force === true
+      ? await tunnel.restart({ settings: after, port: live.port })
+      : await tunnel.start({ settings: after, port: live.port })
+    reportTunnel(status)
+    return status
+  }
+
+  /**
    * Bind one listener for `nextSettings` and make it the live one.
    *
    * `registerEffect: false` on purpose: this closure registers ONE effect for
@@ -388,6 +475,14 @@ export function apply(ctx, config = {}) {
       `[remote-control] gateway listening on ${started.host}:${String(started.port)} `
         + `(upstream ${started.upstream.host})`,
     )
+    /* The tunnel targets this listener. Started asynchronously on purpose: a
+       missing binary, a bad token or a slow edge must not delay activation of the
+       LAN gateway (which is the feature this plugin exists for), and its failure is
+       a panel state, not a plugin error. `syncTunnel` re-checks the stored switch,
+       so a toggle that lands meanwhile wins. */
+    syncTunnel().then(reportTunnel).catch((error) => {
+      logLine(ctx, 'warn', `[remote-control] cloudflared did not start: ${describeErrorCode(error)}`)
+    })
     return started
   }
 
@@ -404,6 +499,14 @@ export function apply(ctx, config = {}) {
     const current = live
     live = null
     liveRequestedPort = null
+    /* Stop the tunnel BEFORE the listener disappears: cloudflared would otherwise
+       spend the gap reconnecting to a port that is closing, and its retry chatter
+       would outlive the state that explains it. Idempotent when nothing is running. */
+    try {
+      await tunnel.stop()
+    } catch (error) {
+      logLine(ctx, 'warn', `[remote-control] cloudflared did not stop: ${describeErrorCode(error)}`)
+    }
     if (current === null) return
     try {
       await current.dispose()
@@ -458,7 +561,10 @@ export function apply(ctx, config = {}) {
     if (next === null || typeof next !== 'object') return { applied: false, port: null }
 
     if (next.enabled !== true) {
-      if (live === null) return { applied: false, port: null }
+      if (live === null) {
+        await tunnel.stop()
+        return { applied: false, port: null }
+      }
       await stopListener()
       logLine(ctx, 'info', '[remote-control] gateway stopped — remote access is off')
       return { applied: true, port: null }
@@ -520,6 +626,14 @@ export function apply(ctx, config = {}) {
     pairing: runtime.pairing,
     audit: runtime.audit,
     getGateway: () => live,
+    /* The tunnel controller, read lazily for the same reason as the gateway: it
+       exists before the listener and may be running, stopped or failed while the
+       panel is open. The admin API may ask for status and drive it, but it never
+       owns the process. */
+    getTunnel: () => tunnel,
+    /* The hot-reload seam for tunnel settings. Without it `POST /tunnel/config`
+       would only write the file and the panel would show a stale process. */
+    applyTunnelChange,
     /* The hot-reload seam. Without it `POST /settings` answers
        `requiresReload: true` and the user restarts `dsh` for a switch and a port. */
     applyListenerChange: reconfigureListener,

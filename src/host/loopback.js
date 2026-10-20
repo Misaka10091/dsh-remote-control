@@ -34,6 +34,9 @@
  * thing it names. Here it waives the credential; it never waives the origin
  * fence, which both callers run separately.
  */
+import { isIP } from 'node:net'
+
+import { CF_CONNECTING_IP_HEADER } from './constants.js'
 
 /**
  * Whether a hostname names loopback.
@@ -134,4 +137,38 @@ export function isLoopback(req) {
   } catch {
     return false
   }
+}
+
+/**
+ * The address to attribute a request to, for the audit trail and the pairing
+ * rate limiter.
+ *
+ * Normally the socket peer. A managed Cloudflare Tunnel connects to the gateway
+ * from `127.0.0.1`, so every public request would otherwise be recorded as
+ * "127.0.0.1" — the audit would be true about the tunnel and useless about the
+ * client, and the per-source pairing budget would collapse into one global
+ * bucket. Cloudflare's edge stamps the real peer in `CF-Connecting-IP`, and both
+ * cloudflared and the edge overwrite a client-supplied value.
+ *
+ * ## Why the socket half still decides
+ *
+ * The header is trusted ONLY when the socket peer is loopback. A request that
+ * arrives directly from the LAN has a non-loopback socket, so a `CF-Connecting-IP`
+ * it carries is ignored — otherwise any LAN client could pick the address the
+ * audit and the rate limiter believe it came from. A value that fails `isIP` is
+ * ignored for the same reason. Only a process that is already running on this
+ * machine (the same trust level that can read `devices.json`) can put a value
+ * here while satisfying the loopback half.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @returns {string | undefined}
+ */
+export function clientAddress(req) {
+  const socketAddress = peerAddress(req?.socket)
+  if (!isLoopbackHostname(socketAddress)) return socketAddress
+  const forwarded = headerValue(req, CF_CONNECTING_IP_HEADER)
+  if (typeof forwarded !== 'string') return socketAddress
+  const candidate = forwarded.trim()
+  if (candidate === '' || isIP(candidate) === 0) return socketAddress
+  return candidate
 }

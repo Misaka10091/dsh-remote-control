@@ -85,8 +85,103 @@ export const PUBLIC_LABEL_MAX = 40
  */
 export const ADDRESS_TEXT_MAX = 253
 
-/** Accepted values of `settings.access.mode`. `lan` is the default and the safer one. */
-export const ACCESS_MODES = Object.freeze(['lan', 'public'])
+/**
+ * Accepted values of `settings.access.mode`.
+ *
+ * `lan` is the default and the safer one. `tunnel` (2026-10-20) names the address
+ * a managed Cloudflare Tunnel is currently reachable at: unlike `public` it is not
+ * a stored string but a runtime fact, so `effectiveAddress` takes it as an extra
+ * argument instead of reading it out of `settings.access`.
+ */
+export const ACCESS_MODES = Object.freeze(['lan', 'public', 'tunnel'])
+
+/* ------------------------------------------------------------------ *
+ * Cloudflare Tunnel (`settings.tunnel`, `prd.md` R1-R5)
+ *
+ * The plugin supervises exactly one external program — `cloudflared` — and only
+ * in `src/host/tunnel.js`. Everything here is either a bound on that program's
+ * lifecycle or a name that the panel, the store and the API must agree on.
+ * ------------------------------------------------------------------ */
+
+/** Accepted values of `settings.tunnel.mode`. */
+export const TUNNEL_MODES = Object.freeze(['quick', 'token'])
+
+/** Leaf name of the tunnel credential file inside the runtime directory. */
+export const TUNNEL_TOKEN_FILE_NAME = 'cloudflared-token'
+
+/**
+ * Longest accepted tunnel token.
+ *
+ * A dashboard token is a base64 blob of a few hundred bytes. The bound exists so
+ * a pasted page of text cannot become a file this process writes on every save,
+ * not because any real token is near it.
+ */
+export const TUNNEL_TOKEN_MAX = 8_192
+
+/** Longest accepted custom `cloudflared` path. Windows paths plus argument-free names fit easily. */
+export const TUNNEL_BINARY_PATH_MAX = 512
+
+/** Leaf name of the binary this plugin downloads into the runtime directory. `.exe` is appended on Windows. */
+export const TUNNEL_BINARY_FILE_NAME = 'cloudflared'
+
+/** How long a quick tunnel may take to print its public URL before the start is failed. */
+export const TUNNEL_START_TIMEOUT_MS = 30_000
+
+/**
+ * Grace period for a token-mode tunnel after spawn.
+ *
+ * A dashboard token can be malformed, and `cloudflared` then exits within a second
+ * or two; reporting `running` before that window closes would make the panel say
+ * "up" for a process that was never usable. Same idea as the URL wait for quick
+ * tunnels, just with a much smaller bound.
+ */
+export const TUNNEL_READY_GRACE_MS = 1_500
+
+/** Bound on the graceful stop before the process is killed outright. */
+export const TUNNEL_STOP_TIMEOUT_MS = 5_000
+
+/** Deadline for one release-metadata request and one asset download. */
+export const TUNNEL_DOWNLOAD_TIMEOUT_MS = 120_000
+
+/**
+ * Refuse an asset larger than this.
+ *
+ * `cloudflared` is roughly 40-60 MB per platform. The cap keeps a mis-selected
+ * asset (or a hostile proxy that is not on the pinned hosts anyway) from turning
+ * a "download" click into an unbounded allocation.
+ */
+export const TUNNEL_DOWNLOAD_MAX_BYTES = 160 * 1024 * 1024
+
+/**
+ * Output lines kept in memory for diagnostics.
+ *
+ * They are NEVER returned by the API and never audited: `cloudflared`'s output is
+ * free text, and the only thing this plugin may show a caller is a stable error
+ * code. The buffer exists so a later `--verbose` style debugging aid has somewhere
+ * to read without changing the process wiring.
+ */
+export const TUNNEL_LOG_LINES_MAX = 40
+
+/**
+ * The GitHub release endpoint the binary download is pinned to.
+ *
+ * A constant, not a setting (`prd.md` constraint 7): the download is the one
+ * action that writes an executable to disk, and it must not be redirectable to a
+ * host the panel could be tricked into naming.
+ */
+export const TUNNEL_RELEASE_API = 'https://api.github.com/repos/cloudflare/cloudflared/releases/latest'
+
+/** Host of a downloadable asset. Checked before a byte is written. */
+export const TUNNEL_ASSET_HOST = 'github.com'
+
+/** Hostname suffix a quick tunnel is created under. Used only to recognise the URL in output. */
+export const TUNNEL_QUICK_HOST_SUFFIX = '.trycloudflare.com'
+
+/**
+ * Header Cloudflare's edge stamps on every proxied request with the real peer
+ * address. Trusted only when the socket half is loopback (`loopback.js#clientAddress`).
+ */
+export const CF_CONNECTING_IP_HEADER = 'cf-connecting-ip'
 
 /** Leading string of every device id, so an id can never be mistaken for a token hash. */
 export const DEVICE_ID_PREFIX = 'dev_'

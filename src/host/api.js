@@ -55,7 +55,13 @@
  * connection reset. `headersSent` is checked before every head, so a late
  * failure destroys the response instead of throwing `ERR_HTTP_HEADERS_SENT`.
  */
-import { ADMIN_API_PREFIX, AUDIT_EVENTS_MAX_PAGE, DEVICE_ID_PREFIX, PAIRING_ROUTE_PATH } from './constants.js'
+import {
+  ADMIN_API_PREFIX,
+  AUDIT_EVENTS_MAX_PAGE,
+  DEVICE_ID_PREFIX,
+  PAIRING_ROUTE_PATH,
+  TUNNEL_TOKEN_MAX,
+} from './constants.js'
 import { listLanAddresses, validateAccess } from './addresses.js'
 import {
   AUDIT_EVENTS,
@@ -66,6 +72,7 @@ import {
 } from './audit.js'
 import { isLoopback } from './loopback.js'
 import { checkAdminOrigin } from './origin.js'
+import { isValidTunnelToken, validateTunnel } from './tunnel.js'
 
 /** Largest JSON body the admin API accepts. Every documented request is a few dozen bytes. */
 const MAX_BODY_BYTES = 64 * 1024
@@ -345,6 +352,13 @@ function publicDevice(device, liveConnections) {
  *   Applies a switch/port change to the RUNNING process (`index.js` rebinds the
  *   listener there). Omitted = this host cannot hot-apply, and `POST /settings`
  *   answers `requiresReload: true` instead of pretending.
+ * @param {() => (object | null)} [options.getTunnel] Returns the managed tunnel
+ *   controller (`tunnel.js#createTunnel`), or null on a host without one. Read
+ *   lazily for the same reason as `getGateway`: it may be running, stopped or
+ *   failed while the panel is open.
+ * @param {(change: { before?: object, after?: object, tokenChanged?: boolean, force?: boolean }) => Promise<object>} [options.applyTunnelChange]
+ *   Applies a tunnel settings change to the RUNNING process (`index.js` owns the
+ *   cloudflared process). Omitted = the API can read status but cannot start it.
  * @returns {{ dispose: () => void, available: boolean, guard: Function }}
  */
 export function startAdminApi(options) {
@@ -354,12 +368,16 @@ export function startAdminApi(options) {
   const pairing = options.pairing
   const audit = options.audit
   const getGateway = typeof options.getGateway === 'function' ? options.getGateway : () => null
+  const getTunnel = typeof options.getTunnel === 'function' ? options.getTunnel : () => null
   const logger = options.logger
   const readLanAddresses = typeof options.listLanAddresses === 'function'
     ? options.listLanAddresses
     : () => listLanAddresses()
   const applyListenerChange = typeof options.applyListenerChange === 'function'
     ? options.applyListenerChange
+    : null
+  const applyTunnelChange = typeof options.applyTunnelChange === 'function'
+    ? options.applyTunnelChange
     : null
 
   /** Report one diagnostic line; never a body, a code, or a token. */
@@ -477,6 +495,43 @@ export function startAdminApi(options) {
     }
   }
 
+  /**
+   * The managed tunnel controller, or null on a host without one.
+   *
+   * This module imports only the GRAMMAR half of `tunnel.js` (`validateTunnel` /
+   * `isValidTunnelToken`); the controller — and therefore the child process — is
+   * injected, exactly like `getGateway`. A test can hand it a fake and the API stays
+   * a thin surface over whatever owns the process.
+   */
+  function tunnelController() {
+    const controller = getTunnel()
+    return controller !== null && typeof controller === 'object' && typeof controller.describe === 'function'
+      ? controller
+      : null
+  }
+
+  /** A status snapshot, or null when this host has no tunnel controller. */
+  function tunnelState() {
+    const controller = tunnelController()
+    if (controller === null) return null
+    try {
+      return controller.describe()
+    } catch {
+      /* A controller that cannot describe itself is reported as absent rather than
+         taking the whole state read down. */
+      return null
+    }
+  }
+
+  /** Require a controller, or answer the documented 500. */
+  function requireTunnel() {
+    const controller = tunnelController()
+    if (controller === null) {
+      throw adminError('admin/tunnel-unavailable', 'This host does not provide a managed tunnel.')
+    }
+    return controller
+  }
+
   /* ------------------------------------------------------------------ *
    * Handlers. Each returns `{ status, data }` or throws a stable-code Error;
    * `handle` turns both into an envelope. That keeps every write to `res` in
@@ -491,6 +546,11 @@ export function startAdminApi(options) {
       status: 200,
       data: {
         settings: store.getSettings(),
+        /* The tunnel status travels with the state read because the pairing tab
+           needs its URL to build a link, and a second round trip would let the
+           link and the switch disagree for one render. `null` on a host without
+           the controller; the panel renders the card as unavailable. */
+        tunnel: tunnelState(),
         /* The NIC list travels with the state read because it is a fact about
            THIS MOMENT, not a setting: a cable that comes back does not need the
            panel restarted, and the stored `lanAddress` is returned unchanged
@@ -652,6 +712,208 @@ export function startAdminApi(options) {
   /** GET /settings */
   function getSettings() {
     return { status: 200, data: { settings: store.getSettings() } }
+  }
+
+  /**
+   * Put a tunnel settings block back after a refused action.
+   *
+   * Best-effort, like `revertSettings`: if the restore fails too, the loud log line
+   * is the only honest signal left. Throwing here would replace the actionable
+   * error with a generic 500.
+   *
+   * @param {object} before `settings.tunnel` as it was.
+   * @returns {boolean} whether the restore was written.
+   */
+  function revertTunnelSettings(before) {
+    try {
+      store.updateSettings({ tunnel: before })
+      return true
+    } catch (error) {
+      log('error', `[remote-control] could not restore the previous tunnel setting (${codeOf(error)})`)
+      return false
+    }
+  }
+
+  /** GET /tunnel — the managed Cloudflare Tunnel's status. */
+  function getTunnelStatus() {
+    const status = tunnelState()
+    if (status === null) throw adminError('admin/tunnel-unavailable', 'This host does not provide a managed tunnel.')
+    return { status: 200, data: { tunnel: status } }
+  }
+
+  /**
+   * POST /tunnel — `{ action: 'start' | 'stop' | 'restart' }`.
+   *
+   * `start`/`restart` persist `enabled = true` BEFORE asking the process to run:
+   * the switch is the user's intent, and a tunnel that fails to come up must not
+   * silently flip their intent back off. The failure is reported in the returned
+   * status (`state: 'failed'` + a stable code) with HTTP 200 — the request did what
+   * it said (saved + attempted); only "cannot even attempt" is an HTTP error.
+   *
+   * @param {object} body
+   * @returns {Promise<{ status: number, data: object }>}
+   */
+  async function tunnelAction(body) {
+    const controller = requireTunnel()
+    const action = typeof body.action === 'string' ? body.action.trim() : ''
+    if (!['start', 'stop', 'restart'].includes(action)) {
+      throw adminError('admin/tunnel-action', 'action must be start, stop or restart')
+    }
+
+    const before = store.getSettings()
+    const wantEnabled = action !== 'stop'
+    if (wantEnabled) {
+      const gateway = getGateway()
+      if (gateway === null || gateway.server?.listening !== true) {
+        throw adminError('admin/tunnel-no-gateway', 'Enable remote access before starting the tunnel.')
+      }
+    }
+    if (applyTunnelChange === null) {
+      throw adminError('admin/tunnel-unavailable', 'This host cannot start a managed tunnel.')
+    }
+
+    const settings = store.updateSettings({
+      tunnel: { ...before.tunnel, enabled: wantEnabled },
+    })
+    let status
+    try {
+      status = await applyTunnelChange({
+        before: before.tunnel,
+        after: settings.tunnel,
+        tokenChanged: false,
+        force: action === 'restart',
+      })
+    } catch (error) {
+      /* The seam itself failed (a bug or a store fault), not the tunnel: restore
+         the switch so the file and the process agree, exactly like a refused
+         listener rebind. */
+      const restored = revertTunnelSettings(before.tunnel)
+      log('error', `[remote-control] tunnel action failed (${codeOf(error)}); `
+        + (restored ? 'the previous setting was restored' : 'the settings file was NOT restored'))
+      throw adminError('admin/tunnel-failed', 'The tunnel action could not be applied.')
+    }
+    return { status: 200, data: { tunnel: status ?? controller.describe() } }
+  }
+
+  /**
+   * POST /tunnel/config — persist mode / binary path / public hostname / token.
+   *
+   * The token is the only field that is WRITE-ONLY: its absence means "leave it
+   * alone", `null` or `''` clears it, and the response carries `tokenSet` instead
+   * of the value. Validation runs on the merged candidate, so a partial patch
+   * cannot produce an object the strict reader would refuse.
+   *
+   * The token is written first: if that fails, the settings file is untouched (the
+   * caller sees an error and nothing changed). If the settings write then fails,
+   * a newly stored token remains — visible as `tokenSet: true`, never as a silent
+   * half-state.
+   *
+   * @param {object} body
+   * @returns {Promise<{ status: number, data: object }>}
+   */
+  async function updateTunnelConfig(body) {
+    const controller = requireTunnel()
+    const before = store.getSettings()
+    const candidate = { ...before.tunnel }
+
+    if (body.enabled !== undefined) {
+      if (typeof body.enabled !== 'boolean') {
+        throw adminError('admin/invalid-tunnel', 'enabled must be a boolean')
+      }
+      candidate.enabled = body.enabled
+      /* An EXPLICIT enable has the same gateway precondition as `POST /tunnel
+         start`; a config edit while already enabled is left alone (the user may be
+         fixing a path with the gateway temporarily off). */
+      if (body.enabled === true) {
+        const gateway = getGateway()
+        if (gateway === null || gateway.server?.listening !== true) {
+          throw adminError('admin/tunnel-no-gateway', 'Enable remote access before starting the tunnel.')
+        }
+      }
+    }
+    if (body.mode !== undefined) candidate.mode = body.mode
+    if (body.binaryPath !== undefined) candidate.binaryPath = body.binaryPath
+    if (body.publicUrl !== undefined) candidate.publicUrl = body.publicUrl
+
+    const validated = validateTunnel(candidate)
+    if (!validated.ok) throw adminError('admin/invalid-tunnel', validated.message)
+
+    if (body.token !== undefined) {
+      const token = body.token === null ? '' : body.token
+      if (typeof token !== 'string') {
+        throw adminError('admin/invalid-tunnel', 'the tunnel token must be a string')
+      }
+      if (token.trim().length > TUNNEL_TOKEN_MAX) {
+        throw adminError('admin/invalid-tunnel', 'the tunnel token is too long')
+      }
+      /* The API validates the same grammar the file writer uses, so a stub or a
+         future controller cannot make a malformed token look saved. */
+      if (token.trim() !== '' && !isValidTunnelToken(token)) {
+        throw adminError('admin/invalid-tunnel', 'the tunnel token is not usable')
+      }
+      try {
+        controller.writeToken(token)
+      } catch (error) {
+        if (codeOf(error) === 'tunnel/token-invalid') {
+          throw adminError('admin/invalid-tunnel', 'the tunnel token is not usable')
+        }
+        log('error', `[remote-control] tunnel token could not be saved (${codeOf(error)})`)
+        throw adminError('admin/tunnel-storage', 'The tunnel token could not be saved.')
+      }
+    }
+
+    const settings = store.updateSettings({ tunnel: validated.tunnel })
+    let status = null
+    if (applyTunnelChange !== null) {
+      try {
+        status = await applyTunnelChange({
+          before: before.tunnel,
+          after: settings.tunnel,
+          tokenChanged: body.token !== undefined,
+        })
+      } catch (error) {
+        const restored = revertTunnelSettings(before.tunnel)
+        log('error', `[remote-control] tunnel configuration could not be applied (${codeOf(error)}); `
+          + (restored ? 'the previous setting was restored' : 'the settings file was NOT restored'))
+        throw adminError('admin/tunnel-failed', 'The tunnel configuration could not be applied.')
+      }
+    }
+    return { status: 200, data: { tunnel: status ?? controller.describe() } }
+  }
+
+  /**
+   * POST /tunnel/download — install the official binary into the runtime directory.
+   *
+   * A deliberate user action, never a startup step (`prd.md` R5). Refused while a
+   * process is live, because replacing a running executable is a Windows failure
+   * and "downloaded but still running the old build" would be a lie.
+   *
+   * @returns {Promise<{ status: number, data: object }>}
+   */
+  async function downloadTunnel() {
+    const controller = requireTunnel()
+    if (typeof controller.download !== 'function') {
+      throw adminError('admin/tunnel-unavailable', 'This host cannot download a managed tunnel binary.')
+    }
+    try {
+      const result = await controller.download()
+      const status = controller.describe()
+      return {
+        status: 200,
+        data: {
+          binary: status.binary,
+          version: result !== null && typeof result === 'object' && typeof result.version === 'string'
+            ? result.version
+            : '',
+        },
+      }
+    } catch (error) {
+      if (codeOf(error) === 'tunnel/busy') {
+        throw adminError('admin/tunnel-busy', 'Stop the tunnel before downloading a new binary.')
+      }
+      log('error', `[remote-control] cloudflared download failed (${codeOf(error)})`)
+      throw adminError('admin/tunnel-download-failed', 'cloudflared could not be downloaded.')
+    }
   }
 
   /**
@@ -952,6 +1214,30 @@ export function startAdminApi(options) {
           }
           throw adminError('admin/not-found', 'there is no such endpoint')
         }
+        case 'tunnel': {
+          if (tail.length === 0) {
+            if (method === 'GET') {
+              respond(res, getTunnelStatus())
+              return
+            }
+            requireMethod(method, ['POST'])
+            const body = parseBody(await readBody(req))
+            respond(res, await tunnelAction(body))
+            return
+          }
+          if (tail.length === 1 && tail[0] === 'config') {
+            requireMethod(method, ['POST'])
+            const body = parseBody(await readBody(req))
+            respond(res, await updateTunnelConfig(body))
+            return
+          }
+          if (tail.length === 1 && tail[0] === 'download') {
+            requireMethod(method, ['POST'])
+            respond(res, await downloadTunnel())
+            return
+          }
+          throw adminError('admin/not-found', 'there is no such endpoint')
+        }
         case 'settings': {
           if (tail.length !== 0) throw adminError('admin/not-found', 'there is no such endpoint')
           if (method === 'GET') {
@@ -1074,12 +1360,24 @@ export function startAdminApi(options) {
       case 'admin/invalid-argument':
       /* A malformed access address is the caller's input, not a server fault:
          reporting 500 would send the user to the host log for a typo. */
-      case 'admin/invalid-access': return 400
+      case 'admin/invalid-access':
+      /* Tunnel configuration the strict reader refuses — the caller's input, so
+         400, and nothing was written (`design.md` §6). */
+      case 'admin/invalid-tunnel':
+      case 'admin/tunnel-action': return 400
       case 'admin/unknown-device': return 404
       /* The listener refused the requested port (or could not bind at all). A
          conflict with the machine's current state, not a malformed request and not
          our bug, so 409 — the panel's `gatewayDown` notice is the right one. */
       case 'admin/listener-failed': return 409
+      /* The tunnel is running while the caller wants to replace its binary, or the
+         gateway is not listening, so there is nothing to point a tunnel at yet. */
+      case 'admin/tunnel-busy':
+      case 'admin/tunnel-no-gateway': return 409
+      /* Download failed at the network / digest / install step. Not the caller's
+         input, but not our bug either: 502 is the honest "upstream failed" answer
+         and the panel shows the code. */
+      case 'admin/tunnel-download-failed': return 502
       case 'admin/loopback-only':
       case 'admin/cross-origin': return 403
       default: return 500

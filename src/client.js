@@ -276,6 +276,40 @@ window.__ModuleLoader__.load({
       'unknown',
     ]
 
+    /**
+     * Stable tunnel codes → locale keys.
+     *
+     * The host publishes `tunnel/*` codes for the PROCESS's state (not an HTTP
+     * error) and `admin/tunnel-*` codes for a refused action. Rendering the code
+     * itself would put English host text in a localized panel; rendering nothing
+     * would leave "failed" with no cause. This map is the one place the two
+     * vocabularies meet, and an unknown code falls back to a generic sentence plus
+     * the code shown separately, so a future host code is visible instead of blank.
+     */
+    const TUNNEL_ERROR_KEYS = {
+      'tunnel/binary-missing': 'tunnel.error.binaryMissing',
+      'tunnel/token-missing': 'tunnel.error.tokenMissing',
+      'tunnel/token-invalid': 'tunnel.error.tokenInvalid',
+      'tunnel/url-missing': 'tunnel.error.urlMissing',
+      'tunnel/start-timeout': 'tunnel.error.startTimeout',
+      'tunnel/spawn-failed': 'tunnel.error.spawnFailed',
+      'tunnel/exited': 'tunnel.error.exited',
+      'tunnel/no-port': 'tunnel.error.noPort',
+      'tunnel/download-failed': 'tunnel.error.downloadFailed',
+      'tunnel/unsupported-platform': 'tunnel.error.unsupportedPlatform',
+      'tunnel/storage': 'tunnel.error.storage',
+      'tunnel/busy': 'tunnel.error.busy',
+      'admin/invalid-tunnel': 'tunnel.error.invalidConfig',
+      'admin/tunnel-no-gateway': 'tunnel.gatewayOff',
+      'admin/tunnel-busy': 'tunnel.error.busy',
+      'admin/tunnel-download-failed': 'tunnel.error.downloadFailed',
+      'admin/tunnel-storage': 'tunnel.error.storage',
+      'admin/tunnel-failed': 'tunnel.error.actionFailed',
+    }
+
+    /** The four states the host reports. Anything else is rendered as `stopped`. */
+    const TUNNEL_STATES = ['stopped', 'starting', 'running', 'failed']
+
     /* ------------------------------------------------------------------ *
      * Dictionaries
      *
@@ -316,10 +350,66 @@ window.__ModuleLoader__.load({
       'address.delete': '删除',
       'address.inUse': '使用中',
       'address.goManage': '去「接入」添加',
+      'address.goTunnel': '去「接入」启用',
+      'address.tunnelOff': '先在「接入」里启用 Cloudflare Tunnel，才能把它选作接入地址。',
       'address.invalid': '地址只能填 host、host:port 或 http(s)://host[:port]，不能带路径、查询、锚点、用户名，端口需在 1 到 65535 之间。',
       'address.tooMany': '最多只能保存 {max} 条公网地址。',
       'address.publicHint': '公网地址需要你自己做端口映射或 TLS 反向代理；本插件不检测可达性，链接打不开不代表配对有问题。',
       'address.staleHint': '保存的局域网地址 {address} 现在不在本机网卡列表里，链接暂时改用当前可用的地址。',
+      'address.modeTunnel': 'Cloudflare',
+      'tunnel.heading': 'Cloudflare Tunnel',
+      'tunnel.hint': '启用后，公网流量经过 Cloudflare 转发到本机网关；配对、鉴权、吊销与审计仍由本插件负责。',
+      'tunnel.enable': '启用隧道',
+      'tunnel.disable': '关闭隧道',
+      'tunnel.restart': '重新启动',
+      'tunnel.state.stopped': '已关闭',
+      'tunnel.state.starting': '正在启动，等待公网地址…',
+      'tunnel.state.running': '运行中',
+      'tunnel.state.failed': '启动失败',
+      'tunnel.url': '公网地址',
+      'tunnel.copy': '复制',
+      'tunnel.copied': '已复制',
+      'tunnel.mode': '隧道类型',
+      'tunnel.mode.quick': '快速隧道',
+      'tunnel.mode.token': '具名隧道（Token）',
+      'tunnel.token': 'Token',
+      'tunnel.tokenSet': '已保存',
+      'tunnel.tokenUnset': '未填写',
+      'tunnel.tokenInvalidState': '文件内容不可用',
+      'tunnel.tokenHint': 'Token 只保存在本机数据目录（0600），面板不会回显。',
+      'tunnel.publicUrl': '公开主机名',
+      'tunnel.publicUrlHint': '填 Cloudflare 控制台里为该隧道配置的公开主机名，例如 https://dsh.example.com。',
+      'tunnel.binary': 'cloudflared',
+      'tunnel.binary.custom': '自定义路径',
+      'tunnel.binary.path': '系统 PATH',
+      'tunnel.binary.downloaded': '已下载',
+      'tunnel.binary.missing': '未找到',
+      'tunnel.download': '下载 cloudflared',
+      'tunnel.downloading': '下载中…',
+      'tunnel.downloaded': '已下载 {version}',
+      'tunnel.binaryPath': '自定义路径',
+      'tunnel.binaryPathHint': '留空则按 PATH → 已下载副本的顺序查找；填了但不存在会直接报错，不会回退。',
+      'tunnel.binaryCustomMissing': '自定义路径优先；它不存在时不会回退到 PATH 或已下载副本。请修正或清空后再试。',
+      'tunnel.save': '保存隧道设置',
+      'tunnel.saved': '已保存。',
+      'tunnel.quickHint': '快速隧道不需要账号，但域名每次启动都会变，已配对设备需要重新配对。',
+      'tunnel.namedHint': '具名隧道需要先在 Cloudflare 控制台创建隧道、配置公开主机名，再把 Token 填到这里。',
+      'tunnel.gatewayOff': '先在上方启用远程接入，隧道才有可转发的本地端口。',
+      'tunnel.error.binaryMissing': '没有找到 cloudflared：请安装、填写路径，或用下面的按钮下载。',
+      'tunnel.error.invalidConfig': '隧道设置无效，请检查模式、路径、公开主机名与 Token。',
+      'tunnel.error.tokenMissing': '具名隧道需要 Token。',
+      'tunnel.error.tokenInvalid': '保存的 Token 不可用，请重新填写。',
+      'tunnel.error.urlMissing': '具名隧道需要填写公开主机名。',
+      'tunnel.error.startTimeout': 'cloudflared 启动后没有在 30 秒内给出公网地址。',
+      'tunnel.error.spawnFailed': 'cloudflared 无法启动，请检查路径与执行权限。',
+      'tunnel.error.exited': 'cloudflared 进程已退出，隧道不再可用；请检查 Token 与网络后重试。',
+      'tunnel.error.noPort': '网关没有可用的监听端口。',
+      'tunnel.error.downloadFailed': '下载失败：网络、摘要校验或写入磁盘任一步没有完成。',
+      'tunnel.error.unsupportedPlatform': 'Cloudflare 没有为当前平台/架构发布 cloudflared。',
+      'tunnel.error.storage': '隧道 Token 无法写入数据目录。',
+      'tunnel.error.busy': '隧道正在运行，先关闭再替换 cloudflared。',
+      'tunnel.error.actionFailed': '隧道操作没有生效，之前的设置已恢复。',
+      'tunnel.error.unknown': '隧道遇到未知错误。',
       'pair.heading': '添加设备',
       'pair.add': '生成配对码',
       'pair.hint': '在这台设备上输入下面的配对码，或直接打开链接。配对码一次性、两分钟内有效。',
@@ -335,6 +425,8 @@ window.__ModuleLoader__.load({
       'pair.needGateway': '先启用远程接入，否则生成的链接没有可连接的端口。',
       'pair.loopbackHint': '此链接里的 127.0.0.1 需要换成这台机器的局域网 IP，手机才能打开。',
       'pair.publicHint': '这条链接用的是你选定的公网地址；能否打开取决于你自己的端口映射或反向代理，本插件不检测可达性。',
+      'pair.tunnelDown': '隧道当前没有运行，先在「接入」里启用 Cloudflare Tunnel。',
+      'pair.tunnelHint': '这条链接走 Cloudflare Tunnel；快速隧道的域名每次启动可能变化，已配对设备需要重新配对。',
       'pair.cancel': '取消',
       'pair.refresh': '刷新',
       'pair.refreshing': '刷新中…',
@@ -442,10 +534,66 @@ window.__ModuleLoader__.load({
       'address.delete': 'Delete',
       'address.inUse': 'In use',
       'address.goManage': 'Add one in 接入',
+      'address.goTunnel': 'Enable it in 接入',
+      'address.tunnelOff': 'Enable Cloudflare Tunnel under 接入 before choosing it as the access address.',
       'address.invalid': 'An address is a host, host:port or http(s)://host[:port] — no path, query, fragment or userinfo, with a port between 1 and 65535.',
       'address.tooMany': 'At most {max} public addresses can be saved.',
       'address.publicHint': 'A public address needs your own port forwarding or TLS reverse proxy. This plugin never checks reachability, so a link that will not open is not a pairing fault.',
       'address.staleHint': 'The saved LAN address {address} is not on this machine any more; the link uses an address that is available right now.',
+      'address.modeTunnel': 'Cloudflare',
+      'tunnel.heading': 'Cloudflare Tunnel',
+      'tunnel.hint': 'When enabled, public traffic is relayed through Cloudflare to the local gateway; pairing, access control, revocation and audit stay in this plugin.',
+      'tunnel.enable': 'Enable tunnel',
+      'tunnel.disable': 'Stop tunnel',
+      'tunnel.restart': 'Restart',
+      'tunnel.state.stopped': 'Stopped',
+      'tunnel.state.starting': 'Starting, waiting for a public URL…',
+      'tunnel.state.running': 'Running',
+      'tunnel.state.failed': 'Failed to start',
+      'tunnel.url': 'Public URL',
+      'tunnel.copy': 'Copy',
+      'tunnel.copied': 'Copied',
+      'tunnel.mode': 'Tunnel type',
+      'tunnel.mode.quick': 'Quick tunnel',
+      'tunnel.mode.token': 'Named tunnel (token)',
+      'tunnel.token': 'Token',
+      'tunnel.tokenSet': 'Saved',
+      'tunnel.tokenUnset': 'Not set',
+      'tunnel.tokenInvalidState': 'Stored file is not usable',
+      'tunnel.tokenHint': 'The token is stored only in the local data directory (0600) and is never echoed back.',
+      'tunnel.publicUrl': 'Public hostname',
+      'tunnel.publicUrlHint': 'Enter the public hostname configured for this tunnel in the Cloudflare dashboard, e.g. https://dsh.example.com.',
+      'tunnel.binary': 'cloudflared',
+      'tunnel.binary.custom': 'custom path',
+      'tunnel.binary.path': 'system PATH',
+      'tunnel.binary.downloaded': 'downloaded',
+      'tunnel.binary.missing': 'not found',
+      'tunnel.download': 'Download cloudflared',
+      'tunnel.downloading': 'Downloading…',
+      'tunnel.downloaded': 'Downloaded {version}',
+      'tunnel.binaryPath': 'Custom path',
+      'tunnel.binaryPathHint': 'Leave empty to look on PATH, then at the downloaded copy. A path that does not exist is an error, never a fallback.',
+      'tunnel.binaryCustomMissing': 'A custom path wins; when it does not exist there is no fallback to PATH or the downloaded copy. Fix or clear it, then retry.',
+      'tunnel.save': 'Save tunnel settings',
+      'tunnel.saved': 'Saved.',
+      'tunnel.quickHint': 'A quick tunnel needs no account, but its hostname changes on every start — paired devices have to pair again.',
+      'tunnel.namedHint': 'A named tunnel needs a tunnel and a public hostname created in the Cloudflare dashboard; paste its token here.',
+      'tunnel.gatewayOff': 'Enable remote access above first; the tunnel needs a local port to forward to.',
+      'tunnel.error.binaryMissing': 'cloudflared was not found: install it, set a path, or use the download button below.',
+      'tunnel.error.invalidConfig': 'Invalid tunnel settings; check the mode, path, public hostname and token.',
+      'tunnel.error.tokenMissing': 'A named tunnel needs a token.',
+      'tunnel.error.tokenInvalid': 'The stored token is not usable; enter it again.',
+      'tunnel.error.urlMissing': 'A named tunnel needs a public hostname.',
+      'tunnel.error.startTimeout': 'cloudflared did not report a public URL within 30 seconds.',
+      'tunnel.error.spawnFailed': 'cloudflared could not be started; check the path and its execute permission.',
+      'tunnel.error.exited': 'The cloudflared process exited, so the tunnel is no longer available. Check the token and network, then retry.',
+      'tunnel.error.noPort': 'The gateway has no listening port.',
+      'tunnel.error.downloadFailed': 'The download failed: network, digest verification or writing to disk did not complete.',
+      'tunnel.error.unsupportedPlatform': 'Cloudflare does not publish cloudflared for this platform/architecture.',
+      'tunnel.error.storage': 'The tunnel token could not be written to the data directory.',
+      'tunnel.error.busy': 'The tunnel is running; stop it before replacing cloudflared.',
+      'tunnel.error.actionFailed': 'The tunnel action did not apply; the previous setting was restored.',
+      'tunnel.error.unknown': 'The tunnel hit an unknown error.',
       'pair.heading': 'Add a device',
       'pair.add': 'Generate pairing code',
       'pair.hint': 'Type the code below on the device, or just open the link. The code is single use and expires in two minutes.',
@@ -461,6 +609,8 @@ window.__ModuleLoader__.load({
       'pair.needGateway': 'Enable remote access first, or the generated link has no port to connect to.',
       'pair.loopbackHint': 'Replace 127.0.0.1 in this link with this machine LAN address so a phone can open it.',
       'pair.publicHint': 'This link uses the public address you selected. Whether it opens depends on your own port forwarding or reverse proxy — this plugin does not check reachability.',
+      'pair.tunnelDown': 'The tunnel is not running; enable Cloudflare Tunnel under 接入 first.',
+      'pair.tunnelHint': 'This link goes through the Cloudflare Tunnel. A quick tunnel hostname changes on every start, so paired devices have to pair again.',
       'pair.cancel': 'Cancel',
       'pair.refresh': 'Refresh',
       'pair.refreshing': 'Refreshing…',
@@ -557,7 +707,7 @@ window.__ModuleLoader__.load({
      * reachability the plugin cannot check.
      *
      * @param {object | null} settings
-     * @returns {{ mode: 'lan' | 'public', lanAddress: string, public: object[], selectedPublicId: string | null }}
+     * @returns {{ mode: 'lan' | 'public' | 'tunnel', lanAddress: string, public: object[], selectedPublicId: string | null }}
      */
     function accessOf(settings) {
       const fallback = defaultAccess()
@@ -575,8 +725,12 @@ window.__ModuleLoader__.load({
             address: entry.address,
           }))
         : []
+      /* `tunnel` is the runtime-address mode added with the managed Cloudflare
+         Tunnel. An unrecognized value still degrades to `lan` — never to a mode
+         whose reachability this plugin cannot reason about. */
+      const mode = access.mode === 'public' || access.mode === 'tunnel' ? access.mode : 'lan'
       return {
-        mode: access.mode === 'public' ? 'public' : 'lan',
+        mode,
         lanAddress: typeof access.lanAddress === 'string' ? access.lanAddress : '',
         public: book,
         selectedPublicId: typeof access.selectedPublicId === 'string' ? access.selectedPublicId : null,
@@ -690,13 +844,19 @@ window.__ModuleLoader__.load({
      *
      * @param {object | null} access
      * @param {object[]} [lan]
+     * @param {string | null} [tunnelUrl] Live managed-tunnel URL, or null/empty.
      * @returns {string | null}
      */
-    function effectiveAddress(access, lan) {
+    function effectiveAddress(access, lan, tunnelUrl) {
       const settings = access !== null && typeof access === 'object' ? access : {}
       const list = Array.isArray(lan)
         ? lan.filter((entry) => entry !== null && typeof entry === 'object' && typeof entry.address === 'string')
         : []
+
+      if (settings.mode === 'tunnel') {
+        const text = typeof tunnelUrl === 'string' ? tunnelUrl.trim() : ''
+        return text === '' ? null : text
+      }
 
       if (settings.mode === 'public') {
         const book = Array.isArray(settings.public)
@@ -902,8 +1062,9 @@ window.__ModuleLoader__.load({
      * @param {{ fragment?: string, pairPath?: string, port?: number | null } | null} pairing
      * @param {string | null} addressText Effective address, or null for none.
      * @param {string} fallbackHref Page base, used only by the legacy fallback.
-     * @param {'lan' | 'public'} [mode] Which kind of address `addressText` is: a public
-     *   one is used as written, a LAN one gets the gateway port when it names none.
+     * @param {'lan' | 'public' | 'tunnel'} [mode] Which kind of address `addressText`
+     *   is: a public or tunnel one is used as written, a LAN one gets the gateway port
+     *   when it names none.
      * @returns {string | null} null when the inputs cannot form a URL.
      */
     function pairingUrl(pairing, addressText, fallbackHref, mode) {
@@ -917,18 +1078,19 @@ window.__ModuleLoader__.load({
       if (address !== null) {
         const scheme = address.scheme === null ? 'http' : address.scheme
         const gatewayPort = Number.isInteger(pairing.port) && pairing.port > 0 ? pairing.port : null
-        /* The MODE decides whether the gateway port is implied, because the two kinds
-           of address are different animals:
+        /* The MODE decides whether the gateway port is implied, because the kinds of
+           address are different animals:
              - LAN  `192.168.9.77` means "this host, on the gateway port" — the port is
                part of what the user is pointing at, so it is filled in;
              - public `https://dsh.example.de` means "whatever my proxy serves" — the
                port is 443 (or a port the user typed) and is not ours to guess. Appending
                3090 produced `https://host:3090/...`, a URL the proxy does not serve
-               (2026-10-19, reported from a live panel).
-           An explicit port always wins, in both modes. */
-        const port = address.port !== null
-          ? address.port
-          : (mode === 'public' ? null : gatewayPort)
+               (2026-10-19, reported from a live panel);
+             - tunnel `https://xxx.trycloudflare.com` is the same shape as public: the
+               Cloudflare edge owns the port, and the URL is used exactly as printed.
+           An explicit port always wins, in every mode. */
+        const appendPort = mode !== 'public' && mode !== 'tunnel'
+        const port = address.port !== null ? address.port : (appendPort ? gatewayPort : null)
         return scheme + '://' + address.host + (port === null ? '' : ':' + port) + pairPath + '#' + fragment
       }
 
@@ -2161,6 +2323,14 @@ window.__ModuleLoader__.load({
          line and read as belonging to the next section. */
       '.drc-inline{display:flex;align-items:center;gap:6px;min-width:0}',
       '.drc-emptyAction{display:flex;flex-direction:column;align-items:flex-start;gap:8px}',
+      /* The managed tunnel card: status and its timestamp on one wrap-friendly row,
+         the binary source on another, and the configuration fields stacked so a
+         long path or hostname does not squeeze the label. */
+      '.drc-tunnelStatus{display:flex;align-items:baseline;flex-wrap:wrap;gap:4px 10px}',
+      '.drc-tunnelState{margin:0;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary)}',
+      '.drc-tunnelStateFailed{color:var(--dsw-alias-state-error-primary)}',
+      '.drc-tunnelRow{display:flex;align-items:center;flex-wrap:wrap;gap:8px}',
+      '.drc-tunnelFields{display:flex;flex-direction:column;gap:10px}',
       '.drc-linkInput{box-sizing:border-box;flex:1;width:auto;min-width:0;height:28px;padding:0 8px;border:1px dashed var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-link);font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px}',
       '.drc-devices{display:flex;flex-direction:column;margin:0;padding:0;list-style:none}',
       '.drc-device{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 0;border-bottom:1px solid var(--dsw-alias-border-l1)}',
@@ -2178,8 +2348,8 @@ window.__ModuleLoader__.load({
          old duplicate "已吊销" meta line is gone. */
       '.drc-deviceRevoked{opacity:.62}',
       '.drc-deviceActions{display:flex;flex:none;align-items:center;gap:6px}',
-      /* Address controls: two mutually exclusive modes (LAN / public), so a
-         segmented pair rather than a dropdown — the mode is a choice between two
+      /* Address controls: mutually exclusive modes (LAN / public / managed tunnel),
+         so a segmented group rather than a dropdown — the mode is a choice between
          named things, not a selection from a list. */
       '.drc-segments{display:flex;gap:4px;padding:2px;border:1px solid var(--dsw-alias-border-l2);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}',
       '.drc-segment{flex:1;box-sizing:border-box;height:26px;padding:0 10px;border:none;border-radius:8px;background:none;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;cursor:pointer}',
@@ -2542,7 +2712,60 @@ window.__ModuleLoader__.load({
         }
       }, [load])
 
-      return { snapshot, refresh: load, revokeDevice, updateSettings }
+      /**
+       * Drive the managed tunnel (`start` / `stop` / `restart`), then re-read.
+       *
+       * The returned status is deliberately NOT merged into local state: a failed
+       * start is a real state the host reports, and the next `GET /state` is the
+       * only authority on it (`quality-guidelines.md` frontend — no optimistic UI).
+       */
+      const tunnelAction = useCallback(async (action) => {
+        try {
+          await requestJson('tunnel', { method: 'POST', body: { action } })
+          await load()
+          return { ok: true, failure: null }
+        } catch (error) {
+          return { ok: false, failure: describeFailure(error) }
+        }
+      }, [load])
+
+      /** Persist tunnel mode / path / hostname / token, then re-read. */
+      const updateTunnelConfig = useCallback(async (patch) => {
+        try {
+          await requestJson('tunnel/config', { method: 'POST', body: patch })
+          await load()
+          return { ok: true, failure: null }
+        } catch (error) {
+          return { ok: false, failure: describeFailure(error) }
+        }
+      }, [load])
+
+      /** Download the official cloudflared into the runtime directory. */
+      const downloadTunnel = useCallback(async () => {
+        try {
+          const data = await requestJson('tunnel/download', { method: 'POST' })
+          await load()
+          return {
+            ok: true,
+            version: data !== null && typeof data === 'object' && typeof data.version === 'string'
+              ? data.version
+              : '',
+            failure: null,
+          }
+        } catch (error) {
+          return { ok: false, version: '', failure: describeFailure(error) }
+        }
+      }, [load])
+
+      return {
+        snapshot,
+        refresh: load,
+        revokeDevice,
+        updateSettings,
+        tunnelAction,
+        updateTunnelConfig,
+        downloadTunnel,
+      }
     }
 
     /**
@@ -2827,9 +3050,12 @@ window.__ModuleLoader__.load({
      * @param {(key: string, params?: object) => string} props.t
      * @param {{ enabled: boolean, port: number } | null} props.settings
      * @param {{ lan?: object[] } | null} props.addresses
+     * @param {object | null} [props.tunnel] The host's tunnel snapshot (`state`/`url`).
      * @param {(patch: object) => Promise<{ ok: boolean, failure: object | null }>} props.updateSettings
+     * @param {() => void} [props.onManagePublic]
+     * @param {() => void} [props.onManageTunnel]
      */
-    function AccessPointSection({ t, settings, addresses, updateSettings, onManagePublic }) {
+    function AccessPointSection({ t, settings, addresses, tunnel, updateSettings, onManagePublic, onManageTunnel }) {
       const [busy, setBusy] = useState(false)
       const [outcome, setOutcome] = useState(null)
 
@@ -2844,7 +3070,12 @@ window.__ModuleLoader__.load({
       const selectedPublicId = publicRows.some((row) => row.id === access.selectedPublicId)
         ? access.selectedPublicId
         : (publicRows.length > 0 ? publicRows[0].id : '')
-      const effective = effectiveAddress(access, lan)
+      const tunnelUrl = tunnel !== null && typeof tunnel === 'object' && typeof tunnel.url === 'string'
+        ? tunnel.url
+        : ''
+      const tunnelLive = tunnel !== null && typeof tunnel === 'object'
+        && tunnel.state === 'running' && tunnelUrl !== ''
+      const effective = effectiveAddress(access, lan, tunnelUrl)
       /* The stored LAN choice is no longer on this machine. The link silently falls
          back (that is right — a link that works beats a link that matches), but
          saying nothing would leave the user wondering why the dropdown shows an
@@ -2882,14 +3113,19 @@ window.__ModuleLoader__.load({
         void commit({ mode: 'public', lanAddress: access.lanAddress, public: publicRows, selectedPublicId: id })
       }
 
-      /** A segment of the LAN/public switch. */
-      const segment = (mode, labelKey) => h('button', {
+      const onPickTunnel = () => {
+        if (busy || known !== true || tunnelLive !== true) return
+        void commit({ mode: 'tunnel', lanAddress: access.lanAddress, public: publicRows, selectedPublicId: access.selectedPublicId })
+      }
+
+      /** A segment of the LAN/public/tunnel switch. */
+      const segment = (mode, labelKey, enabled = true) => h('button', {
         key: mode,
         type: 'button',
         className: access.mode === mode ? 'drc-segment drc-segmentActive' : 'drc-segment',
         'aria-pressed': access.mode === mode,
-        disabled: busy || known !== true,
-        onClick: () => onMode(mode),
+        disabled: busy || known !== true || enabled !== true,
+        onClick: () => (mode === 'tunnel' ? onPickTunnel() : onMode(mode)),
       }, t(labelKey))
 
       /** What the LAN dropdown shows: the resolved address, so it never reads blank. */
@@ -2937,6 +3173,25 @@ window.__ModuleLoader__.load({
         }, publicRows.map((row) => h('option', { key: row.id, value: row.id },
           row.label === '' ? row.address : row.label + ' · ' + row.address)))
 
+      /* Selecting the tunnel mode without a live tunnel would produce a link to
+         nowhere, so the picker is replaced by the one action that fixes it. */
+      const tunnelPicker = tunnelLive
+        ? h('div', { className: 'drc-field' },
+          h('span', { className: 'drc-label' }, t('tunnel.url')),
+          h('p', { className: 'drc-publicAddress' }, tunnelUrl),
+          h('p', { className: 'drc-hint' }, t('pair.tunnelHint')),
+        )
+        : h('div', { className: 'drc-emptyAction' },
+          h('p', { className: 'drc-hint' }, t('pair.tunnelDown')),
+          typeof onManageTunnel === 'function'
+            ? h('button', {
+              type: 'button',
+              className: 'drc-button',
+              onClick: () => onManageTunnel(),
+            }, t('address.goTunnel'))
+            : null,
+        )
+
       let outcomeNode = null
       if (outcome !== null) {
         outcomeNode = outcome.tone === 'ok'
@@ -2953,8 +3208,14 @@ window.__ModuleLoader__.load({
         },
           segment('lan', 'address.modeLan'),
           segment('public', 'address.modePublic'),
+          segment('tunnel', 'address.modeTunnel', tunnelLive),
         ),
-        access.mode === 'public' ? publicPicker : lanPicker,
+        access.mode === 'public'
+          ? publicPicker
+          : (access.mode === 'tunnel' ? tunnelPicker : lanPicker),
+        tunnelLive !== true && access.mode !== 'tunnel'
+          ? h('p', { className: 'drc-hint' }, t('address.tunnelOff'))
+          : null,
         stale ? h('p', { className: 'drc-hint' }, t('address.staleHint', { address: access.lanAddress })) : null,
         outcomeNode,
       )
@@ -3124,6 +3385,362 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /** Locale key for a stable tunnel/admin code, or the generic fallback. */
+    function tunnelErrorKey(code) {
+      if (typeof code !== 'string') return 'tunnel.error.unknown'
+      return Object.prototype.hasOwnProperty.call(TUNNEL_ERROR_KEYS, code)
+        ? TUNNEL_ERROR_KEYS[code]
+        : 'tunnel.error.unknown'
+    }
+
+    /**
+     * The managed Cloudflare Tunnel card.
+     *
+     * Three things share this card because they are one decision: whether the
+     * tunnel runs, how it is configured, and what it is currently reachable at.
+     * Splitting them across tabs would make 「启用」 depend on a setting the user
+     * cannot see.
+     *
+     * Drafts follow the server value until the user types (`draft === null`), and a
+     * successful save resets them to null so the next poll's value wins. Nothing is
+     * updated optimistically: the card renders whatever `GET /state` last reported,
+     * which is what makes `failed` trustworthy (`quality-guidelines.md` frontend).
+     *
+     * @param {object} props
+     * @param {(key: string, params?: object) => string} props.t
+     * @param {object | null} props.settings
+     * @param {object | null} props.tunnel `GET /state`'s `tunnel` snapshot.
+     * @param {object | null} props.gateway
+     * @param {(action: string) => Promise<{ ok: boolean, failure: object | null }>} props.tunnelAction
+     * @param {(patch: object) => Promise<{ ok: boolean, failure: object | null }>} props.updateTunnelConfig
+     * @param {() => Promise<{ ok: boolean, version: string, failure: object | null }>} props.downloadTunnel
+     */
+    function TunnelSection({ t, settings, tunnel, gateway, tunnelAction, updateTunnelConfig, downloadTunnel }) {
+      const known = settings !== null && typeof settings === 'object'
+      const stored = known && settings.tunnel !== null && typeof settings.tunnel === 'object'
+        ? settings.tunnel
+        : { enabled: false, mode: 'quick', binaryPath: '', publicUrl: '' }
+      const status = tunnel !== null && typeof tunnel === 'object' ? tunnel : null
+      const state = status !== null && typeof status.state === 'string' && TUNNEL_STATES.includes(status.state)
+        ? status.state
+        : 'stopped'
+      const enabled = status !== null ? status.enabled === true : stored.enabled === true
+      /* `starting` is not a restartable state: the controller would queue the
+         restart behind an in-flight start that may be waiting 30 s for a URL. */
+      const canRestart = state === 'running' || state === 'failed'
+      const url = status !== null && typeof status.url === 'string' ? status.url : ''
+      const binary = status !== null && status.binary !== null && typeof status.binary === 'object'
+        ? status.binary
+        : { available: false, source: 'missing', path: null }
+      const tokenSet = status !== null && status.tokenSet === true
+      const tokenState = status !== null && typeof status.tokenState === 'string'
+        ? status.tokenState
+        : (tokenSet ? 'ok' : 'none')
+      const tokenInvalid = tokenState === 'invalid'
+      const errorCode = status !== null && status.error !== null && typeof status.error === 'object'
+        && typeof status.error.code === 'string'
+        ? status.error.code
+        : null
+      const gatewayLive = gateway !== null && typeof gateway === 'object' && gateway.listening === true
+
+      const [modeDraft, setModeDraft] = useState(null)
+      const [publicUrlDraft, setPublicUrlDraft] = useState(null)
+      const [binaryPathDraft, setBinaryPathDraft] = useState(null)
+      const [tokenDraft, setTokenDraft] = useState('')
+      const [busy, setBusy] = useState(null)
+      const [outcome, setOutcome] = useState(null)
+      const [copied, setCopied] = useState(false)
+
+      const mode = modeDraft !== null ? modeDraft : (stored.mode === 'token' ? 'token' : 'quick')
+      const publicUrlText = publicUrlDraft !== null ? publicUrlDraft : (typeof stored.publicUrl === 'string' ? stored.publicUrl : '')
+      const binaryPathText = binaryPathDraft !== null ? binaryPathDraft : (typeof stored.binaryPath === 'string' ? stored.binaryPath : '')
+
+      const patchNow = () => {
+        const patch = {
+          mode,
+          publicUrl: publicUrlText,
+          binaryPath: binaryPathText,
+        }
+        if (tokenDraft.trim() !== '') patch.token = tokenDraft.trim()
+        return patch
+      }
+
+      const resetDrafts = () => {
+        setModeDraft(null)
+        setPublicUrlDraft(null)
+        setBinaryPathDraft(null)
+        setTokenDraft('')
+      }
+
+      const save = async () => {
+        const result = await updateTunnelConfig(patchNow())
+        if (result.ok !== true) {
+          setOutcome({ tone: 'error', failure: result.failure })
+          return false
+        }
+        resetDrafts()
+        setOutcome({ tone: 'ok' })
+        return true
+      }
+
+      const onSave = async () => {
+        if (busy !== null) return
+        setBusy('save')
+        setOutcome(null)
+        await save()
+        setBusy(null)
+      }
+
+      const onAction = async (action) => {
+        if (busy !== null) return
+        setBusy(action)
+        setOutcome(null)
+        /* start/restart persist the drafts first: "enable" with an unsaved mode or
+           token would otherwise start something the user did not configure. */
+        if (action !== 'stop') {
+          const saved = await save()
+          if (!saved) {
+            setBusy(null)
+            return
+          }
+        }
+        const result = await tunnelAction(action)
+        setBusy(null)
+        setOutcome(result.ok === true ? { tone: 'ok' } : { tone: 'error', failure: result.failure })
+      }
+
+      const onDownload = async () => {
+        if (busy !== null) return
+        setBusy('download')
+        setOutcome(null)
+        const result = await downloadTunnel()
+        setBusy(null)
+        setOutcome(result.ok === true
+          ? { tone: 'downloaded', version: result.version }
+          : { tone: 'error', failure: result.failure })
+      }
+
+      const onClearToken = async () => {
+        if (busy !== null) return
+        setBusy('token')
+        setOutcome(null)
+        const result = await updateTunnelConfig({ token: null })
+        setBusy(null)
+        setOutcome(result.ok === true ? { tone: 'ok' } : { tone: 'error', failure: result.failure })
+      }
+
+      const copyUrl = async () => {
+        setCopied(false)
+        try {
+          if (typeof navigator === 'undefined' || navigator.clipboard === undefined
+            || typeof navigator.clipboard.writeText !== 'function') {
+            throw new Error('clipboard unavailable')
+          }
+          await navigator.clipboard.writeText(url)
+          setCopied(true)
+        } catch {
+          /* The URL is on screen and selectable; a failed copy is not worth an alert. */
+          setCopied(false)
+        }
+      }
+
+      const binarySourceKey = binary.available === true
+        ? (binary.source === 'custom'
+          ? 'tunnel.binary.custom'
+          : (binary.source === 'downloaded' ? 'tunnel.binary.downloaded' : 'tunnel.binary.path'))
+        : 'tunnel.binary.missing'
+
+      let outcomeNode = null
+      if (outcome !== null) {
+        if (outcome.tone === 'ok') {
+          outcomeNode = h(Notice, { tone: 'ok', title: t('tunnel.saved') })
+        } else if (outcome.tone === 'downloaded') {
+          outcomeNode = h(Notice, { tone: 'ok', title: t('tunnel.downloaded', { version: outcome.version }) })
+        } else {
+          const code = outcome.failure !== null && typeof outcome.failure === 'object' ? outcome.failure.code : null
+          outcomeNode = h(Notice, {
+            tone: 'error',
+            title: t(tunnelErrorKey(code)),
+            body: typeof code === 'string' && code !== '' ? code : undefined,
+          })
+        }
+      }
+
+      const statusNode = h('div', { className: 'drc-tunnelStatus', role: 'status' },
+        h('span', { className: state === 'failed' ? 'drc-tunnelState drc-tunnelStateFailed' : 'drc-tunnelState' },
+          t('tunnel.state.' + state)),
+        status !== null && typeof status.startedAt === 'string'
+          ? h('span', { className: 'drc-hint' }, formatRelative(status.startedAt, Date.now(), t))
+          : null,
+      )
+
+      const urlNode = state === 'running' && url !== ''
+        ? h('div', { className: 'drc-field' },
+          h('span', { className: 'drc-label' }, t('tunnel.url')),
+          h('div', { className: 'drc-inline' },
+            h('input', {
+              className: 'drc-input drc-mono drc-inputWide',
+              type: 'text',
+              readOnly: true,
+              value: url,
+              title: url,
+              'aria-label': t('tunnel.url'),
+              onFocus: (event) => event.target.select(),
+            }),
+            h('button', { type: 'button', className: 'drc-button', onClick: () => { void copyUrl() } },
+              copied ? t('tunnel.copied') : t('tunnel.copy')),
+          ),
+        )
+        : null
+
+      const errorNode = errorCode === null
+        ? null
+        : h(Notice, {
+          tone: 'error',
+          title: t(tunnelErrorKey(errorCode)),
+          body: errorCode,
+        })
+
+      const binaryNode = h('div', { className: 'drc-tunnelRow' },
+        h('span', { className: 'drc-label' }, t('tunnel.binary')),
+        h('span', { className: 'drc-hint' }, t(binarySourceKey)),
+        binary.available !== true && binaryPathText.trim() !== ''
+          ? h('span', { className: 'drc-hint' }, t('tunnel.binaryCustomMissing'))
+          : null,
+        binary.available !== true
+          ? h('button', {
+            type: 'button',
+            className: 'drc-button',
+            disabled: busy !== null,
+            onClick: () => { void onDownload() },
+          }, busy === 'download' ? t('tunnel.downloading') : t('tunnel.download'))
+          : null,
+      )
+
+      const modeButtons = h('div', {
+        className: 'drc-segments',
+        role: 'group',
+        'aria-label': t('tunnel.mode'),
+      },
+        ['quick', 'token'].map((value) => h('button', {
+          key: value,
+          type: 'button',
+          className: mode === value ? 'drc-segment drc-segmentActive' : 'drc-segment',
+          'aria-pressed': mode === value,
+          disabled: busy !== null,
+          onClick: () => {
+            setOutcome(null)
+            setModeDraft(value)
+          },
+        }, t('tunnel.mode.' + value))),
+      )
+
+      const tokenNode = mode !== 'token'
+        ? h('p', { className: 'drc-hint' }, t('tunnel.quickHint'))
+        : h('div', { className: 'drc-tunnelFields' },
+          h('label', { className: 'drc-field' },
+            h('span', { className: 'drc-label' }, t('tunnel.token')),
+            h('input', {
+              className: 'drc-input drc-inputWide',
+              type: 'password',
+              value: tokenDraft,
+              placeholder: tokenInvalid
+                ? t('tunnel.tokenInvalidState')
+                : (tokenSet ? t('tunnel.tokenSet') : t('tunnel.tokenUnset')),
+              autoComplete: 'off',
+              disabled: busy !== null,
+              onChange: (event) => {
+                setOutcome(null)
+                setTokenDraft(event.target.value)
+              },
+            }),
+            h('span', { className: 'drc-hint' }, t('tunnel.tokenHint')),
+          ),
+          tokenState !== 'none'
+            ? h('button', {
+              type: 'button',
+              className: 'drc-button drc-buttonDanger',
+              disabled: busy !== null,
+              onClick: () => { void onClearToken() },
+            }, t('tunnel.tokenUnset'))
+            : null,
+          h('label', { className: 'drc-field' },
+            h('span', { className: 'drc-label' }, t('tunnel.publicUrl')),
+            h('input', {
+              className: 'drc-input drc-inputWide drc-mono',
+              type: 'text',
+              value: publicUrlText,
+              placeholder: 'https://dsh.example.com',
+              disabled: busy !== null,
+              onChange: (event) => {
+                setOutcome(null)
+                setPublicUrlDraft(event.target.value)
+              },
+            }),
+            h('span', { className: 'drc-hint' }, t('tunnel.publicUrlHint')),
+          ),
+          h('p', { className: 'drc-hint' }, t('tunnel.namedHint')),
+        )
+
+      return h('section', { className: 'drc-section' },
+        h('h3', { className: 'drc-sectionTitle' }, t('tunnel.heading')),
+        h('p', { className: 'drc-hint' }, t('tunnel.hint')),
+        status === null
+          ? h(Notice, { tone: 'error', title: t('tunnel.error.unknown') })
+          : null,
+        gatewayLive ? null : h(Notice, { tone: 'warn', title: t('tunnel.gatewayOff') }),
+        status === null ? null : statusNode,
+        urlNode,
+        errorNode,
+        h('div', { className: 'drc-row' },
+          h('button', {
+            type: 'button',
+            className: 'drc-button drc-buttonPrimary',
+            disabled: busy !== null || status === null || (enabled !== true && gatewayLive !== true),
+            onClick: () => { void onAction(enabled === true ? 'stop' : 'start') },
+          }, enabled === true
+            ? (busy === 'stop' ? t('tunnel.disable') + '…' : t('tunnel.disable'))
+            : t('tunnel.enable')),
+          canRestart
+            ? h('button', {
+              type: 'button',
+              className: 'drc-button',
+              disabled: busy !== null,
+              onClick: () => { void onAction('restart') },
+            }, t('tunnel.restart'))
+            : null,        ),
+        modeButtons,
+        tokenNode,
+        binaryNode,
+        h('div', { className: 'drc-tunnelFields' },
+          h('label', { className: 'drc-field' },
+            h('span', { className: 'drc-label' }, t('tunnel.binaryPath')),
+            h('input', {
+              className: 'drc-input drc-inputWide drc-mono',
+              type: 'text',
+              value: binaryPathText,
+              placeholder: 'C:\\Tools\\cloudflared.exe',
+              disabled: busy !== null,
+              onChange: (event) => {
+                setOutcome(null)
+                setBinaryPathDraft(event.target.value)
+              },
+            }),
+            h('span', { className: 'drc-hint' }, t('tunnel.binaryPathHint')),
+          ),
+          h('div', { className: 'drc-row' },
+            h('button', {
+              type: 'button',
+              className: 'drc-button',
+              disabled: busy !== null,
+              onClick: () => { void onSave() },
+            }, busy === 'save' ? t('tunnel.save') + '…' : t('tunnel.save')),
+          ),
+        ),
+        outcomeNode,
+      )
+    }
+
     /**
      * The pairing card: QR symbol, text code, countdown, one-time link.
      *
@@ -3149,14 +3766,19 @@ window.__ModuleLoader__.load({
      * @param {string | null} props.addressText The EFFECTIVE access address, or null
      *   when the host reported none — the link then falls back to the page's own
      *   host and says so.
-     * @param {'lan' | 'public'} props.mode The selected access mode, for the hint.
+     * @param {'lan' | 'public' | 'tunnel'} props.mode The selected access mode, for the hint.
      */
     function PairingSection({ t, pairing, gateway, addressText, mode }) {
       const [copied, setCopied] = useState(null)
       const [copyFailed, setCopyFailed] = useState(false)
       const current = pairing.current
       const listening = gateway !== null && typeof gateway === 'object' && gateway.listening === true
-      const url = current === null ? null : pairingUrl(current, addressText, documentBase(), mode)
+      /* A tunnel-mode selection with no live URL is NOT the legacy fallback case:
+         falling back to the page host there would hand out a link that cannot work
+         and silently ignore the mode the user chose. No link at all plus an explicit
+         sentence is the honest answer. */
+      const tunnelDown = mode === 'tunnel' && (typeof addressText !== 'string' || addressText === '')
+      const url = current === null || tunnelDown ? null : pairingUrl(current, addressText, documentBase(), mode)
       const seconds = Math.max(0, Math.ceil(pairing.remainingMs / 1000))
       /* `null` while the code is live, a label once the host reports otherwise. An
          ABSENT state means "nobody has asked yet" (a pair minted in this session
@@ -3187,6 +3809,8 @@ window.__ModuleLoader__.load({
           if (isLoopbackName(urlHostname(url))) urlHint = t('pair.loopbackHint')
         } else if (mode === 'public') {
           urlHint = t('pair.publicHint')
+        } else if (mode === 'tunnel') {
+          urlHint = t('pair.tunnelHint')
         }
       }
 
@@ -3228,6 +3852,7 @@ window.__ModuleLoader__.load({
         h('h3', { className: 'drc-sectionTitle' }, t('pair.heading')),
         h('p', { className: 'drc-hint' }, t('pair.hint')),
         listening ? null : h(Notice, { tone: 'warn', title: t('pair.needGateway') }),
+        tunnelDown ? h(Notice, { tone: 'warn', title: t('pair.tunnelDown') }) : null,
         current === null
           ? h('div', { className: 'drc-row' },
             h('button', {
@@ -3907,12 +4532,15 @@ window.__ModuleLoader__.load({
       const addresses = state !== null && state.addresses !== null && typeof state.addresses === 'object'
         ? state.addresses
         : null
+      const tunnel = state !== null && state.tunnel !== null && typeof state.tunnel === 'object'
+        ? state.tunnel
+        : null
       /* Resolved ONCE, here, and handed down: both the address card and the pairing
          link must use the same answer, and two calls could disagree across a poll
          that lands between them. */
       const access = accessOf(settings)
       const lan = addresses !== null && Array.isArray(addresses.lan) ? addresses.lan : []
-      const effective = effectiveAddress(access, lan)
+      const effective = effectiveAddress(access, lan, tunnel !== null && typeof tunnel.url === 'string' ? tunnel.url : '')
 
       const activeTab = tab === null || !TAB_KEYS.includes(tab) ? preferredTab(settings, gateway) : tab
       const auditActions = auditActionsOf(state)
@@ -3985,10 +4613,12 @@ window.__ModuleLoader__.load({
                 t,
                 settings,
                 addresses,
+                tunnel,
                 updateSettings: status.updateSettings,
                 /* The empty public book is a dead end on this tab; the shortcut hands
                    the user to the tab that can fix it instead of leaving them there. */
                 onManagePublic: () => setTab('access'),
+                onManageTunnel: () => setTab('access'),
               }),
               h(PairingSection, {
                 key: 'pairing',
@@ -4000,15 +4630,27 @@ window.__ModuleLoader__.load({
               }),
             ]
           case 'access':
-            /* 接入 is now ONLY the public address book: the master switch and the port
-               moved to the configuration row above the tabs, and the LAN/public choice
-               moved to 配对. One tab, one job. */
-            return h(PublicBookSection, {
-              key: 'book',
-              t,
-              settings,
-              updateSettings: status.updateSettings,
-            })
+            /* 接入 owns the public address BOOK and the managed tunnel. The master
+               switch and the port live in the configuration row above the tabs, and
+               the LAN/public/tunnel CHOICE lives in 配对. */
+            return [
+              h(TunnelSection, {
+                key: 'tunnel',
+                t,
+                settings,
+                tunnel,
+                gateway,
+                tunnelAction: status.tunnelAction,
+                updateTunnelConfig: status.updateTunnelConfig,
+                downloadTunnel: status.downloadTunnel,
+              }),
+              h(PublicBookSection, {
+                key: 'book',
+                t,
+                settings,
+                updateSettings: status.updateSettings,
+              }),
+            ]
           case 'devices':
             return h(DeviceSection, {
               key: 'devices',

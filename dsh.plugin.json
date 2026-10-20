@@ -2,7 +2,7 @@
   "id": "dsh-external/dsh-remote-control",
   "version": "0.1.1",
   "main": "./src/index.js",
-  "description": "DeepSeek Harness 远程控制插件：自建配对门控网关反向代理官方 dsh web 端口，提供设备管理面板与本地 JSONL 审计。官方端口保持 127.0.0.1，未配对请求在到达 DSH 前即被拒绝。",
+  "description": "DeepSeek Harness 远程控制插件：自建配对门控网关反向代理官方 dsh web 端口，提供设备管理面板与本地 JSONL 审计，可选内置 Cloudflare Tunnel 公网接入。官方端口保持 127.0.0.1，未配对请求在到达 DSH 前即被拒绝。",
   "engines": {
     "dsh": ">=0.2.0-rc.2"
   },

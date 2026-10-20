@@ -318,7 +318,13 @@ export function formatAddress(parsed) {
  * |----------|------------------------------------------------------------------|
  * | `lan`    | stored `lanAddress` if the NIC list still contains it, else the   |
  * |          | first listed address; empty list → none                           |
- * | `public` | the row `selectedPublicId` names, else the first; empty → none    |
+ * | `public` | the row `selectedPublicId` names, else the first; empty → none |
+ * | `tunnel` | the tunnel URL passed in (`tunnelUrl`), or none while the        |
+ * |          | managed tunnel is not running                                    |
+ *
+ * `tunnel` is the one mode whose address is NOT stored: a quick tunnel's hostname
+ * changes on every start (`prd.md` R6), so persisting it would guarantee a stale
+ * link. The caller supplies the live value; this module stays pure.
  *
  * The fallback happens HERE and only here — never on the write path. A cable that
  * was unplugged for a minute must not quietly rewrite the user's selection, and
@@ -328,9 +334,11 @@ export function formatAddress(parsed) {
  * @param {object | null} access `settings.access`, as stored (possibly malformed).
  * @param {{ address?: string }[]} [lan] Output of {@link listLanAddresses}; entries
  *   without a string `address` are skipped, never used as the fallback.
+ * @param {string | null} [tunnelUrl] Live URL of the managed Cloudflare Tunnel, or
+ *   null/empty while it is not running. Only read in `tunnel` mode.
  * @returns {string | null} Address text, or null when nothing is available.
  */
-export function effectiveAddress(access, lan) {
+export function effectiveAddress(access, lan, tunnelUrl) {
   const settings = access !== null && typeof access === 'object' ? access : {}
   /* An entry WITHOUT a string `address` is dropped instead of becoming the
      "first entry": `listLanAddresses` never emits one, but this function also
@@ -341,6 +349,11 @@ export function effectiveAddress(access, lan) {
   const list = Array.isArray(lan)
     ? lan.filter((entry) => entry !== null && typeof entry === 'object' && typeof entry.address === 'string')
     : []
+
+  if (settings.mode === 'tunnel') {
+    const text = typeof tunnelUrl === 'string' ? tunnelUrl.trim() : ''
+    return text === '' ? null : text
+  }
 
   if (settings.mode === 'public') {
     const book = Array.isArray(settings.public)

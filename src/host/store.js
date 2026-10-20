@@ -52,6 +52,7 @@ import {
   RUNTIME_DIR_NAME,
   TOKEN_HASH_PATTERN,
 } from './constants.js'
+import { defaultTunnel, normalizeTunnel } from './tunnel.js'
 
 /** Build an Error carrying a stable `code` (see `.trellis/spec/backend/error-handling.md`). */
 function storeError(code, message) {
@@ -77,7 +78,14 @@ function emptyDocument() {
   return {
     version: DEVICES_VERSION,
     devices: [],
-    settings: { enabled: false, port: DEFAULT_GATEWAY_PORT, access: defaultAccess() },
+    settings: {
+      enabled: false,
+      port: DEFAULT_GATEWAY_PORT,
+      access: defaultAccess(),
+      /* Additive (2026-10-20): a `devices.json` written before this field existed
+         loads with these defaults instead of needing a migration. */
+      tunnel: defaultTunnel(),
+    },
   }
 }
 
@@ -203,6 +211,7 @@ function normalizeDocument(parsed) {
          existed loads with the documented defaults instead of needing a
          migration (`database-guidelines.md` §Migrations). */
       access: normalizeAccess(settings.access),
+      tunnel: normalizeTunnel(settings.tunnel),
     },
   }
 }
@@ -369,17 +378,19 @@ function buildStore(baseDir, now) {
   /**
    * Merge a partial settings patch and persist.
    *
-   * `enabled` / `port` / `access` are the writable fields; anything else in the
-   * patch is ignored, which is what keeps a caller from inventing settings the
-   * rest of the package does not read.
+   * `enabled` / `port` / `access` / `tunnel` are the writable fields; anything else
+   * in the patch is ignored, which is what keeps a caller from inventing settings
+   * the rest of the package does not read.
    *
-   * `access` is replaced WHOLESALE rather than merged. A partial merge would make
-   * "delete the third public address" inexpressible without an index-shaped
-   * protocol, and the panel always holds the full value anyway (it re-reads
-   * `GET /state` after every write). The replacement is normalized first, so a
-   * caller that skips `addresses.js` still cannot store an unusable address.
+   * `access` and `tunnel` are replaced WHOLESALE rather than merged. A partial
+   * merge would make "delete the third public address" (or "clear the tunnel's
+   * public hostname") inexpressible without an index-shaped protocol, and the panel
+   * always holds the full value anyway (it re-reads `GET /state` after every
+   * write). Both replacements are normalized first, so a caller that skips the
+   * grammar module still cannot store an unusable value. The tunnel TOKEN is not a
+   * field here at all — it lives in its own 0600 file (`tunnel.js`).
    *
-   * @param {{ enabled?: boolean, port?: number, access?: object }} [patch]
+   * @param {{ enabled?: boolean, port?: number, access?: object, tunnel?: object }} [patch]
    */
   function updateSettings(patch = {}) {
     const document = read()
@@ -387,10 +398,12 @@ function buildStore(baseDir, now) {
       enabled: document.settings.enabled,
       port: document.settings.port,
       access: document.settings.access,
+      tunnel: document.settings.tunnel,
     }
     if (typeof patch.enabled === 'boolean') next.enabled = patch.enabled
     if (Number.isInteger(patch.port) && patch.port > 0 && patch.port <= 65535) next.port = patch.port
     if (patch.access !== undefined) next.access = normalizeAccess(patch.access)
+    if (patch.tunnel !== undefined) next.tunnel = normalizeTunnel(patch.tunnel)
     document.settings = next
     return write(document).settings
   }

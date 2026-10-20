@@ -128,7 +128,7 @@ import {
   DEVICE_ID_PREFIX,
   PAIRING_ROUTE_PATH,
 } from '../constants.js'
-import { headerValue, peerAddress } from '../loopback.js'
+import { clientAddress, headerValue } from '../loopback.js'
 import { checkOrigin } from '../origin.js'
 import { signDeviceToken } from '../tokens.js'
 import { deviceCookie, emit, sendDocument, sendError, sendRedirect } from './wire.js'
@@ -834,9 +834,12 @@ export function createPairingRoute(options) {
     }
 
     /* The single credential comparison, and the single place both budgets live.
-       `source` is the real socket peer: `pairing.js` keeps the per-source window,
-       so passing it is what makes "rotating the pairId" not reset the budget. */
-    const source = peerAddress(req?.socket)
+       `source` is the real client: `pairing.js` keeps the per-source window, so
+       passing it is what makes "rotating the pairId" not reset the budget.
+       `clientAddress` answers the socket peer for a LAN connection and Cloudflare's
+       `CF-Connecting-IP` for a managed tunnel (loopback socket only) — without it
+       every public request would share one bucket keyed `127.0.0.1`. */
+    const source = clientAddress(req)
     let redeemed
     try {
       redeemed = pairing.redeem(pairId, code, source === undefined ? {} : { source })
