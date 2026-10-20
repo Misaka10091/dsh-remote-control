@@ -397,7 +397,7 @@ window.__ModuleLoader__.load({
       'tunnel.binaryPathHint': '必须是绝对路径或 PATH 里的命令名；填了但不存在会直接报错，不会回退。',
       'tunnel.binaryCustomMissing': '自定义路径优先；它不存在时不会回退到 PATH 或已下载副本。请修正或清空后再试。',
       'tunnel.save': '保存隧道设置',
-      'tunnel.saved': '已保存。',
+      'tunnel.saved': '隧道设置已保存。',
       'tunnel.quickHint': '快速隧道不需要账号，但域名每次启动都会变，已配对设备需要重新配对。',
       'tunnel.namedHint': '具名隧道需要先在 Cloudflare 控制台创建隧道、配置公开主机名，再把 Token 填到这里。',
       'tunnel.gatewayOff': '先在上方启用远程接入，隧道才有可转发的本地端口。',
@@ -588,7 +588,7 @@ window.__ModuleLoader__.load({
       'tunnel.binaryPathHint': 'Must be an absolute path or a command name on PATH; a path that does not exist is an error, never a fallback.',
       'tunnel.binaryCustomMissing': 'A custom path wins; when it does not exist there is no fallback to PATH or the downloaded copy. Fix or clear it, then retry.',
       'tunnel.save': 'Save tunnel settings',
-      'tunnel.saved': 'Saved.',
+      'tunnel.saved': 'Tunnel settings saved.',
       'tunnel.quickHint': 'A quick tunnel needs no account, but its hostname changes on every start — paired devices have to pair again.',
       'tunnel.namedHint': 'A named tunnel needs a tunnel and a public hostname created in the Cloudflare dashboard; paste its token here.',
       'tunnel.gatewayOff': 'Enable remote access above first; the tunnel needs a local port to forward to.',
@@ -3466,6 +3466,15 @@ window.__ModuleLoader__.load({
       const [outcome, setOutcome] = useState(null)
       const [copied, setCopied] = useState(false)
 
+      /* A success notice describes an ACTION, not a state: leaving it on screen
+         forever reads like a status line ("saved" — of what, and is it still
+         true?). It clears itself; any new action replaces it immediately. */
+      useEffect(() => {
+        if (outcome === null) return undefined
+        const timer = setTimeout(() => setOutcome(null), 4000)
+        return () => clearTimeout(timer)
+      }, [outcome])
+
       const mode = modeDraft !== null ? modeDraft : (stored.mode === 'token' ? 'token' : 'quick')
       const publicUrlText = publicUrlDraft !== null ? publicUrlDraft : (typeof stored.publicUrl === 'string' ? stored.publicUrl : '')
       /* `binaryPath` is the storage for BOTH shapes: empty means "let the plugin
@@ -3535,10 +3544,14 @@ window.__ModuleLoader__.load({
             setBusy(null)
             return
           }
+          /* The save succeeded, but the ACTION's result is what the status card
+             shows; a lingering "settings saved" toast here would sit beside
+             "running" and read like a second, unrelated state. */
+          setOutcome(null)
         }
         const result = await tunnelAction(action)
         setBusy(null)
-        setOutcome(result.ok === true ? { tone: 'ok' } : { tone: 'error', failure: result.failure })
+        setOutcome(result.ok === true ? null : { tone: 'error', failure: result.failure })
       }
 
       const onDownload = async () => {

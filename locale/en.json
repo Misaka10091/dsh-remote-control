@@ -75,7 +75,7 @@
   "tunnel.binaryPathHint": "Must be an absolute path or a command name on PATH; a path that does not exist is an error, never a fallback.",
   "tunnel.binaryCustomMissing": "A custom path wins; when it does not exist there is no fallback to PATH or the downloaded copy. Fix or clear it, then retry.",
   "tunnel.save": "Save tunnel settings",
-  "tunnel.saved": "Saved.",
+  "tunnel.saved": "Tunnel settings saved.",
   "tunnel.quickHint": "A quick tunnel needs no account, but its hostname changes on every start — paired devices have to pair again.",
   "tunnel.namedHint": "A named tunnel needs a tunnel and a public hostname created in the Cloudflare dashboard; paste its token here.",
   "tunnel.gatewayOff": "Enable remote access above first; the tunnel needs a local port to forward to.",

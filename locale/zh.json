@@ -75,7 +75,7 @@
   "tunnel.binaryPathHint": "必须是绝对路径或 PATH 里的命令名；填了但不存在会直接报错，不会回退。",
   "tunnel.binaryCustomMissing": "自定义路径优先；它不存在时不会回退到 PATH 或已下载副本。请修正或清空后再试。",
   "tunnel.save": "保存隧道设置",
-  "tunnel.saved": "已保存。",
+  "tunnel.saved": "隧道设置已保存。",
   "tunnel.quickHint": "快速隧道不需要账号，但域名每次启动都会变，已配对设备需要重新配对。",
   "tunnel.namedHint": "具名隧道需要先在 Cloudflare 控制台创建隧道、配置公开主机名，再把 Token 填到这里。",
   "tunnel.gatewayOff": "先在上方启用远程接入，隧道才有可转发的本地端口。",
