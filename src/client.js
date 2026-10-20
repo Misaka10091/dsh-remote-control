@@ -332,7 +332,7 @@ window.__ModuleLoader__.load({
       'access.enableHint': '关闭时官方 dsh web 端口完全不对外，行为与未安装插件一致。',
       'access.port': '端口',
       'access.save': '保存',
-      'access.saved': '已保存。',
+      'access.saved': '接入设置已保存。',
       'access.reloadRequired': '设置已保存到磁盘，但当前进程仍在使用旧的监听配置，需要重启 dsh 才会生效。',
       'access.invalidPort': '端口必须是 1 到 65535 之间的整数。',
       'access.gatewayDisabled': '未启用，没有监听端口。',
@@ -344,6 +344,8 @@ window.__ModuleLoader__.load({
       'address.modePublic': '公网',
       'address.lanEmpty': '没有可用的网卡地址。',
       'address.publicEmpty': '还没有配置公网地址。',
+      'address.modeSaved': '接入地址已更新。',
+      'address.bookSaved': '公网地址已保存。',
       'address.label': '备注',
       'address.address': '地址',
       'address.add': '添加',
@@ -523,7 +525,7 @@ window.__ModuleLoader__.load({
       'access.enableHint': 'When off, the official dsh web port is not reachable at all and the host behaves as if this plugin were not installed.',
       'access.port': 'Port',
       'access.save': 'Save',
-      'access.saved': 'Saved.',
+      'access.saved': 'Access settings saved.',
       'access.reloadRequired': 'The setting is on disk, but this process still runs the old listener configuration. Restart dsh for it to take effect.',
       'access.invalidPort': 'The port must be an integer between 1 and 65535.',
       'access.gatewayDisabled': 'Disabled, nothing is listening.',
@@ -535,6 +537,8 @@ window.__ModuleLoader__.load({
       'address.modePublic': 'Public',
       'address.lanEmpty': 'No local network address is available.',
       'address.publicEmpty': 'No public address configured yet.',
+      'address.modeSaved': 'Access address updated.',
+      'address.bookSaved': 'Public addresses saved.',
       'address.label': 'Label',
       'address.address': 'Address',
       'address.add': 'Add',
@@ -2932,6 +2936,27 @@ window.__ModuleLoader__.load({
     }
 
     /**
+     * Clear a SUCCESS notice after a few seconds.
+     *
+     * Success describes an action that already finished; leaving it on screen
+     * forever makes it read like a state ("saved" — of what, and is it still
+     * true?). Errors are deliberately NOT auto-dismissed: a failure the user did
+     * not get to read is a failure they will repeat.
+     *
+     * @param {{ tone?: string } | null} outcome
+     * @param {(next: null) => void} clearOutcome State setter (stable identity).
+     * @param {number} [ms]
+     */
+    function useAutoDismiss(outcome, clearOutcome, ms = 4000) {
+      useEffect(() => {
+        if (outcome === null || typeof outcome !== 'object') return undefined
+        if (outcome.tone !== 'ok' && outcome.tone !== 'downloaded') return undefined
+        const timer = setTimeout(() => clearOutcome(null), ms)
+        return () => clearTimeout(timer)
+      }, [outcome, clearOutcome, ms])
+    }
+
+    /**
      * The panel's top configuration: the master switch and the listener port.
      *
      * Both are panel-wide facts, so both live ABOVE the tabs: the switch decides
@@ -2952,6 +2977,7 @@ window.__ModuleLoader__.load({
       const [portDraft, setPortDraft] = useState(null)
       const [busy, setBusy] = useState(false)
       const [outcome, setOutcome] = useState(null)
+      useAutoDismiss(outcome, setOutcome)
 
       const known = settings !== null && typeof settings === 'object'
       const enabled = known && settings.enabled === true
@@ -3072,6 +3098,7 @@ window.__ModuleLoader__.load({
     function AccessPointSection({ t, settings, addresses, tunnel, updateSettings, onManagePublic, onManageTunnel }) {
       const [busy, setBusy] = useState(false)
       const [outcome, setOutcome] = useState(null)
+      useAutoDismiss(outcome, setOutcome)
 
       const known = settings !== null && typeof settings === 'object'
       const access = accessOf(settings)
@@ -3209,7 +3236,7 @@ window.__ModuleLoader__.load({
       let outcomeNode = null
       if (outcome !== null) {
         outcomeNode = outcome.tone === 'ok'
-          ? h(Notice, { tone: 'ok', title: t('access.saved') })
+          ? h(Notice, { tone: 'ok', title: t('address.modeSaved') })
           : h(FailureNotice, { failure: outcome.failure === null ? { kind: 'unknown' } : outcome.failure, t })
       }
 
@@ -3254,6 +3281,7 @@ window.__ModuleLoader__.load({
       const [addressDraft, setAddressDraft] = useState('')
       const [busy, setBusy] = useState(false)
       const [outcome, setOutcome] = useState(null)
+      useAutoDismiss(outcome, setOutcome)
 
       const known = settings !== null && typeof settings === 'object'
       const access = accessOf(settings)
@@ -3323,7 +3351,7 @@ window.__ModuleLoader__.load({
         } else if (outcome.tone === 'tooMany') {
           outcomeNode = h(Notice, { tone: 'error', title: t('address.tooMany', { max: PUBLIC_ADDRESS_MAX }) })
         } else if (outcome.tone === 'ok') {
-          outcomeNode = h(Notice, { tone: 'ok', title: t('access.saved') })
+          outcomeNode = h(Notice, { tone: 'ok', title: t('address.bookSaved') })
         } else {
           outcomeNode = h(FailureNotice, {
             failure: outcome.failure === null ? { kind: 'unknown' } : outcome.failure,
@@ -3465,15 +3493,7 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(null)
       const [outcome, setOutcome] = useState(null)
       const [copied, setCopied] = useState(false)
-
-      /* A success notice describes an ACTION, not a state: leaving it on screen
-         forever reads like a status line ("saved" — of what, and is it still
-         true?). It clears itself; any new action replaces it immediately. */
-      useEffect(() => {
-        if (outcome === null) return undefined
-        const timer = setTimeout(() => setOutcome(null), 4000)
-        return () => clearTimeout(timer)
-      }, [outcome])
+      useAutoDismiss(outcome, setOutcome)
 
       const mode = modeDraft !== null ? modeDraft : (stored.mode === 'token' ? 'token' : 'quick')
       const publicUrlText = publicUrlDraft !== null ? publicUrlDraft : (typeof stored.publicUrl === 'string' ? stored.publicUrl : '')
