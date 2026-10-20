@@ -47,12 +47,57 @@
 
 ```bash
 git tag -a vX.Y.Z -m "Release vX.Y.Z"
-git push --atomic origin main vX.Y.Z
+git push --atomic origin main vX.Y.Z   # ← 只有人执行，见下节「推送授权」
 ```
 
 理由与代价都是可查的：`gh release create --verify-tag` 只要求标签已存在于远端（两种都满足），但 annotated 标签带 tagger 与消息，是唯一能回答「谁在什么时候发的这个版本」的对象。历史偏差：仓库里 `v0.1.0` 是**轻量标签**（`git for-each-ref refs/tags` 显示 `objecttype` 为 `commit`），`v0.1.1` 才是 annotated。既有的轻量标签不必重建，新标签一律 `-a`。
 
 `git push --atomic` 是要求而非习惯：提交与标签要么一起到远端，要么都不动，避免「标签指向一个远端没有的提交」。
+
+## 推送授权
+
+> **硬约束：没有明确的许可，不得执行任何推送。**
+
+`git push` 的全部变体——`--atomic`、`--tags`、`--follow-tags`、`--force` / `--force-with-lease`、`--mirror`、`--delete`，以及等价写法（别名、`git -C <dir> push`、脚本或 `gh` 里的推送）——只能由人执行。AI 可以 `git add` / `git commit` / `git tag -a`，因为它们是**本地的、可撤销的**；推送是本流程里唯一不可撤销的一步，且它的后果发生在机器之外。
+
+单独立一条规则的理由：
+
+- 推 `vX.Y.Z` 会立刻触发 `.github/workflows/npm-publish.yml`，发布一个 **npm 不允许覆盖**的版本、创建 GitHub Release，并改变别人 `npm install` 看到的 `latest`。`git tag -d` 撤不回已经发出去的版本。
+- **授权不能从上下文推断。** 讨论里说过「可以发版」不是对某条具体推送命令的授权；只有用户明确要求推送、或被问到后明确同意，才算许可。含混的「行」「可以」如果指的是上一步（比如跑测试），不算。
+- 边界与 `.trellis/workflow.md` Phase 3.4 一致：提交按批次计划执行，**推送必须停下来问人**。
+
+### 契约
+
+| 动作 | 谁做 | 备注 |
+|---|---|---|
+| `git add` / `git commit` | AI（Phase 3.4 的批次计划，一次确认后执行） | 本地，可 amend / rebase |
+| `git tag -a vX.Y.Z` | AI 或人 | 本地，未推送前 `git tag -d` 可撤 |
+| 任何 `git push` | **只有人** | AI 最多打印命令并写明后果 |
+| `npm publish` | 只有人 | 本仓库应由 tag 触发 OIDC，不该本地发 |
+| `git ls-remote` / `git fetch` / `git log origin/main` / `gh release view` | AI | 只读，用来核对远端状态 |
+
+### 需要推送时的流程
+
+1. 先摆事实：`git log --oneline origin/main..HEAD`、`git status --porcelain`、目标标签是否已在远端（`git ls-remote --tags origin vX.Y.Z`）。
+2. 打印**完整命令**并写明后果，例如「推 `v0.1.2` 会触发 `npm-publish.yml`：发布 `@misaka10091/dsh-remote-control@0.1.2` 到 npm 并建 Release，不可回滚」。
+3. **停在这里**，等人执行，或等一句明确的推送授权。
+4. 推送发生之后，AI 才用只读命令核对结果。
+
+### Wrong vs Correct
+
+```bash
+# Wrong：把「验证发布流程」理解成顺手推一下
+git tag -a v0.1.2 -m "Release v0.1.2" && git push --atomic origin main v0.1.2
+# → 版本已发到 npm，无法覆盖；用户可能还没同意发这个版本
+
+# Correct：标签留在本地，命令与后果交给人
+git tag -a v0.1.2 -m "Release v0.1.2"
+# 报告：
+#   待执行（需你确认）：git push --atomic origin main v0.1.2
+#   后果：触发 npm-publish.yml → npm publish 0.1.2 + GitHub Release（不可回滚）
+```
+
+> **Warning**：这条规则**没有测试守着**，也没有脚本会拦你——CI 由 tag 推送触发，推出去就是既成事实。唯一防线是执行前问一句。
 
 ## CHANGELOG 契约
 
@@ -160,6 +205,8 @@ npm view "$PACKAGE_SPEC" dist.integrity --json
 - **把已发布版本重新发成 `latest`。** 不允许，也不需要：发新版本。
 - **给生产 workflow 加 `NPM_TOKEN`。** OIDC 就是凭据；加 secret 等于多一条会过期的凭证链。
 - **重跑时把 `cancel-in-progress` 打开。** 会把要接续的那次运行打断。
+- **未经许可就推送。** 推送是唯一不可撤销的一步，也是唯一会真的发布版本的一步；AI 只打印命令，等人执行或等明确许可（见「推送授权」）。
+- **把「提交」当成「推送」授权。** Phase 3.4 的批次计划只覆盖 `git add` / `git commit`，不含任何 `git push`。
 - **用轻量标签。** `git tag -a`，并 `git push --atomic`。
 - **引用「33 个文件」当常量。** 它是实测值，改包必须重新数。
 
@@ -181,6 +228,7 @@ npm pack --dry-run        # 33 个文件，无 scripts/、无 .github/
 
 # 4. 标签（真发布，不可回滚）
 git tag -a vX.Y.Z -m "Release vX.Y.Z"
+# 5. 推送 —— 只有人执行；未经许可不得运行（见「推送授权」）
 git push --atomic origin main vX.Y.Z
 ```
 

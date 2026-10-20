@@ -57,9 +57,18 @@ These guides help you **ask the right questions before coding**.
 - [ ] 你改了 `.github/workflows/*` 或 `scripts/prepare-release.mjs`
 - [ ] 你在 `src/` 下新增了文件（它必须同时进 `files` 与 `check:syntax`）
 - [ ] 你准备跑 `git tag` 或 `npm version`
+- [ ] 你准备跑 `git push`（任何变体）
 - [ ] 你正在写「发布已经验证」这类结论
 
 → Read [Release Guidelines](../release/index.md) and [Tag & Release](../release/tag-and-release.md)
+
+### When About to Push or Publish (未经许可不推)
+
+- [ ] 这条命令会不会动远端？`git push`（`--atomic` / `--tags` / `--follow-tags` / force）、`gh release create`、`npm publish`、`npm dist-tag add` 都算
+- [ ] 有**明确许可**吗？讨论里的「发版吧」不是对某条推送命令的授权；含混的「行」「可以」若指的是上一步也不算
+- [ ] 我是不是把「验证发布流程」理解成了「顺手推一下」？推出去就是 npm 上不可覆盖的版本
+
+→ Read [Tag & Release § 推送授权](../release/tag-and-release.md#推送授权)
 
 ### When Verifying AI Cross-Review Results
 

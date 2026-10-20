@@ -16,6 +16,8 @@
 
 **文档语言：中文**；代码标识符、命令、日志原文保持英文。
 
+**硬约束：未经明确许可不得推送。** 任何 `git push`（含 `--atomic` / `--tags` / `--follow-tags` / force 变体与等价写法）只由人执行；AI 负责把命令和后果摆到人面前，然后停下（见 [Tag & Release § 推送授权](./tag-and-release.md#推送授权)）。
+
 ---
 
 ## Guidelines Index
@@ -37,7 +39,8 @@
 - [ ] 新增模块已加进 `npm run check:syntax` 的显式清单（`tests/package.test.mjs` 会红）
 - [ ] 三条 gate 全绿：`npm test` / `npm run check:syntax` / `npm pack --dry-run`
 - [ ] `node scripts/prepare-release.mjs vX.Y.Z <临时目录>` 本地干跑通过，`notes.md` 里的安装命令是 `dsh plugin --profile web add …`
-- [ ] 标签用 annotated（`git tag -a vX.Y.Z -m "Release vX.Y.Z"`），推送用 `git push --atomic origin main vX.Y.Z`
+- [ ] 标签用 annotated：`git tag -a vX.Y.Z -m "Release vX.Y.Z"`
+- [ ] **推送这一步由人做**：`git push --atomic origin main vX.Y.Z` 由 AI 打印并说明后果，由人执行或明确授权（[推送授权](./tag-and-release.md#推送授权)）
 - [ ] 文档里没有把「自动化已验证」写成事实（第 4 层从未真跑过，见 [Tag & Release](./tag-and-release.md#本地能证明什么不能证明什么)）
 
 ## Quality Check
