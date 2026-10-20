@@ -12,6 +12,8 @@
  */
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { EventEmitter } from 'node:events'
+import { PassThrough } from 'node:stream'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { createServer, request as httpRequest } from 'node:http'
 import { connect } from 'node:net'
@@ -258,8 +260,12 @@ test('apply starts no listener while remote access is off', async () => {
        future `server.listen()` registered here would fail it. */
     assert.deepEqual(
       ctx.effectLabels,
-      ['remote-control: audit retention', 'remote-control: admin API'],
-      'only the retention timer and the admin route, no gateway listener',
+      [
+        'remote-control: audit retention',
+        'remote-control: cloudflared tunnel',
+        'remote-control: admin API',
+      ],
+      'only the retention timer, the tunnel disposer and the admin route, no gateway listener',
     )
     for (const dispose of ctx.effects) dispose()
   })
@@ -299,12 +305,105 @@ test('apply binds a gateway and logs one listening line when remote access is on
         ctx.effectLabels,
         [
           'remote-control: audit retention',
+          'remote-control: cloudflared tunnel',
           'remote-control: admin API',
           'remote-control: gateway listener',
         ],
-        'the listener is the third effect, and it is registered last',
+        'the listener is the last effect, and it is registered last',
       )
       for (const dispose of ctx.effects) await dispose()
+    })
+  } finally {
+    await official.close()
+  }
+})
+
+/** A fake `cloudflared` process factory that records what it was asked to run. */
+function fakeCloudflared(children) {
+  return (binary, args, options) => {
+    const child = new EventEmitter()
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.signals = []
+    child.kill = (signal) => {
+      child.signals.push(typeof signal === 'string' ? signal : 'SIGTERM')
+      child.emit('exit', null, typeof signal === 'string' ? signal : 'SIGTERM')
+      return true
+    }
+    children.push({ binary, args, options, child })
+    return child
+  }
+}
+
+test('the managed tunnel follows the gateway listener and stops with it', async () => {
+  const official = await stubOfficialPort()
+  try {
+    await withTempHome(async (home) => {
+      const baseDir = path.join(home, '.dsh', 'remote-control')
+      const binary = path.join(home, 'cloudflared')
+      writeFileSync(binary, '#!/bin/sh\nexit 0\n')
+      const runtime = entry.createRuntime({ baseDir })
+      runtime.store.updateSettings({
+        enabled: true,
+        tunnel: { enabled: true, mode: 'quick', binaryPath: binary },
+      })
+
+      const children = []
+      const { calls, logger } = recordingLogger()
+      const ctx = gatewayContext({ officialPort: official.port, logger })
+      await entry.apply(ctx, {
+        port: 0,
+        host: '127.0.0.1',
+        tunnelSpawnImpl: fakeCloudflared(children),
+      })
+      await new Promise((resolve) => setImmediate(resolve))
+
+      assert.equal(children.length, 1, 'the enabled tunnel starts with the listener')
+      assert.equal(children[0].options.shell, false, 'argv array, never a shell')
+      assert.match(children[0].args[3], /^http:\/\/127\.0\.0\.1:\d+$/, 'it targets the BOUND port')
+      assert.ok(!calls.some((call) => call.level === 'error'))
+
+      children[0].child.stdout.write('https://abc-def-ghi.trycloudflare.com\n')
+      await new Promise((resolve) => setImmediate(resolve))
+
+      /* Cordis disposes in reverse order; the listener's disposer is what stops the
+         tunnel before the port disappears. */
+      for (const dispose of ctx.effects.reverse()) await dispose()
+      assert.deepEqual(children[0].child.signals, ['SIGTERM'], 'no cloudflared outlives the plugin')
+    })
+  } finally {
+    await official.close()
+  }
+})
+
+test('a tunnel that cannot start is reported, and the gateway keeps working', async () => {
+  const official = await stubOfficialPort()
+  try {
+    await withTempHome(async (home) => {
+      const baseDir = path.join(home, '.dsh', 'remote-control')
+      const runtime = entry.createRuntime({ baseDir })
+      runtime.store.updateSettings({
+        enabled: true,
+        tunnel: { enabled: true, mode: 'quick', binaryPath: path.join(home, 'missing-cloudflared') },
+      })
+
+      const children = []
+      const { calls, logger } = recordingLogger()
+      const ctx = gatewayContext({ officialPort: official.port, logger })
+      await entry.apply(ctx, {
+        port: 0,
+        host: '127.0.0.1',
+        tunnelSpawnImpl: fakeCloudflared(children),
+      })
+      await new Promise((resolve) => setImmediate(resolve))
+
+      /* The LAN gateway is the feature; a missing tunnel binary degrades to a panel
+         state and one warn line, never a failed plugin. */
+      assert.equal(children.length, 0)
+      assert.ok(calls.some((call) => call.level === 'info' && /gateway listening/.test(call.message)))
+      assert.ok(calls.some((call) => call.level === 'warn' && /tunnel\/binary-missing/.test(call.message)))
+
+      for (const dispose of ctx.effects.reverse()) await dispose()
     })
   } finally {
     await official.close()

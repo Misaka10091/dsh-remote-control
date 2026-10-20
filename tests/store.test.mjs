@@ -94,7 +94,7 @@ test('addDevice persists the documented device shape, in field order, including 
     assert.equal(stored.revokedAt, null)
     assert.equal(stored.capabilities, null, 'capabilities is reserved and unused (PRD D6)')
     assert.deepEqual(Object.keys(onDisk), ['version', 'devices', 'settings'])
-    assert.deepEqual(Object.keys(onDisk.settings), ['enabled', 'port', 'access'])
+    assert.deepEqual(Object.keys(onDisk.settings), ['enabled', 'port', 'access', 'tunnel'])
     assert.equal(record.id, 'dev_1')
   } finally {
     cleanupDir(dir)
@@ -542,14 +542,26 @@ test('settings merge partially and persist', () => {
   try {
     const { store } = makeStore(dir)
     const defaultAccess = { mode: 'lan', lanAddress: '', public: [], selectedPublicId: null }
-    assert.deepEqual(store.getSettings(), { enabled: false, port: DEFAULT_GATEWAY_PORT, access: defaultAccess })
+    const defaultTunnel = { enabled: false, mode: 'quick', binaryPath: '', publicUrl: '' }
+    assert.deepEqual(store.getSettings(), {
+      enabled: false,
+      port: DEFAULT_GATEWAY_PORT,
+      access: defaultAccess,
+      tunnel: defaultTunnel,
+    })
 
     assert.deepEqual(store.updateSettings({ enabled: true }), {
       enabled: true,
       port: DEFAULT_GATEWAY_PORT,
       access: defaultAccess,
+      tunnel: defaultTunnel,
     })
-    assert.deepEqual(store.updateSettings({ port: 3091 }), { enabled: true, port: 3091, access: defaultAccess })
+    assert.deepEqual(store.updateSettings({ port: 3091 }), {
+      enabled: true,
+      port: 3091,
+      access: defaultAccess,
+      tunnel: defaultTunnel,
+    })
     assert.equal(store.getSettings().port, 3091, 'the enabled flag survived the port update')
   } finally {
     cleanupDir(dir)
@@ -591,6 +603,9 @@ test('a devices.json written before access existed loads with the default', () =
     assert.equal(settings.enabled, true)
     assert.equal(settings.port, 3091)
     assert.deepEqual(settings.access, { mode: 'lan', lanAddress: '', public: [], selectedPublicId: null })
+    /* Same additive rule for the managed tunnel (2026-10-20): a file written
+       before `settings.tunnel` existed gains the documented defaults. */
+    assert.deepEqual(settings.tunnel, { enabled: false, mode: 'quick', binaryPath: '', publicUrl: '' })
   } finally {
     cleanupDir(dir)
   }
@@ -615,6 +630,25 @@ test('access settings survive a write and read back', () => {
        must see exactly what was written. */
     const reopened = createStore({ baseDir: dir })
     assert.deepEqual(reopened.getSettings().access, access)
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('tunnel settings survive a write and read back', () => {
+  const dir = makeTempDir()
+  try {
+    const { store } = makeStore(dir)
+    const tunnel = {
+      enabled: true,
+      mode: 'token',
+      binaryPath: '/usr/local/bin/cloudflared',
+      publicUrl: 'https://dsh.example.com',
+    }
+
+    assert.deepEqual(store.updateSettings({ tunnel }).tunnel, tunnel)
+    const reopened = createStore({ baseDir: dir })
+    assert.deepEqual(reopened.getSettings().tunnel, tunnel)
   } finally {
     cleanupDir(dir)
   }

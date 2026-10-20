@@ -54,6 +54,7 @@ const FAKE_LAN = [
 
 /** The default access block a fresh store carries. */
 const DEFAULT_ACCESS = { mode: 'lan', lanAddress: '', public: [], selectedPublicId: null }
+const DEFAULT_TUNNEL = { enabled: false, mode: 'quick', binaryPath: '', publicUrl: '' }
 
 /** Every listener started by a test, torn down in `after`. */
 const started = []
@@ -154,6 +155,8 @@ async function startAdminHost(spec) {
     ...(typeof spec.applyListenerChange === 'function'
       ? { applyListenerChange: spec.applyListenerChange }
       : {}),
+    ...(typeof spec.getTunnel === 'function' ? { getTunnel: spec.getTunnel } : {}),
+    ...(typeof spec.applyTunnelChange === 'function' ? { applyTunnelChange: spec.applyTunnelChange } : {}),
     logger: {
       debug: () => {}, info: () => {}, error: () => {},
       warn: (message) => log.push(message),
@@ -1055,9 +1058,9 @@ test('settings are readable and writable, and a reload is flagged', async () => 
     })
     assert.equal(after.status, 200)
     const data = JSON.parse(after.body).data
-    assert.deepEqual(data.settings, { enabled: true, port: 3091, access: DEFAULT_ACCESS })
+    assert.deepEqual(data.settings, { enabled: true, port: 3091, access: DEFAULT_ACCESS, tunnel: DEFAULT_TUNNEL })
     assert.equal(data.requiresReload, true, 'a live listener is not restarted underneath itself')
-    assert.deepEqual(runtime.store.getSettings(), { enabled: true, port: 3091, access: DEFAULT_ACCESS })
+    assert.deepEqual(runtime.store.getSettings(), { enabled: true, port: 3091, access: DEFAULT_ACCESS, tunnel: DEFAULT_TUNNEL })
   } finally {
     await host.stop()
     cleanupDir(runtime.dir)
@@ -1079,7 +1082,7 @@ test('an invalid setting is refused rather than silently ignored', async () => {
       assert.equal(res.status, 400, body)
       assert.equal(JSON.parse(res.body).error.code, 'admin/invalid-settings', body)
     }
-    assert.deepEqual(runtime.store.getSettings(), { enabled: false, port: 3090, access: DEFAULT_ACCESS }, 'nothing changed')
+    assert.deepEqual(runtime.store.getSettings(), { enabled: false, port: 3090, access: DEFAULT_ACCESS, tunnel: DEFAULT_TUNNEL }, 'nothing changed')
   } finally {
     await host.stop()
     cleanupDir(runtime.dir)
@@ -1157,7 +1160,7 @@ test('an invalid access block is refused with 400 and nothing is written', async
     }
 
     assert.equal(readFileSync(settingsPath, 'utf8'), before, 'not one byte may change on a refused write')
-    assert.deepEqual(runtime.store.getSettings(), { enabled: false, port: 3090, access: DEFAULT_ACCESS })
+    assert.deepEqual(runtime.store.getSettings(), { enabled: false, port: 3090, access: DEFAULT_ACCESS, tunnel: DEFAULT_TUNNEL })
   } finally {
     await host.stop()
     cleanupDir(runtime.dir)
@@ -1252,14 +1255,14 @@ test('a listener change is applied through the seam instead of asking for a rest
     const data = JSON.parse(res.body).data
     assert.equal(data.requiresReload, false, 'the listener moved, so nothing is left to restart')
     assert.equal(data.applied, true)
-    assert.deepEqual(data.settings, { enabled: true, port: 3091, access: DEFAULT_ACCESS })
+    assert.deepEqual(data.settings, { enabled: true, port: 3091, access: DEFAULT_ACCESS, tunnel: DEFAULT_TUNNEL })
 
     /* Exactly one change, carrying what the seam needs to diff: the API hands over
        the before/after snapshots rather than letting `index.js` re-read the file it
        just wrote. */
     assert.equal(changes.length, 1)
     assert.deepEqual(changes[0].before, before)
-    assert.deepEqual(changes[0].after, { enabled: true, port: 3091, access: DEFAULT_ACCESS })
+    assert.deepEqual(changes[0].after, { enabled: true, port: 3091, access: DEFAULT_ACCESS, tunnel: DEFAULT_TUNNEL })
 
     /* An access-only write never reaches the seam. */
     const accessOnly = await post({ access: DEFAULT_ACCESS })
@@ -1316,7 +1319,7 @@ test('a refused rebind answers 409 and restores the previous setting', async () 
 
     assert.deepEqual(
       runtime.store.getSettings(),
-      { enabled: false, port: 3090, access: DEFAULT_ACCESS },
+      { enabled: false, port: 3090, access: DEFAULT_ACCESS, tunnel: DEFAULT_TUNNEL },
       'the refused change is not left on disk',
     )
     assert.equal(readFileSync(settingsPath, 'utf8'), before, 'the file is byte-identical to before the attempt')
@@ -1324,7 +1327,7 @@ test('a refused rebind answers 409 and restores the previous setting', async () 
     /* One EADDRINUSE must not poison the endpoint: the next write still applies. */
     const retry = await post({ enabled: true, port: 3091 })
     assert.equal(retry.status, 200)
-    assert.deepEqual(runtime.store.getSettings(), { enabled: true, port: 3091, access: DEFAULT_ACCESS })
+    assert.deepEqual(runtime.store.getSettings(), { enabled: true, port: 3091, access: DEFAULT_ACCESS, tunnel: DEFAULT_TUNNEL })
   } finally {
     await host.stop()
     cleanupDir(runtime.dir)
@@ -1951,6 +1954,322 @@ test('a hand-edited meta never reaches the audit detail response', async () => {
     for (const leak of ['secret', 'a whole prompt', 'meta', 'body']) {
       assert.ok(!res.body.includes(leak), `${leak} must not appear in the response`)
     }
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+/* ------------------------------------------------------------------ *
+ * The managed Cloudflare Tunnel (`prd.md` R7)
+ * ------------------------------------------------------------------ */
+
+/** A deterministic tunnel controller: no process, no network, no filesystem. */
+function makeTunnelStub(spec = {}) {
+  const calls = { tokens: [], downloads: 0 }
+  const status = {
+    enabled: false,
+    mode: 'quick',
+    publicUrl: '',
+    state: 'stopped',
+    url: '',
+    error: null,
+    tokenSet: false,
+    binary: { available: true, source: 'path', path: 'C:\\Tools\\cloudflared.exe' },
+    startedAt: null,
+    ...(spec.status ?? {}),
+  }
+  return {
+    calls,
+    describe: () => ({ ...status, ...(spec.describeOverride ?? {}) }),
+    writeToken: (token) => {
+      calls.tokens.push(token)
+      return { tokenSet: token !== '' }
+    },
+    download: async () => {
+      calls.downloads += 1
+      if (spec.downloadError !== undefined) throw spec.downloadError
+      return { path: 'C:\\Tools\\cloudflared.exe', version: '2026.10.1' }
+    },
+  }
+}
+
+test('the tunnel status travels with the state read and its own endpoint', async () => {
+  const runtime = makeRuntime()
+  const tunnel = makeTunnelStub({
+    status: { enabled: true, state: 'running', url: 'https://abc-def-ghi.trycloudflare.com' },
+  })
+  const host = await startAdminHost({ runtime, getTunnel: () => tunnel })
+  try {
+    const stateRes = await send({
+      port: host.port,
+      path: `${ADMIN_API_PREFIX}/state`,
+      headers: { host: loopbackHost(host.port) },
+    })
+    assert.equal(stateRes.status, 200)
+    const state = JSON.parse(stateRes.body).data
+    assert.deepEqual(state.tunnel, tunnel.describe())
+    /* The token file's existence is reduced to a boolean, never the token. */
+    assert.equal(typeof state.tunnel.tokenSet, 'boolean')
+
+    const tunnelRes = await send({
+      port: host.port,
+      path: `${ADMIN_API_PREFIX}/tunnel`,
+      headers: { host: loopbackHost(host.port) },
+    })
+    assert.equal(tunnelRes.status, 200)
+    assert.deepEqual(JSON.parse(tunnelRes.body).data.tunnel, tunnel.describe())
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('starting the tunnel without a listener is refused before anything is written', async () => {
+  const runtime = makeRuntime()
+  const tunnel = makeTunnelStub()
+  const host = await startAdminHost({ runtime, getTunnel: () => tunnel })
+  try {
+    const res = await send({
+      port: host.port,
+      method: 'POST',
+      path: `${ADMIN_API_PREFIX}/tunnel`,
+      headers: { host: loopbackHost(host.port), 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'start' }),
+    })
+    assert.equal(res.status, 409)
+    assert.equal(JSON.parse(res.body).error.code, 'admin/tunnel-no-gateway')
+    assert.equal(runtime.store.getSettings().tunnel.enabled, false, 'the switch did not move')
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('the tunnel start/stop actions persist intent and go through the seam', async () => {
+  const runtime = makeRuntime()
+  const tunnel = makeTunnelStub()
+  const changes = []
+  const gateway = { server: { listening: true }, port: 3090 }
+  const host = await startAdminHost({
+    runtime,
+    gateway,
+    getTunnel: () => tunnel,
+    applyTunnelChange: async (change) => {
+      changes.push(change)
+      return { ...tunnel.describe(), enabled: change.after.enabled, state: change.after.enabled ? 'running' : 'stopped' }
+    },
+  })
+  const post = (body) => send({
+    port: host.port,
+    method: 'POST',
+    path: `${ADMIN_API_PREFIX}/tunnel`,
+    headers: { host: loopbackHost(host.port), 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  try {
+    const started = await post({ action: 'start' })
+    assert.equal(started.status, 200)
+    const afterStart = JSON.parse(started.body).data.tunnel
+    assert.equal(afterStart.enabled, true)
+    assert.equal(runtime.store.getSettings().tunnel.enabled, true)
+    assert.equal(changes.length, 1)
+    assert.equal(changes[0].after.enabled, true)
+    assert.equal(changes[0].force, false)
+
+    const stopped = await post({ action: 'stop' })
+    assert.equal(stopped.status, 200)
+    assert.equal(runtime.store.getSettings().tunnel.enabled, false)
+    assert.equal(changes.length, 2)
+    assert.equal(changes[1].after.enabled, false)
+
+    /* `restart` is the same persisted intent with the force flag, so the host can
+       stop-and-start a tunnel that is already running. */
+    const restarted = await post({ action: 'restart' })
+    assert.equal(restarted.status, 200)
+    assert.equal(changes.length, 3)
+    assert.equal(changes[2].force, true)
+
+    const bad = await post({ action: 'publish' })
+    assert.equal(bad.status, 400)
+    assert.equal(JSON.parse(bad.body).error.code, 'admin/tunnel-action')
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('tunnel configuration is strictly validated and the token is write-only', async () => {
+  const runtime = makeRuntime()
+  const tunnel = makeTunnelStub()
+  const changes = []
+  const host = await startAdminHost({
+    runtime,
+    getTunnel: () => tunnel,
+    applyTunnelChange: async (change) => {
+      changes.push(change)
+      return tunnel.describe()
+    },
+  })
+  const settingsPath = path.join(runtime.dir, 'devices.json')
+  const post = (body) => send({
+    port: host.port,
+    method: 'POST',
+    path: `${ADMIN_API_PREFIX}/tunnel/config`,
+    headers: { host: loopbackHost(host.port), 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  try {
+    runtime.store.updateSettings({ port: 3090 })
+    const before = readFileSync(settingsPath, 'utf8')
+
+    for (const body of [
+      { mode: 'sideways' },
+      { binaryPath: 'relative/path/cloudflared' },
+      { binaryPath: 'x'.repeat(600) },
+      { publicUrl: 'https://dsh.example.com/path' },
+      { token: 42 },
+      { token: 'has space in it' },
+    ]) {
+      const res = await post(body)
+      assert.equal(res.status, 400, JSON.stringify(body))
+      assert.equal(JSON.parse(res.body).error.code, 'admin/invalid-tunnel', JSON.stringify(body))
+    }
+    assert.equal(readFileSync(settingsPath, 'utf8'), before, 'a refused config writes nothing')
+
+    const valid = await post({
+      mode: 'token',
+      publicUrl: 'dsh.example.com',
+      binaryPath: '/usr/local/bin/cloudflared',
+      token: 'eyJhIjoiZXhhbXBsZSJ9',
+    })
+    assert.equal(valid.status, 200)
+    const saved = runtime.store.getSettings().tunnel
+    assert.equal(saved.mode, 'token')
+    assert.equal(saved.publicUrl, 'https://dsh.example.com', 'a bare hostname is stored as https')
+    assert.equal(saved.binaryPath, '/usr/local/bin/cloudflared')
+    assert.deepEqual(tunnel.calls.tokens, ['eyJhIjoiZXhhbXBsZSJ9'])
+    assert.equal(changes.length, 1)
+    assert.equal(changes[0].tokenChanged, true)
+    assert.ok(!valid.body.includes('eyJhIjoiZXhhbXBsZSJ9'), 'the token never travels back to the panel')
+
+    /* `null` clears it, and the response still says only "not set". */
+    const cleared = await post({ token: null })
+    assert.equal(cleared.status, 200)
+    assert.deepEqual(tunnel.calls.tokens, ['eyJhIjoiZXhhbXBsZSJ9', ''])
+    assert.equal(JSON.parse(cleared.body).data.tunnel.tokenSet, false)
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('a tunnel download reports busy, failure and success with the documented codes', async () => {
+  const runtime = makeRuntime()
+  const busy = makeTunnelStub({ downloadError: Object.assign(new Error('busy'), { code: 'tunnel/busy' }) })
+  const broken = makeTunnelStub({ downloadError: Object.assign(new Error('nope'), { code: 'tunnel/download-failed' }) })
+  const good = makeTunnelStub()
+
+  const download = async (tunnel) => {
+    const host = await startAdminHost({ runtime, getTunnel: () => tunnel })
+    try {
+      const res = await send({
+        port: host.port,
+        method: 'POST',
+        path: `${ADMIN_API_PREFIX}/tunnel/download`,
+        headers: { host: loopbackHost(host.port), 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+      })
+      return { status: res.status, payload: JSON.parse(res.body) }
+    } finally {
+      await host.stop()
+    }
+  }
+
+  try {
+    const busyRes = await download(busy)
+    assert.equal(busyRes.status, 409)
+    assert.equal(busyRes.payload.error.code, 'admin/tunnel-busy')
+
+    const brokenRes = await download(broken)
+    assert.equal(brokenRes.status, 502)
+    assert.equal(brokenRes.payload.error.code, 'admin/tunnel-download-failed')
+
+    const goodRes = await download(good)
+    assert.equal(goodRes.status, 200)
+    assert.equal(goodRes.payload.data.version, '2026.10.1')
+    assert.equal(good.calls.downloads, 1)
+  } finally {
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('enabling through the config endpoint has the same gateway precondition', async () => {
+  const runtime = makeRuntime()
+  const tunnel = makeTunnelStub()
+  const host = await startAdminHost({ runtime, getTunnel: () => tunnel })
+  try {
+    const res = await send({
+      port: host.port,
+      method: 'POST',
+      path: `${ADMIN_API_PREFIX}/tunnel/config`,
+      headers: { host: loopbackHost(host.port), 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+      body: JSON.stringify({ enabled: true, mode: 'quick' }),
+    })
+    assert.equal(res.status, 409)
+    assert.equal(JSON.parse(res.body).error.code, 'admin/tunnel-no-gateway')
+    assert.equal(runtime.store.getSettings().tunnel.enabled, false)
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('a tunnel seam that throws restores the previous switch', async () => {
+  const runtime = makeRuntime()
+  const tunnel = makeTunnelStub()
+  const gateway = { server: { listening: true }, port: 3090 }
+  const host = await startAdminHost({
+    runtime,
+    gateway,
+    getTunnel: () => tunnel,
+    applyTunnelChange: async () => {
+      throw new Error('boom')
+    },
+  })
+  try {
+    const res = await send({
+      port: host.port,
+      method: 'POST',
+      path: `${ADMIN_API_PREFIX}/tunnel`,
+      headers: { host: loopbackHost(host.port), 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'start' }),
+    })
+    assert.equal(res.status, 500)
+    assert.equal(JSON.parse(res.body).error.code, 'admin/tunnel-failed')
+    assert.equal(runtime.store.getSettings().tunnel.enabled, false, 'the half-state was rolled back')
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('a host without a tunnel controller degrades instead of pretending', async () => {
+  const runtime = makeRuntime()
+  const host = await startAdminHost({ runtime })
+  try {
+    const res = await send({
+      port: host.port,
+      path: `${ADMIN_API_PREFIX}/tunnel`,
+      headers: { host: loopbackHost(host.port) },
+    })
+    assert.equal(res.status, 500)
+    assert.equal(JSON.parse(res.body).error.code, 'admin/tunnel-unavailable')
+    const state = JSON.parse((await send({
+      port: host.port,
+      path: `${ADMIN_API_PREFIX}/state`,
+      headers: { host: loopbackHost(host.port) },
+    })).body).data
+    assert.equal(state.tunnel, null)
   } finally {
     await host.stop()
     cleanupDir(runtime.dir)

@@ -124,16 +124,37 @@ test('the locale files are valid JSON and share one key set', () => {
   assert.deepEqual(Object.keys(zh).sort(), Object.keys(en).sort())
 })
 
-test('the host half never shells out', () => {
-  /* No external process is needed anywhere in this package; `shell: true` or an
-     `exec` would be a supply-chain surface for no benefit. */
-  const sources = hostSources()
-  for (const relative of sources) {
+test('the host half shells out only for the managed cloudflared process', () => {
+  /* The original invariant was "never shells out". The managed Cloudflare Tunnel
+     narrowed it on purpose (2026-10-20): exactly ONE module may import
+     `node:child_process`, and it does so with an argv array, `shell: false`, and a
+     binary path this package resolved itself. Everything else stays shell-free, and
+     the two properties that made the old rule worth having are still asserted for
+     every file: no `shell: true`, no `exec`/`execSync`. */
+  const processSources = new Set(['src/host/tunnel.js'])
+  for (const relative of hostSources()) {
     const source = readFileSync(path.join(repoRoot, relative), 'utf8')
     assert.ok(!/shell\s*:\s*true/.test(source), `${relative} must not use shell: true`)
     assert.ok(!/\bexecSync\b|\bexec\(/.test(source), `${relative} must not execute external commands`)
+    if (processSources.has(relative)) continue
     assert.ok(!/node:child_process/.test(source), `${relative} must not import node:child_process`)
   }
+
+  /* And the one exception really is the shape it claims to be. */
+  const tunnel = readFileSync(path.join(repoRoot, 'src/host/tunnel.js'), 'utf8')
+  assert.match(tunnel, /from 'node:child_process'/, 'the tunnel controller owns the only child process')
+  assert.match(tunnel, /spawnImpl\(binary\.path, args, \{/, 'the binary and argv are resolved, not concatenated')
+  assert.match(tunnel, /shell: false/, 'the spawn is explicit about not using a shell')
+  assert.match(tunnel, /windowsHide: true/, 'no console window is flashed on Windows')
+  assert.match(tunnel, /--token-file/, 'the tunnel token travels through a file, never through argv')
+
+  /* The download is the one action that writes an executable, so its source is
+     pinned: a constant metadata endpoint and a host check on the asset URL. */
+  const binary = readFileSync(path.join(repoRoot, 'src/host/tunnel-binary.js'), 'utf8')
+  assert.match(binary, /TUNNEL_RELEASE_API/, 'the release endpoint is a constant')
+  assert.match(binary, /url\.hostname !== TUNNEL_ASSET_HOST/, 'the asset host is checked before writing')
+  assert.match(binary, /expected === null/, 'an asset without a published digest is refused')
+  assert.ok(!/node:child_process/.test(binary), 'the downloader never runs anything')
 })
 
 test('the host half logs through ctx.logger, never console', () => {
@@ -217,6 +238,20 @@ test('the access-address module exists and is packaged', () => {
     const source = readFileSync(path.join(repoRoot, relative), 'utf8')
     assert.match(source, /from '\.\/addresses\.js'/, `${relative} must import the address rules`)
   }
+})
+
+test('the tunnel modules exist and are packaged', () => {
+  /* `tunnel.js` is imported by `index.js`, `api.js` (grammar only) and `store.js`
+     (normalization); `tunnel-binary.js` is imported by `tunnel.js`. A package
+     missing either one does not merely lose the feature — it fails to load. */
+  for (const relative of ['src/host/tunnel.js', 'src/host/tunnel-binary.js']) {
+    assert.ok(existsSync(path.join(repoRoot, relative)), `missing tunnel module: ${relative}`)
+    assert.ok(pkg.files.includes(relative), `${relative} must be listed in files`)
+  }
+  const store = readFileSync(path.join(repoRoot, 'src/host/store.js'), 'utf8')
+  assert.match(store, /from '\.\/tunnel\.js'/, 'the store imports the tunnel grammar it normalizes')
+  const api = readFileSync(path.join(repoRoot, 'src/host/api.js'), 'utf8')
+  assert.match(api, /validateTunnel/, 'the API validates the strict form of the tunnel settings')
 })
 
 test('the signing-key module exists and is packaged', () => {

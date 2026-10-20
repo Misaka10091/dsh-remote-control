@@ -450,6 +450,32 @@ test('the two shipped dictionaries are key-identical and value-distinct', () => 
   }
 })
 
+test('the tunnel card discloses the third party and the quick-tunnel limit', () => {
+  /* `design.md` §9 / frontend guidelines §12: enabling a tunnel routes traffic
+     through Cloudflare, and a quick tunnel hostname changes on every start. Both
+     facts have to be visible in the panel, not only in the README. */
+  const { bundle } = loadClientBundle()
+  const { ZH, EN } = bundle.internals
+  for (const key of [
+    'address.modeTunnel',
+    'tunnel.heading',
+    'tunnel.hint',
+    'tunnel.quickHint',
+    'tunnel.namedHint',
+    'tunnel.error.binaryMissing',
+    'tunnel.error.startTimeout',
+    'pair.tunnelDown',
+    'pair.tunnelHint',
+  ]) {
+    assert.equal(typeof ZH[key], 'string', `zh ${key}`)
+    assert.equal(typeof EN[key], 'string', `en ${key}`)
+  }
+  assert.match(ZH['tunnel.hint'], /Cloudflare/)
+  assert.match(EN['tunnel.hint'], /Cloudflare/)
+  assert.match(ZH['tunnel.quickHint'], /重新配对/)
+  assert.match(EN['tunnel.quickHint'], /pair again/)
+})
+
 test('locale/*.json agree with the inline dictionaries the bundle actually ships', () => {
   const { bundle } = loadClientBundle()
   const { ZH, EN } = bundle.internals
@@ -670,6 +696,16 @@ test('a public address is used exactly as written, a LAN address gets the gatewa
   assert.equal(
     pairingUrl(pair, '192.168.1.5', 'http://127.0.0.1:3080/', 'lan'),
     'http://192.168.1.5:3090/remote-control/pair#p:c',
+  )
+  /* Tunnel mode behaves like public: Cloudflare owns the port, so the URL is used
+     exactly as printed. */
+  assert.equal(
+    pairingUrl(pair, 'https://abc-def-ghi.trycloudflare.com', 'http://127.0.0.1:3080/', 'tunnel'),
+    'https://abc-def-ghi.trycloudflare.com/remote-control/pair#p:c',
+  )
+  assert.equal(
+    pairingUrl(pair, 'https://dsh.example.net:8443', 'http://127.0.0.1:3080/', 'tunnel'),
+    'https://dsh.example.net:8443/remote-control/pair#p:c',
   )
   /* Omitting the mode keeps the pre-existing behaviour (LAN rules). */
   assert.equal(
@@ -961,15 +997,22 @@ test('both copies of effectiveAddress resolve the same matrix', () => {
     { mode: 'public', public: [{ id: 'a', address: 'home.example.com:3090' }] },
     { mode: 'public', public: [{ id: 'a', address: 'home.example.com' }, { id: 'b', address: ' x ' }], selectedPublicId: 'b' },
     { mode: 'public', public: [{ id: 'a', address: 'home.example.com' }], selectedPublicId: 'gone' },
+    /* The managed tunnel's URL is a RUNTIME fact passed beside the setting, so the
+       matrix must include it with the URL missing, empty and present. */
+    { mode: 'tunnel' },
+    { mode: 'tunnel', lanAddress: '10.0.0.7', public: [{ id: 'a', address: 'home.example.com' }] },
   ]
+  const tunnelUrls = [null, '', '   ', 'https://abc-def-ghi.trycloudflare.com']
 
   for (const access of accesses) {
     for (const lan of lanSets) {
-      assert.equal(
-        effectiveAddress(access, lan),
-        hostEffectiveAddress(access, lan),
-        `both must resolve ${JSON.stringify({ access, lan })}`,
-      )
+      for (const tunnelUrl of tunnelUrls) {
+        assert.equal(
+          effectiveAddress(access, lan, tunnelUrl),
+          hostEffectiveAddress(access, lan, tunnelUrl),
+          `both must resolve ${JSON.stringify({ access, lan, tunnelUrl })}`,
+        )
+      }
     }
   }
 })
@@ -1015,6 +1058,20 @@ test('the effective address follows the stored choice and falls back without wri
   /* Public mode with an empty book falls back to NO address, not to the LAN list:
      the mode is an instruction about which list to read. */
   assert.equal(effectiveAddress({ mode: 'public', public: [], selectedPublicId: null }, lan), null)
+
+  /* Tunnel mode reads ONLY the live URL; the interfaces and the book are ignored. */
+  const tunnelAccess = { mode: 'tunnel', lanAddress: '10.0.0.7', public: book, selectedPublicId: 'pub_b' }
+  assert.equal(
+    effectiveAddress(tunnelAccess, lan, 'https://abc-def-ghi.trycloudflare.com'),
+    'https://abc-def-ghi.trycloudflare.com',
+  )
+  assert.equal(effectiveAddress(tunnelAccess, lan, ''), null, 'no URL, no address')
+  assert.equal(effectiveAddress(tunnelAccess, lan, undefined), null)
+  assert.equal(
+    effectiveAddress({ mode: 'lan', lanAddress: '10.0.0.7' }, lan, 'https://x.trycloudflare.com'),
+    '10.0.0.7',
+    'the URL is not consulted outside tunnel mode',
+  )
 })
 
 test('the access settings are rebuilt from whatever the host sent', () => {
@@ -1032,6 +1089,9 @@ test('the access settings are rebuilt from whatever the host sent', () => {
   /* Default off LAN, never public: public is the mode whose reachability the
      plugin cannot check, so it must never be the accidental default. */
   assert.equal(accessOf({ access: { mode: 'PUBLIC' } }).mode, 'lan')
+  /* `tunnel` is a recognized mode and survives the rebuild; an unknown one does not. */
+  assert.equal(accessOf({ access: { mode: 'tunnel' } }).mode, 'tunnel')
+  assert.equal(accessOf({ access: { mode: 'sideload' } }).mode, 'lan')
   assert.deepEqual(accessOf({
     access: {
       mode: 'public',
@@ -1354,12 +1414,17 @@ test('the pairing tab owns the access point, the access tab owns the address boo
      pairing (it is what the symbol encodes), maintaining the public address book is
      administration. Asserted at source level — the browser half has no DOM test
      environment; the strings themselves are pinned by the dictionary parity tests. */
-  const point = /function AccessPointSection\(\{ t, settings, addresses, updateSettings, onManagePublic \}\) \{([\s\S]*?)\n    \}/.exec(clientSource)
+  const point = /function AccessPointSection\(\{ t, settings, addresses, tunnel, updateSettings, onManagePublic, onManageTunnel \}\) \{([\s\S]*?)\n    \}/.exec(clientSource)
   assert.ok(point !== null, 'AccessPointSection must be discoverable')
   const pointBody = point[1]
 
   assert.match(pointBody, /segment\('lan', 'address\.modeLan'\)/)
   assert.match(pointBody, /segment\('public', 'address\.modePublic'\)/)
+  assert.match(pointBody, /segment\('tunnel', 'address\.modeTunnel', tunnelLive\)/)
+  /* The tunnel option is disabled until the tunnel actually reports a URL: a mode
+     that would produce a link to nowhere is not offered as if it worked. */
+  assert.match(pointBody, /tunnelLive/)
+  assert.match(pointBody, /t\('address\.goTunnel'\)/)
   /* LAN: a select over the SERVER's list (the browser cannot enumerate NICs). */
   assert.match(pointBody, /addresses\.lan/)
   assert.match(pointBody, /h\('select'/)
@@ -2194,7 +2259,11 @@ test('the panel puts its two global settings above the tabs, and each tab keeps 
   /* 配对 = access point + pairing card; 接入 = the book, and only the book. */
   assert.match(clientSource, /case 'pairing':[\s\S]{0,800}?h\(AccessPointSection, \{/)
   assert.match(clientSource, /h\(AccessPointSection, \{[\s\S]{0,900}?h\(PairingSection, \{/)
-  assert.match(clientSource, /case 'access':[\s\S]{0,400}?h\(PublicBookSection, \{/)
+  /* 接入 = the tunnel card + the public address book. The tunnel status and its
+     configuration are one card because enabling it needs both, and the card must
+     be inside the tab that owns administration. */
+  assert.match(clientSource, /case 'access':[\s\S]{0,300}?h\(TunnelSection, \{/)
+  assert.match(clientSource, /h\(TunnelSection, \{[\s\S]{0,1200}?h\(PublicBookSection, \{/)
   assert.match(clientSource, /case 'audit':[\s\S]{0,200}?h\(AuditEventsSection, \{/)
 
   /* The tab shell's stylesheet: theme tokens only, and one scrolling layer. */

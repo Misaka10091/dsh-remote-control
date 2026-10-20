@@ -293,6 +293,31 @@ test('public mode reads the book, never the interfaces', () => {
   assert.equal(effectiveAddress({ mode: 'public' }, LAN), null)
 })
 
+test('tunnel mode uses the live URL, never the interfaces or the book', () => {
+  /* The managed tunnel's hostname changes on every quick-tunnel start, so it is a
+     RUNTIME fact: nothing is stored in `settings.access`, and the caller supplies
+     the current URL. A stale persisted string is exactly what this avoids. */
+  const access = {
+    mode: 'tunnel',
+    lanAddress: '10.0.0.7',
+    public: BOOK,
+    selectedPublicId: 'pub_b',
+  }
+  assert.equal(
+    effectiveAddress(access, LAN, 'https://abc-def-ghi.trycloudflare.com'),
+    'https://abc-def-ghi.trycloudflare.com',
+  )
+  assert.equal(effectiveAddress(access, LAN, ''), null, 'tunnel mode without a URL has no address')
+  assert.equal(effectiveAddress(access, LAN, null), null)
+  assert.equal(effectiveAddress(access, LAN, '   '), null)
+  assert.equal(effectiveAddress(access, [], 'https://x.trycloudflare.com'), 'https://x.trycloudflare.com')
+  assert.equal(
+    effectiveAddress({ mode: 'lan' }, LAN, 'https://x.trycloudflare.com'),
+    '192.168.1.5',
+    'the URL argument is only read in tunnel mode',
+  )
+})
+
 test('an unknown or missing mode behaves as LAN', () => {
   /* The reader must never end up in `public` by accident: that is the mode whose
      reachability this plugin cannot check. */
@@ -395,6 +420,14 @@ test('validateAccess refuses exactly what normalizeAccess had to repair', () => 
        two policies share one grammar rather than two. */
     assert.equal(typeof normalizeAccess(value), 'object')
   }
+})
+
+test('validateAccess and normalizeAccess both accept the tunnel mode', () => {
+  /* Same rules, two policies: the mode list is the single source of truth, so the
+     strict reader must not reject what the lenient one now stores. */
+  assert.equal(validateAccess({ mode: 'tunnel' }).ok, true)
+  assert.equal(normalizeAccess({ mode: 'tunnel' }).mode, 'tunnel')
+  assert.equal(validateAccess({ mode: 'sideload' }).ok, false, 'an unknown mode is still refused')
 })
 
 test('validateAccess normalizes a valid value into what gets stored', () => {

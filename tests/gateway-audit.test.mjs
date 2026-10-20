@@ -269,6 +269,72 @@ test('a refused request produces no audit line', async () => {
   }
 })
 
+test('a Cloudflare-proxied request is remote, and audited with the edge client IP', async () => {
+  /* A managed tunnel reaches the gateway from loopback with a tunnel hostname. The
+     hostname must NOT satisfy the loopback exemption (it does not name this
+     machine), and the audit must name the real client: `CF-Connecting-IP` is
+     trusted here because the socket half is loopback. */
+  const { gateway, dir, token, stop } = await makeGateway()
+  const host = 'abc-def-ghi.trycloudflare.com'
+  const baseHeaders = { host, origin: `https://${host}`, 'content-type': 'application/json' }
+  try {
+    const unpaired = await send({
+      port: gateway.port,
+      method: 'POST',
+      path: '/api/session/prompt',
+      headers: { ...baseHeaders, 'cf-connecting-ip': '203.0.113.9' },
+      body: '{}',
+    })
+    assert.equal(unpaired.status, 401, 'a tunnel hostname is not a local exemption')
+
+    const paired = await send({
+      port: gateway.port,
+      method: 'POST',
+      path: '/api/session/prompt',
+      headers: {
+        ...baseHeaders,
+        cookie: `${DEVICE_COOKIE_NAME}=${token}`,
+        'cf-connecting-ip': '203.0.113.9',
+      },
+      body: '{}',
+    })
+    assert.equal(paired.status, 200)
+
+    const line = auditLines(dir).find((entry) => entry.event === 'send_message')
+    assert.ok(line !== undefined)
+    assert.equal(line.ip, '203.0.113.9', 'the edge client address, not the tunnel loopback hop')
+  } finally {
+    await stop()
+  }
+})
+
+test('a request on a loopback socket is attributed to the edge IP', async () => {
+  /* The trust rule is about the SOCKET, not the Host: a managed tunnel always
+     arrives over loopback, so a LAN-looking Host plus a real tunnel request must
+     still record the edge address. */
+  const { gateway, dir, token, stop } = await makeGateway()
+  try {
+    const res = await send({
+      port: gateway.port,
+      method: 'POST',
+      path: '/api/session/prompt',
+      headers: {
+        host: lanHost(gateway.port),
+        cookie: `${DEVICE_COOKIE_NAME}=${token}`,
+        'sec-fetch-site': 'same-origin',
+        'content-type': 'application/json',
+        'cf-connecting-ip': '203.0.113.9',
+      },
+      body: '{}',
+    })
+    assert.equal(res.status, 200)
+    const line = auditLines(dir).find((entry) => entry.event === 'send_message')
+    assert.equal(line.ip, '203.0.113.9')
+  } finally {
+    await stop()
+  }
+})
+
 test('a query string never reaches the audit trail', async () => {
   /* A query can carry a prompt fragment or a file path. Only the pathname is
      recorded, which is why `meta.path` is derived from `URL.pathname`. */
