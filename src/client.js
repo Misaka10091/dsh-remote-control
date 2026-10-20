@@ -380,6 +380,12 @@ window.__ModuleLoader__.load({
       'tunnel.publicUrl': '公开主机名',
       'tunnel.publicUrlHint': '填 Cloudflare 控制台里为该隧道配置的公开主机名，例如 https://dsh.example.com。',
       'tunnel.binary': 'cloudflared',
+      'tunnel.binary.auto': '系统 PATH',
+      'tunnel.binary.customMode': '自定义',
+      'tunnel.binaryMode': 'cloudflared 来源',
+      'tunnel.binaryModeHint': '选择从系统 PATH 自动查找，或只使用你填写的自定义路径。',
+      'tunnel.binaryDetected': '实际检测到的路径',
+      'tunnel.binaryAutoHint': '自动依次查找系统 PATH 与已下载副本。',
       'tunnel.binary.custom': '自定义路径',
       'tunnel.binary.path': '系统 PATH',
       'tunnel.binary.downloaded': '已下载',
@@ -388,7 +394,7 @@ window.__ModuleLoader__.load({
       'tunnel.downloading': '下载中…',
       'tunnel.downloaded': '已下载 {version}',
       'tunnel.binaryPath': '自定义路径',
-      'tunnel.binaryPathHint': '留空则按 PATH → 已下载副本的顺序查找；填了但不存在会直接报错，不会回退。',
+      'tunnel.binaryPathHint': '必须是绝对路径或 PATH 里的命令名；填了但不存在会直接报错，不会回退。',
       'tunnel.binaryCustomMissing': '自定义路径优先；它不存在时不会回退到 PATH 或已下载副本。请修正或清空后再试。',
       'tunnel.save': '保存隧道设置',
       'tunnel.saved': '已保存。',
@@ -402,6 +408,7 @@ window.__ModuleLoader__.load({
       'tunnel.error.urlMissing': '具名隧道需要填写公开主机名。',
       'tunnel.error.startTimeout': 'cloudflared 启动后没有在 30 秒内给出公网地址。',
       'tunnel.error.spawnFailed': 'cloudflared 无法启动，请检查路径与执行权限。',
+      'tunnel.error.customPathMissing': '选了自定义就必须填写路径；要自动查找请切回「系统 PATH」。',
       'tunnel.error.exited': 'cloudflared 进程已退出，隧道不再可用；请检查 Token 与网络后重试。',
       'tunnel.error.noPort': '网关没有可用的监听端口。',
       'tunnel.error.downloadFailed': '下载失败：网络、摘要校验或写入磁盘任一步没有完成。',
@@ -564,6 +571,12 @@ window.__ModuleLoader__.load({
       'tunnel.publicUrl': 'Public hostname',
       'tunnel.publicUrlHint': 'Enter the public hostname configured for this tunnel in the Cloudflare dashboard, e.g. https://dsh.example.com.',
       'tunnel.binary': 'cloudflared',
+      'tunnel.binary.auto': 'System PATH',
+      'tunnel.binary.customMode': 'Custom',
+      'tunnel.binaryMode': 'cloudflared source',
+      'tunnel.binaryModeHint': 'Resolve cloudflared from the system PATH, or use only the custom path you enter.',
+      'tunnel.binaryDetected': 'Detected path',
+      'tunnel.binaryAutoHint': 'Looked up on the system PATH first, then at the downloaded copy.',
       'tunnel.binary.custom': 'custom path',
       'tunnel.binary.path': 'system PATH',
       'tunnel.binary.downloaded': 'downloaded',
@@ -572,7 +585,7 @@ window.__ModuleLoader__.load({
       'tunnel.downloading': 'Downloading…',
       'tunnel.downloaded': 'Downloaded {version}',
       'tunnel.binaryPath': 'Custom path',
-      'tunnel.binaryPathHint': 'Leave empty to look on PATH, then at the downloaded copy. A path that does not exist is an error, never a fallback.',
+      'tunnel.binaryPathHint': 'Must be an absolute path or a command name on PATH; a path that does not exist is an error, never a fallback.',
       'tunnel.binaryCustomMissing': 'A custom path wins; when it does not exist there is no fallback to PATH or the downloaded copy. Fix or clear it, then retry.',
       'tunnel.save': 'Save tunnel settings',
       'tunnel.saved': 'Saved.',
@@ -586,6 +599,7 @@ window.__ModuleLoader__.load({
       'tunnel.error.urlMissing': 'A named tunnel needs a public hostname.',
       'tunnel.error.startTimeout': 'cloudflared did not report a public URL within 30 seconds.',
       'tunnel.error.spawnFailed': 'cloudflared could not be started; check the path and its execute permission.',
+      'tunnel.error.customPathMissing': 'A custom path is required in Custom mode; switch to System PATH to auto-resolve.',
       'tunnel.error.exited': 'The cloudflared process exited, so the tunnel is no longer available. Check the token and network, then retry.',
       'tunnel.error.noPort': 'The gateway has no listening port.',
       'tunnel.error.downloadFailed': 'The download failed: network, digest verification or writing to disk did not complete.',
@@ -3445,6 +3459,7 @@ window.__ModuleLoader__.load({
 
       const [modeDraft, setModeDraft] = useState(null)
       const [publicUrlDraft, setPublicUrlDraft] = useState(null)
+      const [binaryModeDraft, setBinaryModeDraft] = useState(null)
       const [binaryPathDraft, setBinaryPathDraft] = useState(null)
       const [tokenDraft, setTokenDraft] = useState('')
       const [busy, setBusy] = useState(null)
@@ -3453,13 +3468,22 @@ window.__ModuleLoader__.load({
 
       const mode = modeDraft !== null ? modeDraft : (stored.mode === 'token' ? 'token' : 'quick')
       const publicUrlText = publicUrlDraft !== null ? publicUrlDraft : (typeof stored.publicUrl === 'string' ? stored.publicUrl : '')
-      const binaryPathText = binaryPathDraft !== null ? binaryPathDraft : (typeof stored.binaryPath === 'string' ? stored.binaryPath : '')
+      /* `binaryPath` is the storage for BOTH shapes: empty means "let the plugin
+         resolve it" (PATH, then the downloaded copy); a value means "use exactly
+         this". The panel makes that choice explicit instead of showing an always-on
+         text box next to a detected path. */
+      const binaryMode = binaryModeDraft !== null
+        ? binaryModeDraft
+        : (typeof stored.binaryPath === 'string' && stored.binaryPath.trim() !== '' ? 'custom' : 'auto')
+      const customPathText = binaryPathDraft !== null
+        ? binaryPathDraft
+        : (typeof stored.binaryPath === 'string' ? stored.binaryPath : '')
 
       const patchNow = () => {
         const patch = {
           mode,
           publicUrl: publicUrlText,
-          binaryPath: binaryPathText,
+          binaryPath: binaryMode === 'custom' ? customPathText.trim() : '',
         }
         if (tokenDraft.trim() !== '') patch.token = tokenDraft.trim()
         return patch
@@ -3468,11 +3492,19 @@ window.__ModuleLoader__.load({
       const resetDrafts = () => {
         setModeDraft(null)
         setPublicUrlDraft(null)
+        setBinaryModeDraft(null)
         setBinaryPathDraft(null)
         setTokenDraft('')
       }
 
       const save = async () => {
+        /* "Custom" is an explicit choice: saving it with an empty path would be
+           stored as the auto setting and the panel would silently flip back to
+           "System PATH" after the reload. Refuse instead of pretending. */
+        if (binaryMode === 'custom' && customPathText.trim() === '') {
+          setOutcome({ tone: 'invalidPath' })
+          return false
+        }
         const result = await updateTunnelConfig(patchNow())
         if (result.ok !== true) {
           setOutcome({ tone: 'error', failure: result.failure })
@@ -3554,6 +3586,8 @@ window.__ModuleLoader__.load({
       if (outcome !== null) {
         if (outcome.tone === 'ok') {
           outcomeNode = h(Notice, { tone: 'ok', title: t('tunnel.saved') })
+        } else if (outcome.tone === 'invalidPath') {
+          outcomeNode = h(Notice, { tone: 'error', title: t('tunnel.error.customPathMissing') })
         } else if (outcome.tone === 'downloaded') {
           outcomeNode = h(Notice, { tone: 'ok', title: t('tunnel.downloaded', { version: outcome.version }) })
         } else {
@@ -3601,20 +3635,77 @@ window.__ModuleLoader__.load({
           body: errorCode,
         })
 
-      const binaryNode = h('div', { className: 'drc-tunnelRow' },
+      const binaryModeButtons = h('div', {
+        className: 'drc-segments',
+        role: 'group',
+        'aria-label': t('tunnel.binaryMode'),
+      },
+        ['auto', 'custom'].map((value) => h('button', {
+          key: value,
+          type: 'button',
+          className: binaryMode === value ? 'drc-segment drc-segmentActive' : 'drc-segment',
+          'aria-pressed': binaryMode === value,
+          disabled: busy !== null,
+          onClick: () => {
+            setOutcome(null)
+            setBinaryModeDraft(value)
+          },
+        }, t(value === 'auto' ? 'tunnel.binary.auto' : 'tunnel.binary.customMode'))),
+      )
+
+      const downloadButton = binary.available !== true
+        ? h('button', {
+          type: 'button',
+          className: 'drc-button',
+          disabled: busy !== null,
+          onClick: () => { void onDownload() },
+        }, busy === 'download' ? t('tunnel.downloading') : t('tunnel.download'))
+        : null
+
+      /* Auto mode shows the path the host ACTUALLY resolved (which may be the
+         downloaded copy rather than PATH), so "system PATH" is a claim the panel
+         proves instead of assuming. Custom mode shows the one path that will be
+         used, with no fallback behind it. */
+      const binaryPathNode = binaryMode === 'auto'
+        ? h('div', { className: 'drc-tunnelFields' },
+          h('div', { className: 'drc-field' },
+            h('span', { className: 'drc-label' }, t('tunnel.binaryDetected')),
+            h('p', { className: 'drc-publicAddress' },
+              binary.available === true && typeof binary.path === 'string'
+                ? binary.path
+                : t('tunnel.binary.missing')),
+          ),
+          binary.available === true ? h('span', { className: 'drc-hint' }, t(binarySourceKey)) : null,
+          h('span', { className: 'drc-hint' }, t('tunnel.binaryAutoHint')),
+          downloadButton,
+        )
+        : h('div', { className: 'drc-tunnelFields' },
+          h('label', { className: 'drc-field' },
+            h('span', { className: 'drc-label' }, t('tunnel.binaryPath')),
+            h('input', {
+              className: 'drc-input drc-inputWide drc-mono',
+              type: 'text',
+              value: customPathText,
+              placeholder: 'C:\\Tools\\cloudflared.exe',
+              disabled: busy !== null,
+              onChange: (event) => {
+                setOutcome(null)
+                setBinaryPathDraft(event.target.value)
+              },
+            }),
+            h('span', { className: 'drc-hint' }, t('tunnel.binaryPathHint')),
+          ),
+          binary.available !== true && customPathText.trim() !== ''
+            ? h('span', { className: 'drc-hint' }, t('tunnel.binaryCustomMissing'))
+            : null,
+          downloadButton,
+        )
+
+      const binaryNode = h('div', { className: 'drc-tunnelFields' },
         h('span', { className: 'drc-label' }, t('tunnel.binary')),
-        h('span', { className: 'drc-hint' }, t(binarySourceKey)),
-        binary.available !== true && binaryPathText.trim() !== ''
-          ? h('span', { className: 'drc-hint' }, t('tunnel.binaryCustomMissing'))
-          : null,
-        binary.available !== true
-          ? h('button', {
-            type: 'button',
-            className: 'drc-button',
-            disabled: busy !== null,
-            onClick: () => { void onDownload() },
-          }, busy === 'download' ? t('tunnel.downloading') : t('tunnel.download'))
-          : null,
+        h('span', { className: 'drc-hint' }, t('tunnel.binaryModeHint')),
+        binaryModeButtons,
+        binaryPathNode,
       )
 
       const modeButtons = h('div', {
@@ -3708,34 +3799,18 @@ window.__ModuleLoader__.load({
               disabled: busy !== null,
               onClick: () => { void onAction('restart') },
             }, t('tunnel.restart'))
-            : null,        ),
+            : null,
+        ),
         modeButtons,
         tokenNode,
         binaryNode,
-        h('div', { className: 'drc-tunnelFields' },
-          h('label', { className: 'drc-field' },
-            h('span', { className: 'drc-label' }, t('tunnel.binaryPath')),
-            h('input', {
-              className: 'drc-input drc-inputWide drc-mono',
-              type: 'text',
-              value: binaryPathText,
-              placeholder: 'C:\\Tools\\cloudflared.exe',
-              disabled: busy !== null,
-              onChange: (event) => {
-                setOutcome(null)
-                setBinaryPathDraft(event.target.value)
-              },
-            }),
-            h('span', { className: 'drc-hint' }, t('tunnel.binaryPathHint')),
-          ),
-          h('div', { className: 'drc-row' },
-            h('button', {
-              type: 'button',
-              className: 'drc-button',
-              disabled: busy !== null,
-              onClick: () => { void onSave() },
-            }, busy === 'save' ? t('tunnel.save') + '…' : t('tunnel.save')),
-          ),
+        h('div', { className: 'drc-row' },
+          h('button', {
+            type: 'button',
+            className: 'drc-button',
+            disabled: busy !== null,
+            onClick: () => { void onSave() },
+          }, busy === 'save' ? t('tunnel.save') + '…' : t('tunnel.save')),
         ),
         outcomeNode,
       )

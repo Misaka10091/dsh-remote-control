@@ -2239,6 +2239,29 @@ test('the tab, status and audit-detail strings exist in all four copies', () => 
   for (const tab of TABS) assert.equal(typeof EN[tab.labelKey], 'string')
 })
 
+test('the tunnel card makes the cloudflared source an explicit choice', () => {
+  /* The panel used to show a "system PATH" label and an always-visible custom-path
+     text box at the same time, which read as two independent settings. The choice
+     is now explicit, and the PATH option displays the path the host actually
+     resolved instead of merely claiming "system PATH". */
+  const section = /function TunnelSection\(\{ t, settings, tunnel, gateway, tunnelAction, updateTunnelConfig, downloadTunnel \}\) \{([\s\S]*?)\n    \}/.exec(clientSource)
+  assert.ok(section !== null, 'TunnelSection must be discoverable')
+  const body = section[1]
+
+  assert.match(body, /t\('tunnel\.binaryMode'\)/, 'the group is labelled')
+  assert.match(body, /'tunnel\.binary\.auto'/)
+  assert.match(body, /'tunnel\.binary\.customMode'/)
+  assert.match(body, /binaryMode === value/, 'the selected source is a real pressed segment')
+  assert.match(body, /t\('tunnel\.binaryDetected'\)/, 'the detected path has its own label')
+  assert.match(body, /binary\.path/, 'the detected path comes from the host, not from the saved text')
+  assert.match(body, /binaryMode === 'auto'/)
+  assert.match(body, /binaryMode === 'custom'/)
+  assert.match(body, /t\('tunnel\.error\.customPathMissing'\)/, 'an empty custom path is refused before saving')
+  /* Saving the auto mode must clear a stored custom path, or the resolver would
+     keep using the path the user just switched away from. */
+  assert.match(body, /binaryPath: binaryMode === 'custom' \? customPathText\.trim\(\) : ''/)
+})
+
 test('the panel puts its two global settings above the tabs, and each tab keeps one job', () => {
   /* Review reshape: the master switch and the listener port are panel-wide facts, so
      they live in a configuration row above the tablist; 配对 owns the access point,
