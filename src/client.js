@@ -332,7 +332,6 @@ window.__ModuleLoader__.load({
       'access.enableHint': '关闭时官方 dsh web 端口完全不对外，行为与未安装插件一致。',
       'access.port': '端口',
       'access.save': '保存',
-      'access.saved': '接入设置已保存。',
       'access.reloadRequired': '设置已保存到磁盘，但当前进程仍在使用旧的监听配置，需要重启 dsh 才会生效。',
       'access.invalidPort': '端口必须是 1 到 65535 之间的整数。',
       'access.gatewayDisabled': '未启用，没有监听端口。',
@@ -344,8 +343,6 @@ window.__ModuleLoader__.load({
       'address.modePublic': '公网',
       'address.lanEmpty': '没有可用的网卡地址。',
       'address.publicEmpty': '还没有配置公网地址。',
-      'address.modeSaved': '接入地址已更新。',
-      'address.bookSaved': '公网地址已保存。',
       'address.label': '备注',
       'address.address': '地址',
       'address.add': '添加',
@@ -394,12 +391,10 @@ window.__ModuleLoader__.load({
       'tunnel.binary.missing': '未找到',
       'tunnel.download': '下载 cloudflared',
       'tunnel.downloading': '下载中…',
-      'tunnel.downloaded': '已下载 {version}',
       'tunnel.binaryPath': '自定义路径',
       'tunnel.binaryPathHint': '必须是绝对路径或 PATH 里的命令名；填了但不存在会直接报错，不会回退。',
       'tunnel.binaryCustomMissing': '自定义路径优先；它不存在时不会回退到 PATH 或已下载副本。请修正或清空后再试。',
       'tunnel.save': '保存隧道设置',
-      'tunnel.saved': '隧道设置已保存。',
       'tunnel.quickHint': '快速隧道不需要账号，但域名每次启动都会变，已配对设备需要重新配对。',
       'tunnel.namedHint': '具名隧道需要先在 Cloudflare 控制台创建隧道、配置公开主机名，再把 Token 填到这里。',
       'tunnel.gatewayOff': '先在上方启用远程接入，隧道才有可转发的本地端口。',
@@ -525,7 +520,6 @@ window.__ModuleLoader__.load({
       'access.enableHint': 'When off, the official dsh web port is not reachable at all and the host behaves as if this plugin were not installed.',
       'access.port': 'Port',
       'access.save': 'Save',
-      'access.saved': 'Access settings saved.',
       'access.reloadRequired': 'The setting is on disk, but this process still runs the old listener configuration. Restart dsh for it to take effect.',
       'access.invalidPort': 'The port must be an integer between 1 and 65535.',
       'access.gatewayDisabled': 'Disabled, nothing is listening.',
@@ -537,8 +531,6 @@ window.__ModuleLoader__.load({
       'address.modePublic': 'Public',
       'address.lanEmpty': 'No local network address is available.',
       'address.publicEmpty': 'No public address configured yet.',
-      'address.modeSaved': 'Access address updated.',
-      'address.bookSaved': 'Public addresses saved.',
       'address.label': 'Label',
       'address.address': 'Address',
       'address.add': 'Add',
@@ -587,12 +579,10 @@ window.__ModuleLoader__.load({
       'tunnel.binary.missing': 'not found',
       'tunnel.download': 'Download cloudflared',
       'tunnel.downloading': 'Downloading…',
-      'tunnel.downloaded': 'Downloaded {version}',
       'tunnel.binaryPath': 'Custom path',
       'tunnel.binaryPathHint': 'Must be an absolute path or a command name on PATH; a path that does not exist is an error, never a fallback.',
       'tunnel.binaryCustomMissing': 'A custom path wins; when it does not exist there is no fallback to PATH or the downloaded copy. Fix or clear it, then retry.',
       'tunnel.save': 'Save tunnel settings',
-      'tunnel.saved': 'Tunnel settings saved.',
       'tunnel.quickHint': 'A quick tunnel needs no account, but its hostname changes on every start — paired devices have to pair again.',
       'tunnel.namedHint': 'A named tunnel needs a tunnel and a public hostname created in the Cloudflare dashboard; paste its token here.',
       'tunnel.gatewayOff': 'Enable remote access above first; the tunnel needs a local port to forward to.',
@@ -2936,27 +2926,6 @@ window.__ModuleLoader__.load({
     }
 
     /**
-     * Clear a SUCCESS notice after a few seconds.
-     *
-     * Success describes an action that already finished; leaving it on screen
-     * forever makes it read like a state ("saved" — of what, and is it still
-     * true?). Errors are deliberately NOT auto-dismissed: a failure the user did
-     * not get to read is a failure they will repeat.
-     *
-     * @param {{ tone?: string } | null} outcome
-     * @param {(next: null) => void} clearOutcome State setter (stable identity).
-     * @param {number} [ms]
-     */
-    function useAutoDismiss(outcome, clearOutcome, ms = 4000) {
-      useEffect(() => {
-        if (outcome === null || typeof outcome !== 'object') return undefined
-        if (outcome.tone !== 'ok' && outcome.tone !== 'downloaded') return undefined
-        const timer = setTimeout(() => clearOutcome(null), ms)
-        return () => clearTimeout(timer)
-      }, [outcome, clearOutcome, ms])
-    }
-
-    /**
      * The panel's top configuration: the master switch and the listener port.
      *
      * Both are panel-wide facts, so both live ABOVE the tabs: the switch decides
@@ -2977,7 +2946,6 @@ window.__ModuleLoader__.load({
       const [portDraft, setPortDraft] = useState(null)
       const [busy, setBusy] = useState(false)
       const [outcome, setOutcome] = useState(null)
-      useAutoDismiss(outcome, setOutcome)
 
       const known = settings !== null && typeof settings === 'object'
       const enabled = known && settings.enabled === true
@@ -2990,8 +2958,11 @@ window.__ModuleLoader__.load({
         setOutcome(null)
         const result = await updateSettings(patch)
         setBusy(false)
+        /* Success needs no banner: the switch/port row and the status strip already
+           show the new value. The ONE exception is a host that could not apply the
+           change live — that is a real instruction, not a confirmation. */
         setOutcome(result.ok === true
-          ? { tone: 'ok', requiresReload: result.requiresReload === true }
+          ? (result.requiresReload === true ? { tone: 'reload' } : null)
           : { tone: 'error', failure: result.failure })
       }
 
@@ -3015,16 +2986,12 @@ window.__ModuleLoader__.load({
       if (outcome !== null) {
         if (outcome.tone === 'invalid') {
           outcomeNode = h(Notice, { tone: 'error', title: t('access.invalidPort') })
-        } else if (outcome.tone === 'ok') {
+        } else if (outcome.tone === 'reload') {
           /* The reload sentence appears only when the server said it could NOT
              rebind the listener: a switch or port change is applied live by the
              host, and an address save never moves a socket at all. Telling the user
              to restart for either is a false instruction. */
-          outcomeNode = h(Notice, {
-            tone: 'ok',
-            title: t('access.saved'),
-            body: outcome.requiresReload === true ? t('access.reloadRequired') : undefined,
-          })
+          outcomeNode = h(Notice, { tone: 'warn', title: t('access.reloadRequired') })
         } else {
           outcomeNode = h(FailureNotice, { failure: outcome.failure === null ? { kind: 'unknown' } : outcome.failure, t })
         }
@@ -3098,7 +3065,6 @@ window.__ModuleLoader__.load({
     function AccessPointSection({ t, settings, addresses, tunnel, updateSettings, onManagePublic, onManageTunnel }) {
       const [busy, setBusy] = useState(false)
       const [outcome, setOutcome] = useState(null)
-      useAutoDismiss(outcome, setOutcome)
 
       const known = settings !== null && typeof settings === 'object'
       const access = accessOf(settings)
@@ -3129,9 +3095,9 @@ window.__ModuleLoader__.load({
         setOutcome(null)
         const result = await updateSettings({ access: next })
         setBusy(false)
-        /* No reload sentence: an address only shapes a link, so it is live the moment
-           it is stored (`design.md` §2.3). */
-        setOutcome(result.ok === true ? { tone: 'ok' } : { tone: 'error', failure: result.failure })
+        /* No success banner: the selected segment/link is already the feedback.
+           Only a refusal needs words. */
+        setOutcome(result.ok === true ? null : { tone: 'error', failure: result.failure })
       }
 
       const onMode = (mode) => {
@@ -3235,9 +3201,10 @@ window.__ModuleLoader__.load({
 
       let outcomeNode = null
       if (outcome !== null) {
-        outcomeNode = outcome.tone === 'ok'
-          ? h(Notice, { tone: 'ok', title: t('address.modeSaved') })
-          : h(FailureNotice, { failure: outcome.failure === null ? { kind: 'unknown' } : outcome.failure, t })
+        outcomeNode = h(FailureNotice, {
+          failure: outcome.failure === null ? { kind: 'unknown' } : outcome.failure,
+          t,
+        })
       }
 
       return h('section', { className: 'drc-section' },
@@ -3281,7 +3248,6 @@ window.__ModuleLoader__.load({
       const [addressDraft, setAddressDraft] = useState('')
       const [busy, setBusy] = useState(false)
       const [outcome, setOutcome] = useState(null)
-      useAutoDismiss(outcome, setOutcome)
 
       const known = settings !== null && typeof settings === 'object'
       const access = accessOf(settings)
@@ -3299,7 +3265,8 @@ window.__ModuleLoader__.load({
           setOutcome({ tone: 'error', failure: result.failure })
           return false
         }
-        setOutcome({ tone: 'ok' })
+        /* The list itself is the confirmation (a row appeared or disappeared). */
+        setOutcome(null)
         return true
       }
 
@@ -3350,8 +3317,6 @@ window.__ModuleLoader__.load({
           outcomeNode = h(Notice, { tone: 'error', title: t('address.invalid') })
         } else if (outcome.tone === 'tooMany') {
           outcomeNode = h(Notice, { tone: 'error', title: t('address.tooMany', { max: PUBLIC_ADDRESS_MAX }) })
-        } else if (outcome.tone === 'ok') {
-          outcomeNode = h(Notice, { tone: 'ok', title: t('address.bookSaved') })
         } else {
           outcomeNode = h(FailureNotice, {
             failure: outcome.failure === null ? { kind: 'unknown' } : outcome.failure,
@@ -3493,7 +3458,6 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState(null)
       const [outcome, setOutcome] = useState(null)
       const [copied, setCopied] = useState(false)
-      useAutoDismiss(outcome, setOutcome)
 
       const mode = modeDraft !== null ? modeDraft : (stored.mode === 'token' ? 'token' : 'quick')
       const publicUrlText = publicUrlDraft !== null ? publicUrlDraft : (typeof stored.publicUrl === 'string' ? stored.publicUrl : '')
@@ -3540,7 +3504,7 @@ window.__ModuleLoader__.load({
           return false
         }
         resetDrafts()
-        setOutcome({ tone: 'ok' })
+        setOutcome(null)
         return true
       }
 
@@ -3580,9 +3544,9 @@ window.__ModuleLoader__.load({
         setOutcome(null)
         const result = await downloadTunnel()
         setBusy(null)
-        setOutcome(result.ok === true
-          ? { tone: 'downloaded', version: result.version }
-          : { tone: 'error', failure: result.failure })
+        /* The binary row switches from "not found" to the detected path; that is
+           the confirmation. */
+        setOutcome(result.ok === true ? null : { tone: 'error', failure: result.failure })
       }
 
       const onClearToken = async () => {
@@ -3591,7 +3555,7 @@ window.__ModuleLoader__.load({
         setOutcome(null)
         const result = await updateTunnelConfig({ token: null })
         setBusy(null)
-        setOutcome(result.ok === true ? { tone: 'ok' } : { tone: 'error', failure: result.failure })
+        setOutcome(result.ok === true ? null : { tone: 'error', failure: result.failure })
       }
 
       const copyUrl = async () => {
@@ -3617,12 +3581,8 @@ window.__ModuleLoader__.load({
 
       let outcomeNode = null
       if (outcome !== null) {
-        if (outcome.tone === 'ok') {
-          outcomeNode = h(Notice, { tone: 'ok', title: t('tunnel.saved') })
-        } else if (outcome.tone === 'invalidPath') {
+        if (outcome.tone === 'invalidPath') {
           outcomeNode = h(Notice, { tone: 'error', title: t('tunnel.error.customPathMissing') })
-        } else if (outcome.tone === 'downloaded') {
-          outcomeNode = h(Notice, { tone: 'ok', title: t('tunnel.downloaded', { version: outcome.version }) })
         } else {
           const code = outcome.failure !== null && typeof outcome.failure === 'object' ? outcome.failure.code : null
           outcomeNode = h(Notice, {
