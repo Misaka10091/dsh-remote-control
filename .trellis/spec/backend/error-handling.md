@@ -34,7 +34,7 @@ throw error
 | `token/` | `claims`、`entropy`、`key` |
 | `audit/` | `invalid-action`、`invalid-cursor`、`invalid-limit`、`unknown-event`、`write-failed`、`no-directory` |
 | `gateway/` | `unauthenticated`、`cross-origin`、`untrusted-origin`、`device-revoked`、`admin-not-here`、`upstream-timeout`、`upstream-unreachable`、`proxy-failed`、`invalid-upstream`、`pairing-disabled` |
-| `admin/` | `loopback-only`、`cross-origin`、`invalid-access`、`invalid-settings`、`unknown-device`、`body-too-large`、`method-not-allowed` |
+| `admin/` | `loopback-only`、`cross-origin`、`invalid-access`、`invalid-settings`、`unknown-device`、`listener-failed`、`body-too-large`、`method-not-allowed` |
 
 新增 code 之前先确认语义落在这六个前缀里的哪一个：同一个语义在两个前缀下各叫一次，排查时就会被当成两件事。
 

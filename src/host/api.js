@@ -341,6 +341,10 @@ function publicDevice(device, liveConnections) {
  *   Injectable NIC enumeration. Defaults to the real `os.networkInterfaces()` read;
  *   overridden by tests so an assertion about `GET /state` never depends on the
  *   machine running the suite (`quality-guidelines.md` — injectable side effects).
+ * @param {(change: { before: object, after: object }) => Promise<{ applied: boolean }>} [options.applyListenerChange]
+ *   Applies a switch/port change to the RUNNING process (`index.js` rebinds the
+ *   listener there). Omitted = this host cannot hot-apply, and `POST /settings`
+ *   answers `requiresReload: true` instead of pretending.
  * @returns {{ dispose: () => void, available: boolean, guard: Function }}
  */
 export function startAdminApi(options) {
@@ -354,6 +358,9 @@ export function startAdminApi(options) {
   const readLanAddresses = typeof options.listLanAddresses === 'function'
     ? options.listLanAddresses
     : () => listLanAddresses()
+  const applyListenerChange = typeof options.applyListenerChange === 'function'
+    ? options.applyListenerChange
+    : null
 
   /** Report one diagnostic line; never a body, a code, or a token. */
   function log(level, message) {
@@ -650,22 +657,37 @@ export function startAdminApi(options) {
   /**
    * POST /settings
    *
-   * Three writable fields, and the reload flag now answers a narrower question
-   * than it used to (`design.md` §2.3):
+   * Three writable fields, two of which move the LISTENER and are now applied to
+   * the running process instead of the next `dsh` start:
    *
-   *   - `enabled` / `port` re-bind the listener, so a change to either really does
-   *     need `dsh` restarted. `requiresReload` is `true` only when one of them
-   *     ACTUALLY changed — comparing before and after, not "a settings write
-   *     happened". A panel that says "restart to apply" after an address edit
+   *   - `enabled` / `port` change what should be bound, so they go through
+   *     `applyListenerChange` (wired by `index.js`). A host that provides no such
+   *     seam — a test harness, an embedder — still persists the value and answers
+   *     `requiresReload: true`, which is the truthful answer there: the file and
+   *     the process disagree. `requiresReload` is `true` only when one of the two
+   *     ACTUALLY changed, comparing before and after, not "a settings write
+   *     happened" — a panel that says "restart to apply" after an address edit
    *     sends the user to restart a process for nothing.
    *   - `access` only shapes the pairing link the panel renders. It takes effect
-   *     immediately and is never a reason to restart.
+   *     immediately and is never a listener change.
+   *
+   * ## A failed rebind restores the previous setting
+   *
+   * If the seam throws (port already in use, a socket the OS refuses), the write
+   * is REVERTED before the `409` is returned. Leaving the new value on disk would
+   * be the reassuring-and-wrong state this package forbids: the panel would show
+   * a port the process is not listening on, and the next `GET /state` would
+   * contradict `POST /settings`'s own answer. The previous listener is untouched
+   * throughout — `index.js` binds before it releases.
    *
    * `access` is validated strictly and, on failure, the request is refused BEFORE
    * anything is written: a 400 that had already half-applied the other fields
    * would leave the panel's next read disagreeing with what it was told.
+   *
+   * @param {object} body
+   * @returns {Promise<{ status: number, data: object }>}
    */
-  function updateSettings(body) {
+  async function updateSettings(body) {
     const patch = {}
     if (typeof body.enabled === 'boolean') patch.enabled = body.enabled
     if (Number.isInteger(body.port) && body.port > 0 && body.port <= 65535) patch.port = body.port
@@ -682,13 +704,72 @@ export function startAdminApi(options) {
        no window a concurrent writer could exploit here: this API has one client. */
     const before = store.getSettings()
     const settings = store.updateSettings(patch)
-    return {
-      status: 200,
-      data: {
-        settings,
-        requiresReload: settings.enabled !== before.enabled || settings.port !== before.port,
-      },
+
+    const listenerChanged = settings.enabled !== before.enabled || settings.port !== before.port
+    if (!listenerChanged) {
+      return { status: 200, data: { settings, requiresReload: false, applied: false } }
     }
+    if (applyListenerChange === null) {
+      return { status: 200, data: { settings, requiresReload: true, applied: false } }
+    }
+
+    try {
+      const outcome = await applyListenerChange({ before, after: settings })
+      return {
+        status: 200,
+        data: {
+          settings,
+          /* The listener really moved (or really stopped), so there is nothing to
+             restart for. */
+          requiresReload: false,
+          applied: outcome !== null && typeof outcome === 'object' && outcome.applied === true,
+        },
+      }
+    } catch (error) {
+      const reverted = revertSettings(before)
+      const outcome = reverted
+        ? 'the previous setting was restored'
+        : 'the settings file was NOT restored'
+      log('warn', `[remote-control] listener change refused (${codeOf(error)}); ${outcome}`)
+      throw adminError(
+        'admin/listener-failed',
+        'The gateway could not start with the new listener configuration, so the change was not applied.',
+      )
+    }
+  }
+
+  /**
+   * Put `before` back after a refused listener change.
+   *
+   * Best-effort by design: if this write fails too, the disk still names a port
+   * the process is not on, and the only honest thing left is the loud log line in
+   * the caller. Throwing here would replace the actionable `409` with a generic
+   * `500` that says nothing about the port.
+   *
+   * @param {{ enabled: boolean, port: number }} before
+   * @returns {boolean} whether the restore was written.
+   */
+  function revertSettings(before) {
+    try {
+      store.updateSettings({ enabled: before.enabled, port: before.port })
+      return true
+    } catch (error) {
+      log('error', `[remote-control] could not restore the previous listener setting (${codeOf(error)})`)
+      return false
+    }
+  }
+
+  /**
+   * The stable `code` of a thrown error, or `'unknown'`.
+   *
+   * @param {unknown} error
+   * @returns {string}
+   */
+  function codeOf(error) {
+    if (error !== null && typeof error === 'object' && typeof error.code === 'string' && error.code !== '') {
+      return error.code
+    }
+    return 'unknown'
   }
 
   /** GET /audit — the panel's summary. */
@@ -879,7 +960,7 @@ export function startAdminApi(options) {
           }
           requireMethod(method, ['POST'])
           const body = parseBody(await readBody(req))
-          respond(res, updateSettings(body))
+          respond(res, await updateSettings(body))
           return
         }
         case 'audit': {
@@ -995,6 +1076,10 @@ export function startAdminApi(options) {
          reporting 500 would send the user to the host log for a typo. */
       case 'admin/invalid-access': return 400
       case 'admin/unknown-device': return 404
+      /* The listener refused the requested port (or could not bind at all). A
+         conflict with the machine's current state, not a malformed request and not
+         our bug, so 409 — the panel's `gatewayDown` notice is the right one. */
+      case 'admin/listener-failed': return 409
       case 'admin/loopback-only':
       case 'admin/cross-origin': return 403
       default: return 500

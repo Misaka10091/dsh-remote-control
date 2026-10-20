@@ -13,10 +13,12 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
-import { createServer } from 'node:http'
+import { createServer, request as httpRequest } from 'node:http'
+import { connect } from 'node:net'
 import path from 'node:path'
 
 import * as entry from '../src/index.js'
+import { ADMIN_API_PREFIX } from '../src/host/constants.js'
 import { cleanupDir, makeTempDir } from './helpers.mjs'
 
 /** A logger stub that records each call, per level. */
@@ -426,4 +428,280 @@ test('an audit failure is a warning, never a fatal load or a thrown request', as
       'the append failure is reported too',
     )
   })
+})
+
+/* ------------------------------------------------------------------ *
+ * Hot reload: the switch and the port apply to THIS process
+ * ------------------------------------------------------------------ */
+
+/**
+ * The official `dsh web` port with a real route table.
+ *
+ * The admin guard requires a loopback socket, a loopback `Host` and the origin
+ * fence, so the hot-reload tests must reach the API over a REAL socket: a fake
+ * request object would skip exactly the admission path the panel uses.
+ */
+async function officialHost() {
+  const routes = new Map()
+  const server = createServer((req, res) => {
+    let pathname
+    try {
+      pathname = new URL(req.url ?? '/', 'http://x').pathname
+    } catch {
+      res.writeHead(400).end()
+      return
+    }
+    let best
+    for (const [prefix, route] of routes) {
+      if (pathname !== prefix && !pathname.startsWith(`${prefix}/`)) continue
+      if (best === undefined || prefix.length > best.prefix.length) best = { prefix, route }
+    }
+    if (best === undefined) {
+      res.writeHead(404, { 'content-type': 'text/plain' })
+      res.end('not found')
+      return
+    }
+    Promise.resolve(best.route.handler(req, res)).catch(() => {
+      if (!res.headersSent) res.writeHead(500)
+      res.end()
+    })
+  })
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve))
+  const port = server.address().port
+  return {
+    port,
+    webServer: {
+      port,
+      register: (route) => {
+        routes.set(route.path, route)
+        return () => routes.delete(route.path)
+      },
+    },
+    close: () => new Promise((resolve) => { server.closeAllConnections(); server.close(resolve) }),
+  }
+}
+
+/**
+ * One JSON request against the official loopback port.
+ *
+ * @param {number} port
+ * @param {{ method?: string, path: string, body?: object }} spec
+ */
+function adminRequest(port, { method = 'GET', path: target, body }) {
+  return new Promise((resolve, reject) => {
+    const payload = body === undefined ? null : Buffer.from(JSON.stringify(body), 'utf8')
+    const req = httpRequest({
+      host: '127.0.0.1',
+      port,
+      method,
+      path: target,
+      headers: {
+        host: `127.0.0.1:${String(port)}`,
+        'sec-fetch-site': 'same-origin',
+        ...(payload === null
+          ? {}
+          : { 'content-type': 'application/json', 'content-length': String(payload.length) }),
+      },
+    }, (res) => {
+      const chunks = []
+      res.on('data', (chunk) => chunks.push(chunk))
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8')
+        let json = null
+        try {
+          json = JSON.parse(text)
+        } catch {
+          json = null
+        }
+        resolve({ status: res.statusCode, json, text })
+      })
+    })
+    req.on('error', reject)
+    if (payload !== null) req.write(payload)
+    req.end()
+  })
+}
+
+/** Whether a loopback TCP port accepts a connection right now. */
+function isListening(port) {
+  return new Promise((resolve) => {
+    const socket = connect({ host: '127.0.0.1', port })
+    const settle = (value) => {
+      socket.destroy()
+      resolve(value)
+    }
+    socket.once('connect', () => settle(true))
+    socket.once('error', () => settle(false))
+  })
+}
+
+/**
+ * A port that was free a moment ago.
+ *
+ * Only ever used as `settings.port`; the plugin's own config seam (`port: 0`) is
+ * how the other tests avoid picking a number at all.
+ */
+async function freePort() {
+  const probe = createServer()
+  await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve))
+  const { port } = probe.address()
+  await new Promise((resolve) => probe.close(resolve))
+  return port
+}
+
+/**
+ * A context sufficient for `apply` to start a gateway AND route the admin API.
+ *
+ * Same shape as {@link gatewayContext}, but the web server is a real listener so
+ * the panel's own HTTP path (guard + fence + handler) runs.
+ */
+function hotReloadContext({ webServer, logger }) {
+  const effects = []
+  const effectLabels = []
+  const ctx = {
+    effects,
+    effectLabels,
+    logger,
+    webServer,
+    get: () => undefined,
+    effect: (acquire, label) => {
+      const release = typeof acquire === 'function' ? acquire() : undefined
+      effects.push(typeof release === 'function' ? release : () => {})
+      effectLabels.push(label)
+      return () => {}
+    },
+  }
+  return ctx
+}
+
+test('turning remote access off closes the listener without a restart', async () => {
+  /* The switch used to be restart-only, which is a switch the user does not believe.
+     `prd.md` D1 also says "off" must be indistinguishable from "not installed", and
+     a released socket is the only proof of that. */
+  const official = await officialHost()
+  try {
+    await withTempHome(async (home) => {
+      const runtime = entry.createRuntime({ baseDir: path.join(home, '.dsh', 'remote-control') })
+      const port = await freePort()
+      runtime.store.updateSettings({ enabled: true, port })
+
+      const { calls, logger } = recordingLogger()
+      const ctx = hotReloadContext({ webServer: official.webServer, logger })
+      await entry.apply(ctx, { host: '127.0.0.1' })
+      assert.equal(await isListening(port), true, 'the switch was on at load, so it listens')
+
+      const off = await adminRequest(official.port, {
+        method: 'POST',
+        path: `${ADMIN_API_PREFIX}/settings`,
+        body: { enabled: false },
+      })
+      assert.equal(off.status, 200)
+      assert.equal(off.json.data.requiresReload, false, 'nothing is left to restart')
+      assert.equal(await isListening(port), false, 'the port is released immediately')
+      assert.ok(
+        calls.some((call) => /gateway stopped/.test(call.message)),
+        'the stop is reported on the host log',
+      )
+
+      const state = await adminRequest(official.port, { path: `${ADMIN_API_PREFIX}/state` })
+      assert.equal(state.json.data.gateway, null, 'the panel is told the truth, not the setting')
+
+      const on = await adminRequest(official.port, {
+        method: 'POST',
+        path: `${ADMIN_API_PREFIX}/settings`,
+        body: { enabled: true },
+      })
+      assert.equal(on.status, 200)
+      assert.equal(on.json.data.applied, true)
+      assert.equal(await isListening(port), true, 'the switch turns it back on in the same process')
+      assert.equal(
+        ctx.effectLabels.filter((label) => label === 'remote-control: gateway listener').length,
+        1,
+        'one listener disposer across every bind, not one per bind',
+      )
+
+      for (const dispose of ctx.effects) await dispose()
+    })
+  } finally {
+    await official.close()
+  }
+})
+
+test('changing the port moves the listener and releases the old one', async () => {
+  const official = await officialHost()
+  try {
+    await withTempHome(async (home) => {
+      const runtime = entry.createRuntime({ baseDir: path.join(home, '.dsh', 'remote-control') })
+      const first = await freePort()
+      let second = await freePort()
+      for (let attempt = 0; attempt < 8 && second === first; attempt += 1) second = await freePort()
+      assert.notEqual(second, first, 'two distinct free ports are needed for this test')
+
+      runtime.store.updateSettings({ enabled: true, port: first })
+      const { logger } = recordingLogger()
+      const ctx = hotReloadContext({ webServer: official.webServer, logger })
+      await entry.apply(ctx, { host: '127.0.0.1' })
+      assert.equal(await isListening(first), true)
+
+      const moved = await adminRequest(official.port, {
+        method: 'POST',
+        path: `${ADMIN_API_PREFIX}/settings`,
+        body: { port: second },
+      })
+      assert.equal(moved.status, 200)
+      assert.equal(moved.json.data.requiresReload, false)
+      assert.equal(moved.json.data.applied, true)
+      assert.equal(await isListening(second), true, 'the new port is bound')
+      assert.equal(await isListening(first), false, 'the old port is released')
+
+      const state = await adminRequest(official.port, { path: `${ADMIN_API_PREFIX}/state` })
+      assert.equal(state.json.data.gateway.port, second, 'the state read names the port actually bound')
+
+      for (const dispose of ctx.effects) await dispose()
+    })
+  } finally {
+    await official.close()
+  }
+})
+
+test('a port another process holds is refused and the running listener stays up', async () => {
+  /* Bind-before-release: a mistyped or occupied port must cost the user an error,
+     not their remote session. The setting is restored so the panel and the file
+     keep agreeing with the socket that is still open. */
+  const official = await officialHost()
+  const blocker = createServer()
+  await new Promise((resolve) => blocker.listen(0, '127.0.0.1', resolve))
+  const heldPort = blocker.address().port
+  try {
+    await withTempHome(async (home) => {
+      const runtime = entry.createRuntime({ baseDir: path.join(home, '.dsh', 'remote-control') })
+      const port = await freePort()
+      runtime.store.updateSettings({ enabled: true, port })
+
+      const { logger } = recordingLogger()
+      const ctx = hotReloadContext({ webServer: official.webServer, logger })
+      await entry.apply(ctx, { host: '127.0.0.1' })
+      assert.equal(await isListening(port), true)
+
+      const refused = await adminRequest(official.port, {
+        method: 'POST',
+        path: `${ADMIN_API_PREFIX}/settings`,
+        body: { port: heldPort },
+      })
+      assert.equal(refused.status, 409)
+      assert.equal(refused.json.error.code, 'admin/listener-failed')
+      assert.ok(!refused.json.error.message.includes('EADDRINUSE'), 'no raw errno in the message')
+
+      assert.equal(runtime.store.getSettings().port, port, 'the setting is restored')
+      assert.equal(await isListening(port), true, 'the previous listener never went down')
+
+      const state = await adminRequest(official.port, { path: `${ADMIN_API_PREFIX}/state` })
+      assert.equal(state.json.data.gateway.port, port, 'the state read agrees with the live socket')
+
+      for (const dispose of ctx.effects) await dispose()
+    })
+  } finally {
+    await new Promise((resolve) => { blocker.closeAllConnections(); blocker.close(resolve) })
+    await official.close()
+  }
 })

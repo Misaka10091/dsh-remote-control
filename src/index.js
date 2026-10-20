@@ -188,6 +188,29 @@ export function createRuntime(options = {}) {
  * likewise fails the fiber — the user must not be told remote access is up when
  * nothing is listening.
  *
+ * ## The switch and the port are live, not restart-only
+ *
+ * `POST /remote-control/api/settings` writes `enabled` / `port` and then calls
+ * {@link applyListenerChange} through the `applyListenerChange` seam below, which
+ * stops or rebinds THIS process's listener. The panel's save therefore takes
+ * effect on the next request instead of the next `dsh` start — a switch that
+ * needs a restart is a switch the user does not believe.
+ *
+ * Three properties of that seam are load-bearing:
+ *
+ *   - **Bind before release.** Moving to a different port binds the new listener
+ *     first, so a refusal (`EADDRINUSE`) leaves the old one serving rather than
+ *     taking remote access down over a mistyped number. `api.js` reverts the
+ *     stored setting when the rebind fails, so the file never claims a port the
+ *     process is not on.
+ *   - **One effect, many binds.** `startGateway` is called with
+ *     `registerEffect: false` and this closure owns the single
+ *     `remote-control: gateway listener` disposer, so toggling the switch does not
+ *     stack one disposer per bind.
+ *   - **Serialised.** Overlapping settings writes are queued through
+ *     `reconfigureListener`; two interleaved rebinds could otherwise leave a
+ *     listener bound and unreferenced.
+ *
  * `apply` is a plain function that MAY return a promise, not an `async` function.
  * The distinction matters: an `async` function converts every synchronous throw
  * into a rejection, and a corrupt device table (`store/corrupt`) must surface at
@@ -212,7 +235,7 @@ export function apply(ctx, config = {}) {
     /* An audit write failure is reported once per failure through the host logger.
        It must never be fatal (the request that triggered it was authorized), and
        it must never be silent (`quality-guidelines.md` §5). */
-    onAuditError: (error) => logLine(ctx, 'warn', `[remote-control] audit: ${describeAuditError(error)}`),
+    onAuditError: (error) => logLine(ctx, 'warn', `[remote-control] audit: ${describeErrorCode(error)}`),
   })
   const settings = runtime.store.getSettings()
   const devices = runtime.store.listDevices()
@@ -249,7 +272,7 @@ export function apply(ctx, config = {}) {
         )
       }
     } catch (error) {
-      logLine(ctx, 'warn', `[remote-control] audit retention failed: ${describeAuditError(error)}`)
+      logLine(ctx, 'warn', `[remote-control] audit retention failed: ${describeErrorCode(error)}`)
     }
   }
   runPrune()
@@ -269,10 +292,219 @@ export function apply(ctx, config = {}) {
 
   /* The running gateway, or null. The admin API reads it lazily through this
      closure rather than capturing a value, because the gateway may start after
-     the API mounts (and may never start at all while the switch is off).
-     `gateway.revokeDevice` behind it is the single entry point that both writes
-     the store AND closes live sockets (`quality-guidelines.md` §18). */
+     the API mounts, may stop while the panel is open, and may move to another
+     port without the process restarting. `gateway.revokeDevice` behind it is the
+     single entry point that both writes the store AND closes live sockets
+     (`quality-guidelines.md` §18). */
   let live = null
+
+  /* The port this process ASKED a listener for — not the one the OS granted.
+     Comparing "did the requested port change" against the BOUND port would be
+     wrong in the one case that matters: a profile that pins `config.port` to 0
+     (every test) binds an ephemeral number, so every settings write would look
+     like a port change and restart the listener underneath the panel. */
+  let liveRequestedPort = null
+
+  /* Row-level overrides, resolved once. `Number.isInteger` and not truthiness:
+     0 is a legitimate override (OS-assigned) and the common one in tests, which
+     must never bind a real port. */
+  const configPort = Number.isInteger(config?.port) ? config.port : null
+  const configHost = typeof config?.host === 'string' && config.host !== '' ? config.host : undefined
+
+  /** Whether the one listener effect has been registered (see below). */
+  let listenerEffectRegistered = false
+
+  /** The port a listener started for `nextSettings` must ask the OS for. */
+  function requestedPortFor(nextSettings) {
+    return configPort !== null ? configPort : nextSettings.port
+  }
+
+  /**
+   * The upstream port, read from the official web server at the moment a listener
+   * needs it.
+   *
+   * Reading it lazily (here rather than at module scope) is what makes
+   * `inject: ['webServer']` meaningful: when the service is absent Cordis parks
+   * the fiber in PENDING and this code never runs, so the read cannot see
+   * `undefined` in practice. The guard exists for the test harness, where a fake
+   * context may provide the service with a port of 0, and for a rebind, where the
+   * service is present but could in principle report nothing usable.
+   *
+   * @returns {number}
+   */
+  function upstreamPort() {
+    const port = ctx?.webServer?.port
+    if (!Number.isInteger(port) || port <= 0) {
+      throw gatewayFailure('gateway/invalid-upstream', 'the official web server did not report a listening port')
+    }
+    return port
+  }
+
+  /**
+   * Bind one listener for `nextSettings` and make it the live one.
+   *
+   * `registerEffect: false` on purpose: this closure registers ONE effect for
+   * whichever listener is current (see {@link registerListenerEffect}), so a host
+   * that toggles the switch ten times ends up with one disposer, not ten.
+   *
+   * @param {object} nextSettings Settings snapshot this listener is bound for.
+   * @param {number} [officialPort] Already-validated upstream port; resolved here when omitted.
+   * @returns {Promise<object>} The started gateway handle.
+   */
+  async function startListener(nextSettings, officialPort) {
+    const upstream = Number.isInteger(officialPort) ? officialPort : upstreamPort()
+    const port = requestedPortFor(nextSettings)
+    const started = await startGateway({
+      ctx,
+      store: runtime.store,
+      officialPort: upstream,
+      port,
+      host: configHost,
+      cookieName: DEVICE_COOKIE_NAME,
+      /* The JWT signing key (`research/jwt-device-credential.md` §3.3). Left to the
+         gateway to load, pointed at the SAME directory the store resolved, and
+         deliberately not caught: an unreadable or corrupt key file must refuse to
+         enable remote access rather than silently minting a fresh in-memory key that
+         invalidates every paired device at the next restart. */
+      baseDir: runtime.store.baseDir,
+      /* The pairing store is the OTHER half of `design.md` §3.1: `api.js` mints a
+         code on the loopback admin API, and the gateway's `/remote-control/pair`
+         routes redeem it. Both must see the SAME in-memory table, or the code the
+         panel shows can never be spent. */
+      pairing: runtime.pairing,
+      /* The audit writer, wired LAST so an audit failure can never be mistaken for
+         an authorization failure: `server.js` records through `recordSafely`,
+         which swallows its own writer's problems. */
+      audit: runtime.audit,
+      registerEffect: false,
+      logger: ctx.logger,
+    })
+    live = started
+    liveRequestedPort = port
+    registerListenerEffect()
+    logLine(
+      ctx,
+      'info',
+      `[remote-control] gateway listening on ${started.host}:${String(started.port)} `
+        + `(upstream ${started.upstream.host})`,
+    )
+    return started
+  }
+
+  /**
+   * Release the live listener, if any.
+   *
+   * Idempotent, and never throws out: this runs from a `ctx.effect` disposer
+   * during unload AND from the panel's switch, and a socket that refuses to close
+   * must not take the plugin down with it.
+   *
+   * @returns {Promise<void>}
+   */
+  async function stopListener() {
+    const current = live
+    live = null
+    liveRequestedPort = null
+    if (current === null) return
+    try {
+      await current.dispose()
+    } catch (error) {
+      logLine(ctx, 'warn', `[remote-control] listener shutdown failed: ${describeErrorCode(error)}`)
+    }
+  }
+
+  /**
+   * Register the one effect that owns whatever listener is current.
+   *
+   * Registered on the FIRST bind rather than at mount time, because the plugin
+   * must not claim a listener (or a `remote-control: gateway listener` effect) it
+   * does not have while remote access is off — that label is how the load-line
+   * test proves "off means no socket". Later binds reuse it.
+   */
+  function registerListenerEffect() {
+    if (listenerEffectRegistered) return
+    listenerEffectRegistered = true
+    /* The disposer returns a promise; Cordis (and the test harness) awaits it, so
+       an in-flight close is not lost at unload. */
+    registerEffect(ctx, () => () => stopListener(), 'remote-control: gateway listener')
+  }
+
+  /**
+   * Apply one listener-relevant settings change to the running process.
+   *
+   * The three cases the panel can produce, and what each does here:
+   *
+   *   - **switch off** — release the listener. There is no "disabled but still
+   *     bound" state: a switched-off plugin must look exactly like one that was
+   *     never installed (`prd.md` D1), and a closed socket is the only proof.
+   *   - **switch on, or a new port** — bind the requested port, and only then
+   *     release the previous listener. Binding first matters: the new port is free
+   *     by definition when it differs, so a refusal (port in use) leaves the old
+   *     listener serving instead of taking remote access down for a port the user
+   *     merely mistyped.
+   *   - **nothing to do** — the requested port is unchanged (a re-save, or an
+   *     access edit that also carried the switch). Re-binding would drop every
+   *     live session and every keep-alive socket for no change at all.
+   *
+   * A bind failure propagates: the caller (`api.js`) reverts the stored setting
+   * and answers `409 admin/listener-failed`, so this function deliberately does
+   * not catch. What it does guarantee is that the PREVIOUS listener is still live
+   * when it throws.
+   *
+   * @param {{ before: object, after: object }} change
+   * @returns {Promise<{ applied: boolean, port: number | null }>}
+   */
+  async function applyListenerChange(change) {
+    const next = change?.after
+    if (next === null || typeof next !== 'object') return { applied: false, port: null }
+
+    if (next.enabled !== true) {
+      if (live === null) return { applied: false, port: null }
+      await stopListener()
+      logLine(ctx, 'info', '[remote-control] gateway stopped — remote access is off')
+      return { applied: true, port: null }
+    }
+
+    const port = requestedPortFor(next)
+    if (live !== null && liveRequestedPort === port) return { applied: false, port: live.port }
+
+    const previous = live
+    const started = await startListener(next)
+    if (previous !== null) {
+      try {
+        await previous.dispose()
+      } catch (error) {
+        /* The new listener is already live; a stuck old socket is a leak to
+           report, not a reason to fail a change that took effect. */
+        logLine(ctx, 'warn', `[remote-control] old listener did not close cleanly: ${describeErrorCode(error)}`)
+      }
+      logLine(ctx, 'info', `[remote-control] gateway moved to ${started.host}:${String(started.port)}`)
+    }
+    return { applied: true, port: started.port }
+  }
+
+  /* Two settings writes can overlap (the panel disables its buttons, but a second
+     window or a script need not). The store write is atomic; the REBIND is not,
+     and two interleaved rebinds could leave one listener bound and unreferenced.
+     Serialising here — rather than in `api.js` — keeps the invariant with the
+     resources it is about. */
+  let rebinding = Promise.resolve()
+
+  /**
+   * Queue one listener change behind any in-flight one.
+   *
+   * @param {{ before: object, after: object }} change
+   * @returns {Promise<{ applied: boolean, port: number | null }>}
+   */
+  function reconfigureListener(change) {
+    const run = rebinding.then(
+      () => applyListenerChange(change),
+      () => applyListenerChange(change),
+    )
+    /* The chain must survive a failed rebind, or one EADDRINUSE would poison every
+       later attempt. */
+    rebinding = run.then(() => undefined, () => undefined)
+    return run
+  }
 
   /* Mount the admin API. It does not depend on the gateway having started: every
      device-management route works from the store, and only `revoke` prefers the
@@ -288,68 +520,25 @@ export function apply(ctx, config = {}) {
     pairing: runtime.pairing,
     audit: runtime.audit,
     getGateway: () => live,
+    /* The hot-reload seam. Without it `POST /settings` answers
+       `requiresReload: true` and the user restarts `dsh` for a switch and a port. */
+    applyListenerChange: reconfigureListener,
     logger: ctx?.logger,
   })
   if (typeof config?.onAdminApi === 'function') config.onAdminApi(admin)
 
   if (!settings.enabled) return
 
-  /* The upstream port comes from the official web server. Reading it lazily (here
-     rather than at module scope) is what makes `inject: ['webServer']` meaningful:
-     when the service is absent Cordis parks the fiber in PENDING and this code
-     never runs, so the cast below cannot see `undefined` in practice. The guard
-     exists for the test harness, where a fake context may provide the service with
-     a port of 0. */
-  const officialPort = ctx.webServer.port
-  if (!Number.isInteger(officialPort) || officialPort <= 0) {
-    throw gatewayFailure('gateway/invalid-upstream', 'the official web server did not report a listening port')
-  }
-
-  /* A row-level override, then the stored setting. `Number.isInteger` and not
-     truthiness: 0 is a legitimate override (OS-assigned) and the common one in
-     tests, which must never bind a real port. */
-  const bindPort = Number.isInteger(config?.port) ? config.port : settings.port
-  const bindHost = typeof config?.host === 'string' && config.host !== '' ? config.host : undefined
-
-  const gateway = startGateway({
-    ctx,
-    store: runtime.store,
-    officialPort,
-    port: bindPort,
-    host: bindHost,
-    cookieName: DEVICE_COOKIE_NAME,
-    /* The JWT signing key (`research/jwt-device-credential.md` §3.3). Left to the
-       gateway to load, pointed at the SAME directory the store resolved, and
-       deliberately not caught: an unreadable or corrupt key file must refuse to
-       enable remote access rather than silently minting a fresh in-memory key that
-       invalidates every paired device at the next restart. */
-    baseDir: runtime.store.baseDir,
-    /* The pairing store is the OTHER half of `design.md` §3.1: `api.js` mints a
-       code on the loopback admin API, and the gateway's `/remote-control/pair`
-       routes redeem it. Both must see the SAME in-memory table, or the code the
-       panel shows can never be spent — which is exactly the state this plugin was
-       in until the pairing routes landed. */
-    pairing: runtime.pairing,
-    /* The audit writer, wired LAST so an audit failure can never be mistaken for
-       an authorization failure: `server.js` records through `recordSafely`,
-       which swallows its own writer's problems. */
-    audit: runtime.audit,
-    logger: ctx.logger,
-  })
+  /* Validated SYNCHRONOUSLY, before the promise exists: a host whose official
+     server reports no port must fail the fiber at the moment of the call, not as
+     a floating rejection (see the `apply` note above). */
+  const initialUpstream = upstreamPort()
 
   /* Return the pending promise rather than awaiting it: the caller (Cordis) holds
      activation until the socket is actually bound, and a listen failure rejects
-     into the fiber as a startup error. The listening line is therefore printed from
-     a callback, never optimistically before the bind. */
-  return gateway.then((started) => {
-    live = started
-    logLine(
-      ctx,
-      'info',
-      `[remote-control] gateway listening on ${started.host}:${String(started.port)} `
-        + `(upstream ${started.upstream.host})`,
-    )
-  })
+     into the fiber as a startup error. The listening line is printed from inside
+     `startListener`, never optimistically before the bind. */
+  return startListener(settings, initialUpstream).then(() => undefined)
 }
 
 /**
@@ -375,14 +564,15 @@ function registerEffect(ctx, acquire, label) {
 /**
  * Describe an error for a log line, without its message.
  *
- * An audit error's `message` is safe, but a `code` is what an operator greps
- * for and it never quotes a path or a value. The message is used only when no
- * code exists.
+ * A `code` is what an operator greps for and it never quotes a path or a value.
+ * The fallback is deliberately generic: these lines also cover an audit writer and
+ * a socket that refused to close, and neither has a message that belongs in a
+ * host log.
  *
  * @param {unknown} error
  * @returns {string}
  */
-function describeAuditError(error) {
+function describeErrorCode(error) {
   if (error === null || typeof error !== 'object') return 'unknown error'
   if (typeof error.code === 'string' && error.code !== '') return error.code
   return 'storage error'

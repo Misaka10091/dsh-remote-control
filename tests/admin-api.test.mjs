@@ -151,6 +151,9 @@ async function startAdminHost(spec) {
     /* A fixed NIC list, so `GET /state` is asserted against a known answer rather
        than against the machine running the suite. */
     listLanAddresses: spec.listLanAddresses ?? (() => FAKE_LAN),
+    ...(typeof spec.applyListenerChange === 'function'
+      ? { applyListenerChange: spec.applyListenerChange }
+      : {}),
     logger: {
       debug: () => {}, info: () => {}, error: () => {},
       warn: (message) => log.push(message),
@@ -1198,7 +1201,9 @@ test('an access write is live immediately, so it does not ask for a reload', asy
     /* Re-sending the SAME values is still not a listener change. */
     assert.equal(JSON.parse((await post({ enabled: false })).body).data.requiresReload, false)
 
-    /* The port really does need a restart. */
+    /* A host with no `applyListenerChange` seam cannot move its own listener, so
+       the port and the switch really do need a restart THERE. `index.js` wires the
+       seam and answers `requiresReload: false` — see the hot-apply tests below. */
     const portChange = await post({ port: 4000 })
     const portData = JSON.parse(portChange.body).data
     assert.equal(portData.requiresReload, true)
@@ -1213,6 +1218,113 @@ test('an access write is live immediately, so it does not ask for a reload', asy
 
     /* The address block survived every one of those writes. */
     assert.deepEqual(runtime.store.getSettings().access, access)
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('a listener change is applied through the seam instead of asking for a restart', async () => {
+  /* The hot-reload contract: `index.js` supplies `applyListenerChange`, so a switch
+     or port write moves the RUNNING process and `requiresReload` is false. Before
+     this seam the panel told the user to restart `dsh` for a toggle it could have
+     performed itself. */
+  const runtime = makeRuntime()
+  const changes = []
+  const host = await startAdminHost({
+    runtime,
+    applyListenerChange: async (change) => {
+      changes.push(change)
+      return { applied: true, port: change.after.port }
+    },
+  })
+  const post = (body) => send({
+    port: host.port,
+    method: 'POST',
+    path: `${ADMIN_API_PREFIX}/settings`,
+    headers: { host: loopbackHost(host.port), 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  try {
+    const before = runtime.store.getSettings()
+    const res = await post({ enabled: true, port: 3091 })
+    assert.equal(res.status, 200)
+    const data = JSON.parse(res.body).data
+    assert.equal(data.requiresReload, false, 'the listener moved, so nothing is left to restart')
+    assert.equal(data.applied, true)
+    assert.deepEqual(data.settings, { enabled: true, port: 3091, access: DEFAULT_ACCESS })
+
+    /* Exactly one change, carrying what the seam needs to diff: the API hands over
+       the before/after snapshots rather than letting `index.js` re-read the file it
+       just wrote. */
+    assert.equal(changes.length, 1)
+    assert.deepEqual(changes[0].before, before)
+    assert.deepEqual(changes[0].after, { enabled: true, port: 3091, access: DEFAULT_ACCESS })
+
+    /* An access-only write never reaches the seam. */
+    const accessOnly = await post({ access: DEFAULT_ACCESS })
+    assert.equal(accessOnly.status, 200)
+    const accessData = JSON.parse(accessOnly.body).data
+    assert.equal(accessData.requiresReload, false)
+    assert.equal(accessData.applied, false, 'an address edit is not a listener change')
+    assert.equal(changes.length, 1)
+  } finally {
+    await host.stop()
+    cleanupDir(runtime.dir)
+  }
+})
+
+test('a refused rebind answers 409 and restores the previous setting', async () => {
+  /* The one outcome that must never be silently swallowed: the write succeeded but
+     the listener did not move. Leaving the new port on disk would make the panel
+     show a port the process is not listening on, and the next `GET /state` would
+     contradict `POST /settings`'s own answer. */
+  const runtime = makeRuntime()
+  let attempts = 0
+  const host = await startAdminHost({
+    runtime,
+    applyListenerChange: async () => {
+      attempts += 1
+      if (attempts === 1) {
+        const error = new Error('listen EADDRINUSE: address already in use')
+        error.code = 'EADDRINUSE'
+        throw error
+      }
+      return { applied: true, port: null }
+    },
+  })
+  const settingsPath = path.join(runtime.dir, 'devices.json')
+  const post = (body) => send({
+    port: host.port,
+    method: 'POST',
+    path: `${ADMIN_API_PREFIX}/settings`,
+    headers: { host: loopbackHost(host.port), 'sec-fetch-site': 'same-origin', 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  try {
+    /* Seed the file so "the bytes did not change" is a real comparison. */
+    runtime.store.updateSettings({ enabled: false, port: 3090 })
+    const before = readFileSync(settingsPath, 'utf8')
+
+    const refused = await post({ enabled: true, port: 3091 })
+    assert.equal(refused.status, 409)
+    const payload = JSON.parse(refused.body)
+    assert.equal(payload.error.code, 'admin/listener-failed')
+    assert.ok(payload.error.message.length > 0)
+    assert.ok(!payload.error.message.includes(runtime.dir), 'no file paths in the message')
+    assert.ok(!payload.error.message.includes('EADDRINUSE'), 'no raw errno in the message')
+
+    assert.deepEqual(
+      runtime.store.getSettings(),
+      { enabled: false, port: 3090, access: DEFAULT_ACCESS },
+      'the refused change is not left on disk',
+    )
+    assert.equal(readFileSync(settingsPath, 'utf8'), before, 'the file is byte-identical to before the attempt')
+
+    /* One EADDRINUSE must not poison the endpoint: the next write still applies. */
+    const retry = await post({ enabled: true, port: 3091 })
+    assert.equal(retry.status, 200)
+    assert.deepEqual(runtime.store.getSettings(), { enabled: true, port: 3091, access: DEFAULT_ACCESS })
   } finally {
     await host.stop()
     cleanupDir(runtime.dir)

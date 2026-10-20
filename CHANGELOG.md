@@ -8,6 +8,22 @@ Format: `## vX.Y.Z — YYYY-MM-DD`.
 
 ### Changed
 
+- **The remote-access switch and the listen port now take effect immediately.**
+  Both used to be restart-only: `POST /remote-control/api/settings` wrote `enabled`
+  / `port` to `devices.json` and answered `requiresReload: true`, so the panel told
+  the user to restart `dsh` for a toggle — although the listener is this plugin's
+  own socket and could be rebound by the process that owns it. The host now wires
+  `applyListenerChange` (`src/index.js`): switching off releases the port before
+  the response is written (so 「关闭」 is once again indistinguishable from 「未安装」),
+  switching on binds again, and a new port binds the new listener **before** the
+  old one is released. A port another process holds answers
+  `409 admin/listener-failed` and the stored setting is rolled back, so the file
+  never names a port this process is not listening on and a typo cannot cost the
+  user the session that was up. `requiresReload` stays `true` only for a host with
+  no rebind seam (a test harness or an embedder). Panel copy follows: 「已启用但
+  没有在监听」/「远程网关未监听」/ the pairing prerequisite now point at a port
+  conflict instead of telling the user to restart.
+
 - **The pairing card now says 「已使用」 once a device has redeemed the code.**
   The card only had a local countdown, so a redeemed code kept counting down as
   though it were still good — the one question a user actually asks after scanning

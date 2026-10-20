@@ -165,6 +165,11 @@ export function upstreamFor(officialPort) {
  * @param {object} [options.audit] Audit writer (`audit.js`). Omitted = nothing is recorded.
  * @param {object} [options.pairing] Pairing store (`pairing.js`). Omitted = the pairing routes answer 503.
  * @param {(size: number) => Buffer} [options.random] Random-byte source for device ids and JWTs; injectable for tests.
+ * @param {boolean} [options.registerEffect] Whether this call registers its own
+ *   `ctx.effect` disposer. Default `true` (the single-start case). A caller that
+ *   REBINDS the listener — `index.js` does, when the panel switches remote access
+ *   or the port — passes `false` and owns one effect for whichever listener is
+ *   current, so repeated binds do not stack one disposer per bind.
  * @param {object} [options.logger]
  * @returns {Promise<{
  *   server: import('node:http').Server,
@@ -179,6 +184,7 @@ export function upstreamFor(officialPort) {
  *   isRevoked: (deviceId: string) => boolean,
  *   revokeDevice: (deviceId: string) => { device: object | null, closedSockets: number },
  *   close: () => Promise<void>,
+ *   dispose: () => Promise<void>,
  * }>}
  */
 export async function startGateway(options) {
@@ -681,7 +687,8 @@ export async function startGateway(options) {
     return close()
   }
 
-  if (ctx !== null && typeof ctx === 'object' && typeof ctx.effect === 'function') {
+  if (options.registerEffect !== false
+    && ctx !== null && typeof ctx === 'object' && typeof ctx.effect === 'function') {
     ctx.effect(() => dispose, 'remote-control: gateway listener')
   }
 
@@ -698,6 +705,12 @@ export async function startGateway(options) {
     isRevoked,
     revokeDevice,
     close,
+    /* The one shutdown path: flushes the activity tracker, then closes the
+       listener and every socket it holds. `index.js` calls this when the panel
+       switches remote access off or moves the port, so `close()` alone — which
+       leaves the last half-minute of `lastSeenAt` in memory — is not what a
+       rebind uses. */
+    dispose,
   }
 }
 

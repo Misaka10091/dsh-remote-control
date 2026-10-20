@@ -302,7 +302,7 @@ window.__ModuleLoader__.load({
       'access.reloadRequired': '设置已保存到磁盘，但当前进程仍在使用旧的监听配置，需要重启 dsh 才会生效。',
       'access.invalidPort': '端口必须是 1 到 65535 之间的整数。',
       'access.gatewayDisabled': '未启用，没有监听端口。',
-      'access.gatewayNotListening': '已启用，但当前没有在监听。重启 dsh 后生效。',
+      'access.gatewayNotListening': '已启用，但没有在监听。请检查端口是否被占用，或换一个端口。',
       'access.gatewayListening': '正在监听 {port} 端口，已建立 {live} 条远程连接。',
       'point.heading': '配对地址',
       'address.heading': '公网地址',
@@ -332,7 +332,7 @@ window.__ModuleLoader__.load({
       'pair.copied': '已复制',
       'pair.copyFailed': '复制失败，请手动选择文本。',
       'pair.expires': '剩余 {seconds} 秒',
-      'pair.needGateway': '先启用远程接入并重启 dsh，否则生成的链接没有可连接的端口。',
+      'pair.needGateway': '先启用远程接入，否则生成的链接没有可连接的端口。',
       'pair.loopbackHint': '此链接里的 127.0.0.1 需要换成这台机器的局域网 IP，手机才能打开。',
       'pair.publicHint': '这条链接用的是你选定的公网地址；能否打开取决于你自己的端口映射或反向代理，本插件不检测可达性。',
       'pair.cancel': '取消',
@@ -396,7 +396,7 @@ window.__ModuleLoader__.load({
       'error.crossOrigin.title': '请求来源被拒绝',
       'error.crossOrigin.body': '这个请求不是从 dsh web 页面发出的，管理接口按跨站请求拒绝。请从本机的 dsh web 页面打开面板。',
       'error.gatewayDown.title': '远程网关未监听',
-      'error.gatewayDown.body': '远程接入当前没有可用的监听端口。请启用远程接入并重启 dsh。',
+      'error.gatewayDown.body': '远程接入当前没有可用的监听端口。请检查端口是否被其他程序占用，或换一个端口再试。',
       'error.notMounted.title': '管理接口未挂载',
       'error.notMounted.body': '宿主没有注册管理接口（Web 服务器不支持注册路由，或插件未加载）。设备面板因此没有后端。',
       'error.network.title': '无法连接管理接口',
@@ -428,7 +428,7 @@ window.__ModuleLoader__.load({
       'access.reloadRequired': 'The setting is on disk, but this process still runs the old listener configuration. Restart dsh for it to take effect.',
       'access.invalidPort': 'The port must be an integer between 1 and 65535.',
       'access.gatewayDisabled': 'Disabled, nothing is listening.',
-      'access.gatewayNotListening': 'Enabled, but nothing is listening right now. Restart dsh to apply it.',
+      'access.gatewayNotListening': 'Enabled, but nothing is listening right now. Check whether the port is in use, or pick another one.',
       'access.gatewayListening': 'Listening on port {port} with {live} live remote connection(s).',
       'point.heading': 'Pairing address',
       'address.heading': 'Public addresses',
@@ -458,7 +458,7 @@ window.__ModuleLoader__.load({
       'pair.copied': 'Copied',
       'pair.copyFailed': 'Copy failed; select the text manually.',
       'pair.expires': '{seconds}s left',
-      'pair.needGateway': 'Enable remote access and restart dsh first, or the generated link has no port to connect to.',
+      'pair.needGateway': 'Enable remote access first, or the generated link has no port to connect to.',
       'pair.loopbackHint': 'Replace 127.0.0.1 in this link with this machine LAN address so a phone can open it.',
       'pair.publicHint': 'This link uses the public address you selected. Whether it opens depends on your own port forwarding or reverse proxy — this plugin does not check reachability.',
       'pair.cancel': 'Cancel',
@@ -522,7 +522,7 @@ window.__ModuleLoader__.load({
       'error.crossOrigin.title': 'Request origin refused',
       'error.crossOrigin.body': 'This request did not come from the dsh web page, and the management API refuses cross-site requests. Open the panel from the dsh web page on this machine.',
       'error.gatewayDown.title': 'The remote gateway is not listening',
-      'error.gatewayDown.body': 'Remote access has no listening port right now. Enable remote access and restart dsh.',
+      'error.gatewayDown.body': 'Remote access has no listening port right now. Check whether another program holds the port, or pick another one.',
       'error.notMounted.title': 'The management API is not mounted',
       'error.notMounted.body': 'The host did not register the management API (its web server cannot register routes, or this plugin is not loaded). The panel has no backend.',
       'error.network.title': 'The management API is unreachable',
@@ -2522,9 +2522,10 @@ window.__ModuleLoader__.load({
        * re-reads the state afterwards (never optimistically).
        *
        * `requiresReload` is the SERVER's answer, carried through instead of being
-       * inferred here: since `design.md` §2.3 it is true only when `enabled` or
-       * `port` actually changed, and a panel that guessed would tell a user to
-       * restart `dsh` after editing an address that needs no restart.
+       * inferred here: it is true only when the listener configuration changed AND
+       * the host could not rebind itself, so a panel that guessed would tell a user
+       * to restart `dsh` after editing an address (no restart) or after toggling the
+       * switch (the host applies that live).
        */
       const updateSettings = useCallback(async (patch) => {
         try {
@@ -2752,9 +2753,10 @@ window.__ModuleLoader__.load({
         if (outcome.tone === 'invalid') {
           outcomeNode = h(Notice, { tone: 'error', title: t('access.invalidPort') })
         } else if (outcome.tone === 'ok') {
-          /* The reload sentence appears only when the server said the listener
-             configuration changed: an address save is live immediately, and telling
-             the user to restart for it is a false instruction (`design.md` §2.3). */
+          /* The reload sentence appears only when the server said it could NOT
+             rebind the listener: a switch or port change is applied live by the
+             host, and an address save never moves a socket at all. Telling the user
+             to restart for either is a false instruction. */
           outcomeNode = h(Notice, {
             tone: 'ok',
             title: t('access.saved'),
