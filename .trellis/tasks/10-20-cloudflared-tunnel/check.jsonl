@@ -1,0 +1,5 @@
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "检查外部进程/Token/降级/测试是否越过红线"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "检查错误码、状态码与响应体不泄漏内部信息"}
+{"file": ".trellis/spec/backend/logging-guidelines.md", "reason": "检查日志不含 Token、stderr、Cookie"}
+{"file": ".trellis/spec/frontend/quality-guidelines.md", "reason": "检查客户端单入口、词典同步、错误态与测试"}
+{"file": ".trellis/tasks/10-20-cloudflared-tunnel/research/cloudflared-facts.md", "reason": "对照官方行为检查实现假设"}

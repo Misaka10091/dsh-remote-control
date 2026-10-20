@@ -53,7 +53,7 @@
 ```bash
 npm test                # 内部是 node --test "tests/*.test.mjs"
 npm run check:syntax    # 每个宿主模块 + scripts/prepare-release.mjs
-npm pack --dry-run      # 产物完整性：31 个文件
+npm pack --dry-run      # 产物完整性：33 个文件
 ```
 
 > 不要写 `node --test tests/`：Node 21+ 会把目录参数当字面 glob，目录本身被当成测试文件执行（见 [Quality Guidelines](./quality-guidelines.md) 的 Testing Requirements）。`npm test` 传的是 glob，所有版本都能用。

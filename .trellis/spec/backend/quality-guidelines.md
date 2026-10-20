@@ -17,7 +17,8 @@
 
 2. **新增构建步骤。** 客户端半边是手写 ESM，保留 `window.__ModuleLoader__.load({ id, factory })` 单入口包装，禁止出现第二个 client entry 或编译产物目录。
 
-3. **`shell: true` / 命令拼接。** 本项目不需要执行外部命令。若将来需要，一律 argv 数组，禁止 `exec`。
+3. **`shell: true` / 命令拼接。** 除下面这一条例外，本项目不执行外部命令；将来需要时一律 argv 数组，禁止 `exec`。
+   **唯一例外（2026-10-20）**：`src/host/tunnel.js` 可以 `import 'node:child_process'`，用于拉起 `cloudflared`。例外只覆盖这一个模块，并且只能以 `spawnImpl(binary, args, { shell: false, windowsHide: true })` 的形式使用；`binary` 必须来自 `resolveTunnelBinary()`（自定义路径 / PATH / 本插件下载的副本），`args` 必须是数组，Token 走 `--token-file` 而不是 argv/env。`tests/package.test.mjs` 断言「只有这一个文件 import `node:child_process`」，任何扩散都会变红。
 
 4. **`console.log` 作为日志。** 宿主用 `ctx.logger`。
 
@@ -104,6 +105,16 @@
 
 29. **「改完要重启才生效」的设置，等于没生效。** 阶段 7 的真实缺陷：面板的「启用远程接入」与「端口」写盘后只回 `requiresReload: true`，把重启 `dsh` 当成用户的事——而那个 socket 是本插件自己持有的，它完全有能力解绑重绑。修法三条，缺一不可：① 变更只走一个入口（`index.js#applyListenerChange`，开关与端口是同一件事），`api.js` 不自己碰 listener；② **先绑新端口再释放旧端口**，绑定失败时旧监听仍在服务，且 `api.js` 把设置**回滚**（`revertSettings`），绝不让磁盘写着进程没在听的端口——否则 `POST /settings` 与下一次 `GET /state` 会互相打脸；③ 监听器只注册一个 `ctx.effect` disposer（`startGateway({ registerEffect: false })` + 上层持有），否则每切换一次就多一个 disposer，热重载时同一端口被关两次。测试要钉住「关闭后端口真的连不上」「换端口后旧端口真的释放」「端口被占用时返回 409 且旧监听没掉」，只断言响应字段会漏掉真正的副作用。
 
+30. **外部进程是可选的降级能力，不是新的启动前提。** Cloudflare Tunnel（2026-10-20）引入了本包唯一一个外部进程，规则是：
+    - **进程只属于一个模块**（`src/host/tunnel.js`），生命周期只属于一个所有者（`src/index.js`）。`api.js` 只发动作与读状态，不 spawn；`gateway/*` 完全不知道隧道存在。
+    - **spawn 用 argv 数组 + `shell: false` + `windowsHide: true`**，程序路径只能来自 `resolveTunnelBinary()`（自定义路径 / PATH / 本插件下载的副本）。用户填的自定义路径等价于「用户自己运行这个程序」，属于本机信任级别；不接受任意命令拼接。
+    - **失败不致命。** `apply` 不因 cloudflared 缺失、Token 错、网络失败而 reject：局域网网关继续工作，面板显示 `failed` + 稳定错误码。这与「启动失败要大声」（`error-handling.md`）不矛盾——那条约束的是**核心能力**（监听端口、存储），隧道是可选能力。
+    - **不自动重启、不自动安装、不自动更新。** 进程退出只报告；二进制只在用户点「下载」时安装；下载来源固定 `github.com/cloudflare/cloudflared`，并且**必须有 release API 给出的 sha256**，摘要缺失就拒绝安装。临时文件 → 校验 → rename，任何失败都不留下半份可执行文件。
+    - **Token 是凭据，不是配置。** 不进 `devices.json`、不进响应、不进日志、不进 argv、不进子进程环境；用 `0600` 文件 + `--token-file`。API 只回 `tokenSet: boolean`。
+    - **运行时事实不写进设置。** 快速隧道的 URL 每次启动都会变，所以 `access.mode = 'tunnel'` 在拼链接时读运行时 URL，而不是把它持久化成一个很快过期的字符串（同 §23 的「显示层事实」）。
+    - **第三方必须显式披露。** 启用隧道后流量经 Cloudflare；默认安装仍然没有第三方。README 与面板都要写，不能把「可选」说成「没有」。
+    - **测试不得真的拉起 cloudflared 或联网**：`spawnImpl` / `fetchImpl` / 超时 / 平台 / 环境全部注入；用假 ChildProcess 驱动状态机，用假 fetch 驱动资产选择与摘要校验。
+
 
 ---
 
@@ -116,7 +127,7 @@
   - 令牌：正确令牌通过、错误令牌失败、长度不同的令牌不抛错只失败、**非摘要的「哈希」被拒**。
   - 存储：原子写后可读回、损坏文件报 `store/corrupt`、Windows 下 chmod 不抛错、**非法 tokenHash 被拒**。
   - 审计：追加格式合法、30 天清理、导出不含正文。
-- **文件级不变量测试**：断言 manifest 与 package 版本一致、`files` 全存在、客户端只有一个 ModuleLoader 入口、宿主半边不出现 `exec(`／`shell: true`。
+- **文件级不变量测试**：断言 manifest 与 package 版本一致、`files` 全存在、客户端只有一个 ModuleLoader 入口、宿主半边只有 `src/host/tunnel.js` 可以 import `node:child_process`，且任何文件都不出现 `exec(`／`shell: true`。
 - **验证测试真的能失败**：写完一条断言，故意改坏实现确认它变红，再还原。阶段 1 复核发现过 `assert.ok(() => JSON.parse(raw))` 这种永真式（函数对象恒为真值，根本没解析）。
 - 真机验证（手机扫码、流式输出、吊销即时生效）不属于 `npm test`，由 `implement.md` 阶段 6 单独执行并记录结论。
 

@@ -20,6 +20,8 @@ src/
     ├── constants.js      # 磁盘布局、数据模型版本、TTL、JWT 声明、文件权限
     ├── store.js          # devices.json 读写、原子写、0600
     ├── addresses.js      # 接入地址的归一化（store 与 api 共用）
+    ├── tunnel.js         # Cloudflare Tunnel 配置文法、Token 文件与 cloudflared 进程控制器
+    ├── tunnel-binary.js  # cloudflared 的定位、下载与 sha256 校验
     ├── pairing.js        # 8 位 base32 配对码、120s TTL、一次性兑换、锁定
     ├── tokens.js         # 设备凭证：HS256 JWT 签发/校验，手写实现
     ├── jwt-key.js        # 加载/创建 32 字节 HS256 密钥，0600，损坏时大声失败
@@ -44,7 +46,9 @@ scripts/
 └── prepare-release.mjs   # 发布校验的纯函数 + CLI（见 ../release/）
 ```
 
-`src/host/*.js` 是**与传输无关的领域模块**（存储、地址、配对、令牌、审计），`src/host/gateway/*` 是**只在网关里成立的传输模块**。领域模块不得 import gateway 里的任何东西，否则它们就没法被 `/remote-control/api` 复用，也没法脱离 HTTP 单测。
+`src/host/*.js` 是**与传输无关的领域模块**（存储、地址、隧道、配对、令牌、审计），`src/host/gateway/*` 是**只在网关里成立的传输模块**。领域模块不得 import gateway 里的任何东西，否则它们就没法被 `/remote-control/api` 复用，也没法脱离 HTTP 单测。
+
+`tunnel.js` 是本包唯一允许 import `node:child_process` 的模块（见 [Quality Guidelines](./quality-guidelines.md) §30），生命周期由 `src/index.js` 持有；`api.js` 只通过注入的 `getTunnel` / `applyTunnelChange` 读状态、发动作，自己从不 spawn。`gateway/*` 不 import 隧道模块：隧道只是「另一个到达网关的入口」，鉴权链路不变。
 
 `scripts/` 与 `.github/` 属于发布链路，**不在 npm 包内**（`package.json#files` 未列）。新增工具脚本时先想清楚它属于「发布/仓库」还是「运行时」：只有后者才进 `files`。
 

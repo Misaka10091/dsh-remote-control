@@ -34,7 +34,8 @@ throw error
 | `token/` | `claims`、`entropy`、`key` |
 | `audit/` | `invalid-action`、`invalid-cursor`、`invalid-limit`、`unknown-event`、`write-failed`、`no-directory` |
 | `gateway/` | `unauthenticated`、`cross-origin`、`untrusted-origin`、`device-revoked`、`admin-not-here`、`upstream-timeout`、`upstream-unreachable`、`proxy-failed`、`invalid-upstream`、`pairing-disabled` |
-| `admin/` | `loopback-only`、`cross-origin`、`invalid-access`、`invalid-settings`、`unknown-device`、`listener-failed`、`body-too-large`、`method-not-allowed` |
+| `tunnel/` | `binary-missing`、`token-missing`、`token-invalid`、`url-missing`、`no-port`、`spawn-failed`、`start-timeout`、`exited`、`busy`、`download-failed`、`unsupported-platform`、`storage` |
+| `admin/` | `loopback-only`、`cross-origin`、`invalid-access`、`invalid-settings`、`invalid-tunnel`、`tunnel-action`、`tunnel-no-gateway`、`tunnel-busy`、`tunnel-download-failed`、`tunnel-storage`、`tunnel-unavailable`、`unknown-device`、`listener-failed`、`body-too-large`、`method-not-allowed` |
 
 新增 code 之前先确认语义落在这六个前缀里的哪一个：同一个语义在两个前缀下各叫一次，排查时就会被当成两件事。
 
@@ -69,7 +70,7 @@ throw error
 // 错：catch 后 console.warn，用户以为远程开着其实没监听
 ```
 
-唯一允许降级的是**可选依赖缺失**（如 `ctx.connection` 不存在）：降级时必须在日志里 `warn` 一次，并让该能力在面板上显示为不可用，而不是假装工作。
+唯一允许降级的是**可选能力**：`ctx.connection` 缺失（内层凭证降级）与 Cloudflare Tunnel 起不来（外部进程/网络/Token 问题）。降级时必须在日志里 `warn` 一次，并让该能力在面板上显示为不可用，而不是假装工作。隧道失败的状态走 `GET /tunnel` 的 `state: "failed"` + `error.code`，**不是** HTTP 500：请求本身成功了（设置已保存、尝试已做出）。
 
 ---
 

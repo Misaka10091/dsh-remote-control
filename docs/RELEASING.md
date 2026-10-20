@@ -141,7 +141,7 @@ automatically. Official note: <https://docs.npmjs.com/trusted-publishers/>.
 
 5. **Read the tarball list** from `npm pack --dry-run`. Anything you expect and do
    not see is a packaging bug; anything you did not expect is a leak. The list is
-   31 files; `scripts/` and `.github/` are deliberately **not** in the package.
+   33 files; `scripts/` and `.github/` are deliberately **not** in the package.
 
 6. **Commit, then push the tag.** Publishing is triggered by the tag, so the tag
    must point at a commit that already contains the release workflow and the

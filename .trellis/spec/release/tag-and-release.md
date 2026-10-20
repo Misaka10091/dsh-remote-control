@@ -131,7 +131,7 @@ npm view "$PACKAGE_SPEC" dist.integrity --json
 2. 进 `scripts['check:syntax']` 的显式清单（不是 glob，所以必须手写）；
 3. 若是网关模块，`tests/package.test.mjs` 的 "the gateway modules exist and are all packaged" 里也要出现。
 
-实测产物为 **31 个文件**：`icon.svg`、`locale/{zh,en}.json`、`src/index.js`、`src/client.js`、`src/host/*.js`（11 个）、`src/host/gateway/*.js`（9 个）、`cordis.patch.yml`、`dsh.plugin.json`、`README.md`、`CHANGELOG.md`、`LICENSE`、`package.json`。`scripts/` 与 `.github/` 故意不在其中。
+实测产物为 **33 个文件**：`icon.svg`、`locale/{zh,en}.json`、`src/index.js`、`src/client.js`、`src/host/*.js`（13 个，含 `tunnel.js` / `tunnel-binary.js`）、`src/host/gateway/*.js`（9 个）、`cordis.patch.yml`、`dsh.plugin.json`、`README.md`、`CHANGELOG.md`、`LICENSE`、`package.json`。`scripts/` 与 `.github/` 故意不在其中。
 
 - 这个 31 **没有测试守着**（没有任何断言钉住文件数）。改动后自己数，别引用旧数字；`npm pack --dry-run` 里多出来的就是泄漏，少了的就是打包 bug。
 - `src/host/addresses.js` 是「加进 `src/` 却忘进白名单」这类事故的典型：它同时被 `store.js` 与 `api.js` import，漏掉它不只是少个功能，而是插件加载即失败。对应的断言与注释就在 `tests/package.test.mjs`。
@@ -161,7 +161,7 @@ npm view "$PACKAGE_SPEC" dist.integrity --json
 - **给生产 workflow 加 `NPM_TOKEN`。** OIDC 就是凭据；加 secret 等于多一条会过期的凭证链。
 - **重跑时把 `cancel-in-progress` 打开。** 会把要接续的那次运行打断。
 - **用轻量标签。** `git tag -a`，并 `git push --atomic`。
-- **引用「31 个文件」当常量。** 它是实测值，改包必须重新数。
+- **引用「33 个文件」当常量。** 它是实测值，改包必须重新数。
 
 ## 验证命令
 
@@ -177,7 +177,7 @@ node scripts/prepare-release.mjs vX.Y.Z "$TMPDIR/release-dry-run"
 # 3. 三条 gate
 npm run check:syntax
 npm test
-npm pack --dry-run        # 31 个文件，无 scripts/、无 .github/
+npm pack --dry-run        # 33 个文件，无 scripts/、无 .github/
 
 # 4. 标签（真发布，不可回滚）
 git tag -a vX.Y.Z -m "Release vX.Y.Z"

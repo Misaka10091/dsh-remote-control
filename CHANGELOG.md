@@ -6,6 +6,42 @@ Format: `## vX.Y.Z — YYYY-MM-DD`.
 
 ## Unreleased
 
+### Added
+
+- **Public access can now be a built-in Cloudflare Tunnel.** The address book could
+  already point at a tunnel hostname, but getting one meant installing and running
+  `cloudflared` by hand and copying its URL. The 接入 tab now owns the process: a
+  switch starts and stops `cloudflared`, a quick tunnel needs no account, and a
+  named tunnel takes a dashboard token plus the public hostname configured in
+  Cloudflare. The generated URL becomes a third access mode (`tunnel`) next to LAN
+  and public, and the pairing link uses it as-is (Cloudflare owns the port).
+  - The binary is either found (a configured path, then PATH, then a copy this
+    plugin downloaded) or installed from Cloudflare's official GitHub Release:
+    the asset is selected by platform/arch, its **sha256 from the release API is
+    required and verified**, and it is written through temp → fsync → rename, so a
+    failed download leaves no half executable. Nothing is downloaded until the user
+    clicks the button.
+  - The tunnel token is write-only: it lives in
+    `~/.dsh/remote-control/cloudflared-token` (0600), never in `devices.json`, and
+    is passed as `--token-file` so it is neither in `argv` nor in the child's
+    environment. The API only ever answers `tokenSet: boolean`.
+  - Lifecycle follows the gateway: the tunnel starts with the listener, stops when
+    remote access is switched off, and is restarted against the new **bound** port.
+    A failure is a panel state (`failed` + a stable code), never a failed plugin —
+    the LAN gateway keeps working.
+  - Tunnel traffic is attributed to the real client: `CF-Connecting-IP` is trusted
+    only on a loopback socket (a LAN client cannot choose its own audit address),
+    so the trail and the pairing rate limiter stop seeing `127.0.0.1` for every
+    public request. Cloudflare forwarding headers are stripped before the upstream.
+  - Honest limits, written into the README and the panel: a quick tunnel's hostname
+    changes on every start (already-paired devices must pair again), there is no
+    uptime guarantee, and enabling a tunnel routes public traffic through Cloudflare
+    — the default install still uses no third party.
+  - **The "host half never shells out" invariant is narrowed, not deleted.**
+    Exactly one module (`src/host/tunnel.js`) may import `node:child_process`; it
+    spawns an argv array with `shell: false` and a binary path this package
+    resolved. `tests/package.test.mjs` asserts both halves of that sentence.
+
 ### Changed
 
 - **The remote-access switch and the listen port now take effect immediately.**

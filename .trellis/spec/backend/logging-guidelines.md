@@ -61,7 +61,8 @@ ctx.logger.info(`[remote-control] device paired: ${device.id} (${device.name})`)
 - 网关监听/停止，及上游目标。
 - 设备配对、吊销（含来源 IP）。
 - 上游返回 401 且触发内层凭证重兑。
-- 可选能力降级（`ctx.connection` 缺失等）。
+- 可选能力降级（`ctx.connection` 缺失、Cloudflare Tunnel 启动失败等）。
+- Cloudflare Tunnel 的状态迁移只记 `running (quick|token)` / `stopped` / `failed (<tunnel/code>)`；**不打印 cloudflared 的原始 stderr**，也不打印隧道 URL 之外的输出行（输出缓冲只用于本机诊断，API 不返回）。
 
 ---
 
@@ -74,5 +75,6 @@ ctx.logger.info(`[remote-control] device paired: ${device.id} (${device.name})`)
 - 配对码明文（配对 URL 的 `#` 片段不进服务端，也不得被记进日志）。
 - 消息正文、工具参数、文件内容。
 - 请求体全文。
+- Cloudflare Tunnel 的 Token（及其文件名之外的内容）、cloudflared 的完整 stderr、`--token-file` 指向文件的内容。
 
 审计只记「谁、什么时候、做了什么动作」，不记「做了什么内容」。

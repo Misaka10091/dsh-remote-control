@@ -44,7 +44,7 @@
 ```bash
 npm test                 # 含文件级不变量：单入口、无顶层 import、词典键集一致
 npm run check:syntax     # node --check 每个入口与宿主模块
-npm pack --dry-run       # 确认 src/locale 都被打进产物（31 个文件）
+npm pack --dry-run       # 确认 src/locale 都被打进产物（33 个文件）
 ```
 
 外加人工过 [Quality Guidelines 的 Code Review Checklist](./quality-guidelines.md#code-review-checklist)。

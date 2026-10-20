@@ -45,7 +45,7 @@
 ```bash
 npm test                # 整套 node:test，含 tests/release.test.mjs 与 tests/package.test.mjs
 npm run check:syntax    # 每个宿主模块 + scripts/prepare-release.mjs
-npm pack --dry-run      # 产物清单：应为 31 个文件，且不含 scripts/、.github/
+npm pack --dry-run      # 产物清单：应为 33 个文件，且不含 scripts/、.github/
 ```
 
 发布前的额外干跑（不碰 npm、不碰 git、不联网）：
@@ -61,7 +61,7 @@ node scripts/prepare-release.mjs vX.Y.Z .release-dry-run   # 产出 notes.md + m
 ## 关键事实（不在别处重复）
 
 - **`0.1.0` 是手工发布的**：包当时还不在 npm 上，而 npm Trusted Publisher 只能配置在**已存在**的包上，所以自动化无法完成首发。从下一个版本起才是 tag → OIDC 发布（`docs/RELEASING.md` 第一节）。
-- **包内共 31 个文件**（实测计数，不是断言）。`scripts/`、`.github/`、`docs/`、`tests/` 故意不进包。该数字没有任何测试守着，改动后要重新数，不要引用旧数字。
+- **包内共 33 个文件**（实测计数，不是断言）。`scripts/`、`.github/`、`docs/`、`tests/` 故意不进包。该数字没有任何测试守着，改动后要重新数，不要引用旧数字。
 - **`npm version` 的 lifecycle 脚本会同步两个清单**：`scripts.version` 把 `package.json#version` 写进 `dsh.plugin.json` 并 `git add`，所以用一条命令即可保持一致。
 - **标签文法、三方版本、`repository.url`、CHANGELOG 段落**这四类错误都在 `npm publish` 之前被拒；一旦 publish 成功，版本就不可回滚（npm 不允许覆盖已发布版本）。
 - **本地最多验到第 3 层**（脚本规则、真实清单干跑、workflow 可解析）。第 4 层「真实 OIDC 发布 + GitHub Release」只能靠一次真实 tag 推送，尚未发生。
