@@ -4,7 +4,7 @@ All notable changes to this project are documented here.
 
 Format: `## vX.Y.Z — YYYY-MM-DD`.
 
-## Unreleased
+## v0.2.0 — 2026-10-21
 
 ### Added
 
@@ -15,10 +15,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD`.
   named tunnel takes a dashboard token plus the public hostname configured in
   Cloudflare. The generated URL becomes a third access mode (`tunnel`) next to LAN
   and public, and the pairing link uses it as-is (Cloudflare owns the port).
-  - The binary is either found (a configured path, then PATH, then a copy this
-    plugin downloaded) or installed from Cloudflare's official GitHub Release:
-    the asset is selected by platform/arch, its **sha256 from the release API is
-    required and verified**, and it is written through temp → fsync → rename, so a
+  - The binary source is an explicit choice, not a resolution order: 「系统 PATH」
+    looks on PATH and then at the copy this plugin downloaded, while 「自定义」 uses
+    exactly the path you typed and **never falls back** — so a custom path that does
+    not exist is an error instead of a silent switch to another binary. The panel
+    also prints the path it actually resolved, which is the only way to notice a
+    `cloudflared` earlier on PATH shadowing the one you meant.
+  - The binary is installed from Cloudflare's official GitHub Release when it is not
+    found: the asset is selected by platform/arch, its **sha256 from the release API
+    is required and verified**, and it is written through temp → fsync → rename, so a
     failed download leaves no half executable. Nothing is downloaded until the user
     clicks the button.
   - The tunnel token is write-only: it lives in
@@ -80,6 +85,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD`.
   handful of events it exists for. Unknown writes and unknown upgrade channels are
   now dropped; the `unknown` event stays readable and filterable for files written
   before this change.
+
+- **Saving in the panel no longer prints a success banner.** The switch, the port,
+  the address and the tunnel rows already render the value that was just stored, so
+  a 「已保存」 line only repeated them — and a line that never clears reads like a
+  state («saved» — of what, and is it still true?). Failures still surface, and the
+  one instruction that is not a confirmation still appears: 「需要重启 dsh」 is shown
+  only for a host that could not apply the change live. The audit export keeps its
+  notice, because a download leaves no other trace on screen.
 
 ## v0.1.1 — 2026-10-19
 

@@ -178,7 +178,7 @@ npm view "$PACKAGE_SPEC" dist.integrity --json
 
 实测产物为 **33 个文件**：`icon.svg`、`locale/{zh,en}.json`、`src/index.js`、`src/client.js`、`src/host/*.js`（13 个，含 `tunnel.js` / `tunnel-binary.js`）、`src/host/gateway/*.js`（9 个）、`cordis.patch.yml`、`dsh.plugin.json`、`README.md`、`CHANGELOG.md`、`LICENSE`、`package.json`。`scripts/` 与 `.github/` 故意不在其中。
 
-- 这个 31 **没有测试守着**（没有任何断言钉住文件数）。改动后自己数，别引用旧数字；`npm pack --dry-run` 里多出来的就是泄漏，少了的就是打包 bug。
+- 这个 33 **没有测试守着**（没有任何断言钉住文件数）。改动后自己数，别引用旧数字；`npm pack --dry-run` 里多出来的就是泄漏，少了的就是打包 bug。
 - `src/host/addresses.js` 是「加进 `src/` 却忘进白名单」这类事故的典型：它同时被 `store.js` 与 `api.js` import，漏掉它不只是少个功能，而是插件加载即失败。对应的断言与注释就在 `tests/package.test.mjs`。
 - `package.json#scripts.version` 里 `git add dsh.plugin.json` 是流水线的一部分（`npm version` 后两个清单要一起提交），不要删。
 

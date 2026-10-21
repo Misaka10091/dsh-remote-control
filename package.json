@@ -1,6 +1,6 @@
 {
   "name": "@misaka10091/dsh-remote-control",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Pairing-gated remote access for the dsh web GUI: a self-hosted reverse-proxy gateway, a device panel and a local audit trail, with an optional managed Cloudflare Tunnel and no relay unless you enable one. | DeepSeek Harness 远程控制插件：配对鉴权网关、设备管理面板与本地审计，可选内置 Cloudflare Tunnel；官方 dsh web 端口保持仅回环。",
   "type": "module",
   "author": {
