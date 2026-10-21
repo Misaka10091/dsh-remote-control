@@ -171,27 +171,40 @@ test('PATH is preferred over the downloaded copy, and the copy is used when PATH
   }
 })
 
-test('findOnPath honours PATHEXT on Windows and executable bits elsewhere', () => {
+test('findOnPath honours PATHEXT on Windows', () => {
   const dir = makeTempDir()
   try {
-    writeFileSync(path.join(dir, 'cloudflared.exe'), 'x')
-    const hit = findOnPath('cloudflared', {
-      platform: 'win32',
-      env: { Path: dir, PATHEXT: '.COM;.EXE' },
-    })
-    assert.equal(typeof hit, 'string')
-    assert.equal(hit.toLowerCase(), path.join(dir, 'cloudflared.exe').toLowerCase())
-    assert.equal(findOnPath('cloudflared', { platform: 'win32', env: { Path: '', PATHEXT: '.EXE' } }), null)
-
-    const posix = makeExecutable(dir, 'cloudflared')
-    /* Windows has no POSIX execute bit; a real POSIX host is the only place this
-       branch can be exercised honestly. */
-    if (process.platform !== 'win32') {
+    for (const [name, extension] of [['lowercase', '.exe'], ['uppercase', '.EXE']]) {
+      const binDir = path.join(dir, name)
+      mkdirSync(binDir)
+      const file = path.join(binDir, `cloudflared${extension}`)
+      /* Injecting win32 does not make the host filesystem case-insensitive. */
+      writeFileSync(file, 'x')
       assert.equal(
-        findOnPath('cloudflared', { platform: 'linux', env: { PATH: dir } }),
-        posix,
+        findOnPath('cloudflared', {
+          platform: 'win32',
+          env: { Path: binDir, PATHEXT: `.COM;${extension}` },
+        }),
+        file,
       )
     }
+    assert.equal(findOnPath('cloudflared', { platform: 'win32', env: { Path: '', PATHEXT: '.EXE' } }), null)
+  } finally {
+    cleanupDir(dir)
+  }
+})
+
+test('findOnPath requires executable bits on POSIX', { skip: process.platform === 'win32' }, () => {
+  const dir = makeTempDir()
+  try {
+    const file = path.join(dir, 'cloudflared')
+    writeFileSync(file, 'x')
+    chmodSync(file, 0o644)
+    const options = { platform: process.platform, env: { PATH: dir } }
+    assert.equal(findOnPath('cloudflared', options), null, 'a regular file without execute bits is rejected')
+
+    chmodSync(file, 0o755)
+    assert.equal(findOnPath('cloudflared', options), file, 'the executable file is found')
   } finally {
     cleanupDir(dir)
   }
