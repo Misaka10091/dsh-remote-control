@@ -12,6 +12,11 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A test that leaks a live socket keeps the child process alive after every test
+    # has finished. Without a bound, that run hangs until GitHub's six-hour default
+    # and the log ends with no failing test to blame — which is what happened on
+    # 2026-10-21. A job timeout turns that class of bug into a bounded, visible fail.
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6

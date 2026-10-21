@@ -14,13 +14,14 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { createServer, request as httpRequest } from 'node:http'
 import { connect } from 'node:net'
 import path from 'node:path'
 
 import * as entry from '../src/index.js'
 import { ADMIN_API_PREFIX } from '../src/host/constants.js'
+import { resolveTunnelBinary } from '../src/host/tunnel-binary.js'
 import { cleanupDir, makeTempDir } from './helpers.mjs'
 
 /** A logger stub that records each call, per level. */
@@ -225,6 +226,38 @@ function gatewayContext({ officialPort, logger }) {
   }
 }
 
+/**
+ * Release every effect a context recorded, newest first.
+ *
+ * Cordis disposes in reverse registration order, so the listener registered last
+ * is released first — the same order the managed-tunnel test relies on. Two
+ * properties make this the failure path as well as the happy path:
+ *
+ *   - `splice(0)` empties the list, so the safety net registered with `t.after`
+ *     is a no-op after an explicit call and vice versa;
+ *   - a disposer that throws is swallowed, because the assertion that is already
+ *     failing is the news. Letting a shutdown error replace it would cost the
+ *     reader the actual reason the test went red.
+ *
+ * This exists because of a real CI failure: the managed-tunnel test below shut
+ * its gateway down only on the success path, so one failed assertion on Linux
+ * left a listening socket behind, the child test process never exited, and
+ * `npm test` sat there until the workflow timed out with no failing test to show
+ * for it.
+ *
+ * @param {{ effects: Array<() => unknown> }} ctx
+ * @returns {Promise<void>}
+ */
+async function disposeEffects(ctx) {
+  for (const dispose of ctx.effects.splice(0).reverse()) {
+    try {
+      await dispose()
+    } catch {
+      /* the test's own failure is the news; a shutdown error must not replace it */
+    }
+  }
+}
+
 /** A throwaway listener standing in for the official `dsh web` port. */
 async function stubOfficialPort() {
   const server = createServer((req, res) => {
@@ -271,7 +304,7 @@ test('apply starts no listener while remote access is off', async () => {
   })
 })
 
-test('apply binds a gateway and logs one listening line when remote access is on', async () => {
+test('apply binds a gateway and logs one listening line when remote access is on', async (t) => {
   const official = await stubOfficialPort()
   try {
     await withTempHome(async (home) => {
@@ -284,6 +317,10 @@ test('apply binds a gateway and logs one listening line when remote access is on
 
       const { calls, logger } = recordingLogger()
       const ctx = gatewayContext({ officialPort: official.port, logger })
+      /* Registered BEFORE the bind, so every failed assertion below still releases
+         the listener. A socket left open outlives the test and keeps the whole run
+         alive, which is how this file once hung CI for fifteen minutes. */
+      t.after(() => disposeEffects(ctx))
 
       await entry.apply(ctx, { port: 0, host: '127.0.0.1' })
 
@@ -311,7 +348,8 @@ test('apply binds a gateway and logs one listening line when remote access is on
         ],
         'the listener is the last effect, and it is registered last',
       )
-      for (const dispose of ctx.effects) await dispose()
+
+      await disposeEffects(ctx)
     })
   } finally {
     await official.close()
@@ -335,13 +373,45 @@ function fakeCloudflared(children) {
   }
 }
 
-test('the managed tunnel follows the gateway listener and stops with it', async () => {
+/**
+ * A temp file that `resolveTunnelBinary` accepts as a configured `cloudflared`.
+ *
+ * The execute bit is the part that is easy to forget: `resolveTunnelBinary` tests
+ * POSIX paths with `accessSync(..., X_OK)`, and a file created by `writeFileSync`
+ * alone has no execute bit on Linux or macOS. The shebang in the content does not
+ * help — the mode does. Windows has no POSIX execute bit and accepts the file
+ * either way, which is why a missing `chmod` passes on the primary dev platform
+ * and fails on the ubuntu runner.
+ *
+ * @param {string} dir
+ * @returns {string} The file's absolute path.
+ */
+function makeFakeTunnelBinary(dir) {
+  const file = path.join(dir, 'cloudflared')
+  writeFileSync(file, '#!/bin/sh\nexit 0\n')
+  try {
+    chmodSync(file, 0o755)
+  } catch {
+    /* Windows has no POSIX execute bit; `resolveTunnelBinary` accepts it there. */
+  }
+  return file
+}
+
+test('the managed tunnel follows the gateway listener and stops with it', async (t) => {
   const official = await stubOfficialPort()
   try {
     await withTempHome(async (home) => {
       const baseDir = path.join(home, '.dsh', 'remote-control')
-      const binary = path.join(home, 'cloudflared')
-      writeFileSync(binary, '#!/bin/sh\nexit 0\n')
+      const binary = makeFakeTunnelBinary(home)
+      /* Assert the fixture BEFORE anything binds. On a POSIX host a file without
+         the execute bit resolves to `tunnel/binary-missing`, the tunnel never
+         spawns, and `children.length` below fails for a reason that has nothing to
+         do with the lifecycle this test is about. */
+      assert.equal(
+        resolveTunnelBinary({ baseDir, binaryPath: binary, platform: process.platform }).available,
+        true,
+        'the fake cloudflared must be executable, or this test measures the fixture',
+      )
       const runtime = entry.createRuntime({ baseDir })
       runtime.store.updateSettings({
         enabled: true,
@@ -351,6 +421,7 @@ test('the managed tunnel follows the gateway listener and stops with it', async 
       const children = []
       const { calls, logger } = recordingLogger()
       const ctx = gatewayContext({ officialPort: official.port, logger })
+      t.after(() => disposeEffects(ctx))
       await entry.apply(ctx, {
         port: 0,
         host: '127.0.0.1',
@@ -368,7 +439,7 @@ test('the managed tunnel follows the gateway listener and stops with it', async 
 
       /* Cordis disposes in reverse order; the listener's disposer is what stops the
          tunnel before the port disappears. */
-      for (const dispose of ctx.effects.reverse()) await dispose()
+      await disposeEffects(ctx)
       assert.deepEqual(children[0].child.signals, ['SIGTERM'], 'no cloudflared outlives the plugin')
     })
   } finally {
@@ -376,7 +447,7 @@ test('the managed tunnel follows the gateway listener and stops with it', async 
   }
 })
 
-test('a tunnel that cannot start is reported, and the gateway keeps working', async () => {
+test('a tunnel that cannot start is reported, and the gateway keeps working', async (t) => {
   const official = await stubOfficialPort()
   try {
     await withTempHome(async (home) => {
@@ -390,6 +461,7 @@ test('a tunnel that cannot start is reported, and the gateway keeps working', as
       const children = []
       const { calls, logger } = recordingLogger()
       const ctx = gatewayContext({ officialPort: official.port, logger })
+      t.after(() => disposeEffects(ctx))
       await entry.apply(ctx, {
         port: 0,
         host: '127.0.0.1',
@@ -403,7 +475,7 @@ test('a tunnel that cannot start is reported, and the gateway keeps working', as
       assert.ok(calls.some((call) => call.level === 'info' && /gateway listening/.test(call.message)))
       assert.ok(calls.some((call) => call.level === 'warn' && /tunnel\/binary-missing/.test(call.message)))
 
-      for (const dispose of ctx.effects.reverse()) await dispose()
+      await disposeEffects(ctx)
     })
   } finally {
     await official.close()
@@ -673,7 +745,7 @@ function hotReloadContext({ webServer, logger }) {
   return ctx
 }
 
-test('turning remote access off closes the listener without a restart', async () => {
+test('turning remote access off closes the listener without a restart', async (t) => {
   /* The switch used to be restart-only, which is a switch the user does not believe.
      `prd.md` D1 also says "off" must be indistinguishable from "not installed", and
      a released socket is the only proof of that. */
@@ -686,6 +758,7 @@ test('turning remote access off closes the listener without a restart', async ()
 
       const { calls, logger } = recordingLogger()
       const ctx = hotReloadContext({ webServer: official.webServer, logger })
+      t.after(() => disposeEffects(ctx))
       await entry.apply(ctx, { host: '127.0.0.1' })
       assert.equal(await isListening(port), true, 'the switch was on at load, so it listens')
 
@@ -719,14 +792,14 @@ test('turning remote access off closes the listener without a restart', async ()
         'one listener disposer across every bind, not one per bind',
       )
 
-      for (const dispose of ctx.effects) await dispose()
+      await disposeEffects(ctx)
     })
   } finally {
     await official.close()
   }
 })
 
-test('changing the port moves the listener and releases the old one', async () => {
+test('changing the port moves the listener and releases the old one', async (t) => {
   const official = await officialHost()
   try {
     await withTempHome(async (home) => {
@@ -739,6 +812,7 @@ test('changing the port moves the listener and releases the old one', async () =
       runtime.store.updateSettings({ enabled: true, port: first })
       const { logger } = recordingLogger()
       const ctx = hotReloadContext({ webServer: official.webServer, logger })
+      t.after(() => disposeEffects(ctx))
       await entry.apply(ctx, { host: '127.0.0.1' })
       assert.equal(await isListening(first), true)
 
@@ -756,14 +830,14 @@ test('changing the port moves the listener and releases the old one', async () =
       const state = await adminRequest(official.port, { path: `${ADMIN_API_PREFIX}/state` })
       assert.equal(state.json.data.gateway.port, second, 'the state read names the port actually bound')
 
-      for (const dispose of ctx.effects) await dispose()
+      await disposeEffects(ctx)
     })
   } finally {
     await official.close()
   }
 })
 
-test('a port another process holds is refused and the running listener stays up', async () => {
+test('a port another process holds is refused and the running listener stays up', async (t) => {
   /* Bind-before-release: a mistyped or occupied port must cost the user an error,
      not their remote session. The setting is restored so the panel and the file
      keep agreeing with the socket that is still open. */
@@ -779,6 +853,7 @@ test('a port another process holds is refused and the running listener stays up'
 
       const { logger } = recordingLogger()
       const ctx = hotReloadContext({ webServer: official.webServer, logger })
+      t.after(() => disposeEffects(ctx))
       await entry.apply(ctx, { host: '127.0.0.1' })
       assert.equal(await isListening(port), true)
 
@@ -797,7 +872,7 @@ test('a port another process holds is refused and the running listener stays up'
       const state = await adminRequest(official.port, { path: `${ADMIN_API_PREFIX}/state` })
       assert.equal(state.json.data.gateway.port, port, 'the state read agrees with the live socket')
 
-      for (const dispose of ctx.effects) await dispose()
+      await disposeEffects(ctx)
     })
   } finally {
     await new Promise((resolve) => { blocker.closeAllConnections(); blocker.close(resolve) })
