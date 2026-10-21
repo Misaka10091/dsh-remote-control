@@ -115,6 +115,10 @@
     - **第三方必须显式披露。** 启用隧道后流量经 Cloudflare；默认安装仍然没有第三方。README 与面板都要写，不能把「可选」说成「没有」。
     - **测试不得真的拉起 cloudflared 或联网**：`spawnImpl` / `fetchImpl` / 超时 / 平台 / 环境全部注入；用假 ChildProcess 驱动状态机，用假 fetch 驱动资产选择与摘要校验。
 
+31. **测试夹具的跨平台属性要显式设置，清理要挂在「失败也会跑」的地方。** 2026-10-21 的真实 CI 事故（不是产品缺陷）：`tests/plugin.test.mjs` 用 `writeFileSync` 造了个假 `cloudflared`，没给执行位。`resolveTunnelBinary` 在 POSIX 上用 `accessSync(X_OK)` 判定可执行，于是 ubuntu runner 上隧道根本没启动，`children.length` 断言失败——而 Windows 上布尔检查直接 `true`，所以本地全绿。失败本身不致命，致命的是**清理写在断言之后**：网关监听 socket 留了下来，子进程永不退出，`npm test` 挂到 workflow 超时，日志里连一条失败都看不到（`npm-publish` 15 分钟被取消，`ci` 会一直挂到 GitHub 的 6 小时默认上限）。
+    两条规则：① 造可执行夹具一律 `chmodSync(file, 0o755)`（`tunnel.test.mjs`、`tunnel-binary.test.mjs` 本来就这样写，只有新文件漏了），**并在绑定任何端口之前先断言夹具真的可用**，让失败指向夹具而不是被测的生命周期逻辑；② 任何 `listen` / 子进程的释放挂到 `t.after()`（或 `finally`），清理函数要**幂等**（`effects.splice(0)` 后遍历，显式调用与兜底互不为难）且**吞掉自身错误**，否则一个 close 失败会把真正的断言失败顶掉。
+    验证方式：把一条断言故意改红，确认「旧代码 45 秒仍不退出 / 新代码立即退出并报出失败」，再还原——这才是这条修复的证据，`npm test` 变绿不算。
+
 
 ---
 
